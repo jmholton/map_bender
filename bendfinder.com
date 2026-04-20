@@ -5,18 +5,18 @@
 #    between two non-isomorphous forms of the same structure
 #
 #    Function is based on HKL index equations, but not directly related 
-#    to low-resolution structure factors
+#    to structure factors
 #
-#    -James Holton  5-13-22
+#    -James Holton  11-17-23
 #    -comments by David Case, Aug. 2017
 #
 #    Usage : bendfinder.com bendme.pdb reference.pdb [bendme.map] 
-#                          [order=n] [frac=x] [reject=m] [dimensions=list]
+#                          [nhkls=n] [frac=x] [reject=m] [dimensions=list]
 #                          [fitparams_3.gnuplot]
 #
 #    where :
-#     order   number of orders of 3D polysine functions to use in the fit. 
-#             Default : $maxorder, set in script as 8
+#     nhkls   number of coefficients of 3D polysine functions to use in the fit. 
+#             Default : $maxhkls, set in script as 1000
 #     frac    how far along the bend path to place the output.  
 #             Default : $frac, set in script as 1
 #     geotest use refmac5 to evaluate geometry at each step
@@ -43,19 +43,32 @@ set path = ( $path `dirname $0` . /programs/gnuplot5/bin/ )
 # location of mapman?
 set mapman = mapman
 
-# how many orders of hkl-like functions to use
-set maxorder = 8
-set startorder = 0
+# how many coefficients of hkl-like functions to use
+set maxhkls = 1000
+set starthkls = 5
+set batchhkls = 1
+
+# resolution limit of hkls to use
+set reso = 3
+set Bblur = 0
+
+# rejection criteria for coefficients
+set drop_frac = 0.001
+set drop_snr  = 1
+set augment_value = 0.001
 
 # how far across the transition to go?
 set frac = 1
 
-# reject outliers more than m MADs from the median
+# reject atom outliers more than m MADs from the median
 set reject = 0
 
 # speed things up with higher gnuplot FIT_LIMIT ?
 set FIT_LIMIT = ""
 set fitscale  = 1000
+
+# skip gnuplot fitting and use DFT starting values directly (faster but less accurate)
+unset NOFIT
 
 # maybe decide to ignore some params
 set dimensions = ( x y z o B )
@@ -84,7 +97,7 @@ set starttime = `date +%s`
 
 if($#argv == 0) then
     cat << EOF 
-usage: $0 bendme.pdb reference.pdb [bendme.map] [order=n] \
+usage: $0 bendme.pdb reference.pdb [bendme.map] [reso=10] \
       [frac=x] [reject=6] [dimensions=xyz] \
       [fitparams_x.gnuplot] [refit] [deltamaps]
 
@@ -94,12 +107,13 @@ reference.pdb  defines the reference frame and cell
 
 bendme.map     is a map that will be spline interpolated into the reference frame
 
-order          is the number of orders of 3D polysine functions to use in the fit. Default: $maxorder
+nhkls          is the number of hkl coefficients of 3D polysine functions to use in the fit. Default: $maxhkls
 frac           is how far along the bend path to place the output.  Default: $frac
 reject         reject outlier shifts > 6x the median absolute deviation. Default: no rejection
 dimensions     aspects of PDB files to fit, default: xyz (not occ or B)
 fitparams_x.gnuplot  - use a previously-fitted function, skip the fit step
 refit          do the fit step even if a fitparams.gnuplot is provided
+nofit          skip gnuplot fitting, use DFT (slow-FT) values directly — much faster, slightly less accurate
 deltamaps      generate electron density maps of the shift magnitudes in x,y,z and r over whole cell
 
 both PDB files must always be provided because they contain the two unit cells.
@@ -227,21 +241,29 @@ foreach arg ( $* )
     if("$arg" =~ dimensions=*) then
         set dimensions = `echo $arg | awk -F "=" '{print $2}' | awk -F "," '{for(i=1;i<=NF;++i)print $i}'`
     endif
-    if("$arg" =~ order=*) set maxorder = `echo $arg | awk -F "=" '{print $2+0}'`
+    if("$arg" =~ reso=*) set reso = `echo $arg | awk -F "=" '{print $2+0}'`
+    if("$arg" =~ Bblur=*) set Bblur = `echo $arg | awk -F "=" '{print $2+0}'`
+    if("$arg" =~ nhkls=*) set maxhkls = `echo $arg | awk -F "=" '{print $2+0}'`
+    if("$arg" =~ hklbatch=*) set hklbatch = `echo $arg | awk -F "=" '{print $2+0}'`
+    if("$arg" =~ batchhkls=*) set batchhkls = `echo $arg | awk -F "=" '{print $2+0}'`
+    if("$arg" =~ drop_frac=*) set drop_frac = `echo $arg | awk -F "=" '{print $2+0}'`
+    if("$arg" =~ drop_snr=*) set drop_snr = `echo $arg | awk -F "=" '{print $2+0}'`
     if("$arg" =~ frac=*) set frac = `echo $arg | awk -F "=" '{print $2+0}'`
     if("$arg" =~ reject=*) set reject = `echo $arg | awk -F "=" '{print $2+0}'`
-    if("$arg" =~ startorder=*) set startorder = `echo $arg | awk -F "=" '{print $2+0}'`
+    if("$arg" =~ starthkls=*) set starthkls = `echo $arg | awk -F "=" '{print $2+0}'`
     if("$arg" =~ geotest=*) set geotest = `echo $arg | awk -F "=" '{print $2}'`
     if("$arg" =~ fit_limit=*) set FIT_LIMIT = `echo $arg | awk -F "=" '{print "FIT_LIMIT=",$2}'`
     if("$arg" =~ fitscale=*) set fitscale = `echo $arg | awk -F "=" '{print $2}'`
+    if("$arg" =~ debug=*) set debug = `echo $arg | awk -F "=" '{print $2}'`
     if("$arg" == refit) set REFIT
+    if("$arg" == nofit) set NOFIT
     if("$arg" == deltamaps) set MAKE_DELTAMAPS
     if("$arg" == nodeltamaps) unset MAKE_DELTAMAPS
 end
 
 if($?debug) then
     set tempfile = tempfile
-    set logfile = /dev/stdout
+    if( "$debug" == "9" ) set logfile = /dev/stdout
 endif
 
 
@@ -346,7 +368,8 @@ end
 if(-e "$user_fitparams") then
     echo "using existing $user_fitparams "
     cat $user_fitparams |\
-    awk '/^a/{hkl=substr($1,5);x=substr($1,4,1);a[x hkl]=$3}\
+    awk '$1~/_err$/{next}\
+       /^a/{hkl=substr($1,5);x=substr($1,4,1);a[x hkl]=$3}\
        /^phi/{hkl=substr($1,7);x=substr($1,6,1);p[x hkl]=$3}\
        END{for(xhkl in a) print xhkl,a[xhkl]+0,p[xhkl]+0}' |\
     sort |\
@@ -356,11 +379,14 @@ if(-e "$user_fitparams") then
     cp -p ${tempfile}user_fitparams.gnuplot fitparams.gnuplot
 
     cat $user_fitparams |\
-    awk '/^a/{hkl=substr($1,length($1)-2);\
-       print substr(hkl,1,1),substr(hkl,2,1),substr(hkl,3,1);}' |\
-    sort -u | egrep -v '^0 0 0$' |\
+    awk '$1~/_err$/{next}\
+       /^a/{hkl=substr($1,5);\
+       gsub("_"," ",hkl);gsub("p","+",hkl);gsub("m","-",hkl);\
+       print hkl;}' |\
+    awk '{print $1+0,$2+0,$3+0}' |\
+    sort -u |\
     cat >! hkl.txt
-    set order = `awk '{print $1;print $2;print $3}' hkl.txt | sort -gr | awk '{print;exit}'`
+    set nhkls = `cat hkl.txt | wc -l`
 
     # construct bending functions from these coefficients
     rm -f func.gnuplot
@@ -370,18 +396,20 @@ if(-e "$user_fitparams") then
         # define the function to fit in gnuplot5
         egrep "^$x" ${tempfile}apsi.txt |\
         awk -v mult=$mult 'NR==1{x=substr($1,1,1);\
-                print "d"x"(x,y,z)=real(\\"}\
-            {h=substr($1,2,1);k=substr($1,3,1);l=substr($1,4,1);\
-                printf(" +a_d%s%d%d%d/%s",x,h,k,l,mult);\
+                print "d"x"(x,y,z)=(\\"}\
+            {ehkl=substr($1,2);hkl=ehkl;\
+             gsub("p","+",hkl);gsub("m","-",hkl);gsub("_"," ",hkl);\
+             split(hkl,w);h=w[1];k=w[2];l=w[3];\
+                printf(" +a_d%s%s/%s",x,ehkl,mult);\
                 if($3+0==0){print "\\";next}\
-                printf("*exp(2*pi*i*(%d*x+%d*y+%d*z+phi_d%s%d%d%d))\\\n",h,k,l,x,h,k,l);\
+                printf("*sin(2*pi*(%+d*x %+d*y %+d*z+phi_d%s%s))\\\n",h,k,l,x,ehkl);\
             } END{print ")"}' |\
         tee -a func.gnuplot >> $logfile
     end
 
     set reject = 0
-    set maxorder = $order
-    set startorder = $order
+    set maxhkls = $nhkls
+    set starthkls = $nhkls
     if($?REFIT) then
         echo "re-fitting, starting from $user_fitparams"
         goto measure_shifts
@@ -429,39 +457,59 @@ endif
 # make sure this does not exist
 rm -f ${tempfile}remaining.pdb >& /dev/null
 
+echo "generating basis functions out to $reso A resolution"
+echo "    0   0   0       1e10" >! allhkl.txt
+unique hklout ${tempfile}.mtz << EOF >! ${tempfile}unique.log
+cell $CELL
+symm 1
+resolution $reso
+EOF
+rm -f ${tempfile}reso.mtz
+sftools << EOF >> $logfile
+read ${tempfile}.mtz
+calc col reso = 0.5 STOL /
+write ${tempfile}reso.mtz col reso
+quit
+EOF
+mtzdump hklin ${tempfile}reso.mtz << EOF >! ${tempfile}dump.txt
+nref -1
+EOF
+awk '/ LIST OF REFLECTIONS/,/ MTZDUMP/' ${tempfile}dump.txt |\
+awk -v w=4 'substr($0,2,3*w) == sprintf("%"w"d%"w"d%"w"d", $1, $2, $3)' |\
+sort -k4gr |\
+tee -a allhkl.txt |\
+wc -l |\
+awk -v d="$dimensions" '{print $1+1," complex coefficients for each dimension:",d}'
+
 #========================================================================
-#    Big loop over orders:
+#    Big loop over nhkls:
 
 echo -n "" >! fitparams.gnuplot
-foreach order ( `seq $startorder 1 $maxorder` ) 
+foreach nhkls ( `seq $starthkls $batchhkls $maxhkls` ) 
 
 set deltaT = `date +%s | awk -v s=$starttime '{print $1-s}'`
 echo ""
-echo "=================  Starting order $order fit at $deltaT s"
+echo "=================  Starting nhkls $nhkls fit at $deltaT s"
 echo ""
 
-# now generate the basis functions
-echo "generating basis functions out to order $order"
-echo $order |\
-awk '{m=$1;\
-    for(h=0;h<=m;++h)for(k=0;k<=m;++k)for(l=0;l<=m;++l){\
-      r=sqrt(h*h+k*k+l*l);\
-      if(r==0 || r>m) continue;\
-      print h,k,l;}}' |\
-tee hkl.txt |\
-  wc -l |\
-  awk -v d="$dimensions" '{print $1+1," complex coefficients for each dimension:",d}'
+# extract hkls needed to make basis functions
+head -n $nhkls allhkl.txt |\
+cat >! hkl.txt
+
+# encode hkls for variable names
+cat hkl.txt |\
+awk '{gsub("+","p");gsub("-","m");print $1 "_" $2 "_" $3}' |\
+cat >! ehkl.txt
 
 foreach x ( x y z o B )
 
     # define new set to be filled in with last iteration
     echo $x |\
-    cat - hkl.txt |\
-    awk 'NR==1{x=$1;print "a_d"x"000 = new";next}\
-       {h=$1;k=$2;l=$3;\
-          printf("a_d%s%d%d%d = new\n",x,h,k,l);\
-          printf("phi_d%s%d%d%d = new\n",x,h,k,l);\
-       }' |\
+    cat - ehkl.txt |\
+    awk 'NR==1{x=$1;next}\
+       {ehkl=$1;\
+          printf("a_d%s%s = new\n",x,ehkl);}\
+       ehkl!="0_0_0"{printf("phi_d%s%s = new\n",x,ehkl)}' |\
     tee -a fitparams.gnuplot >> $logfile
 end
 
@@ -479,19 +527,17 @@ if(-e "$user_fitparams") goto after_rejects
 #    do slow-ft for starting values
 echo "doing slow-ft to get starting values..."
 echo -n "" >! fitparams_init.gnuplot
-foreach h_k_l ( 0_0_0 `awk '{print $1"_"$2"_"$3}' hkl.txt` )
-    set hkl = `echo $h_k_l | awk -F "_" '{print $1,$2,$3}'`
-    set h = $hkl[1]
-    set k = $hkl[2]
-    set l = $hkl[3]
+foreach ehkl ( `cat ehkl.txt` )
+    set hkl = `echo $ehkl | awk -F "_" '{gsub("m","-");gsub("p","+");print $1,$2,$3}'`
 
     # skip if we already have a value
-    set test = `egrep "a_dx${h}${k}${l} " fitparams.gnuplot | awk '{print ($NF+0 != 0)}'`
+    set test = `egrep "a_dx${ehkl} " fitparams.gnuplot | awk '{print ($NF+0 != 0)}'`
     if("$test" == "1") continue
 
-    echo "$hkl  $fitscale" |\
+    echo "$hkl  $ehkl  $fitscale" |\
     cat - fitme |\
-    awk 'NR==1{h=$1;k=$2;l=$3;mult=$4;pi=atan2(1,1)*4;h000=(h==0 && k==0 && l==0);next;}\
+    awk 'NR==1{h=$1;k=$2;l=$3;ehkl[h,k,l]=$4;mult=$5;\
+        pi=atan2(1,1)*4;h000=(h==0 && k==0 && l==0);next;}\
       {x=$1;y=$2;z=$3;++n;\
       cosine=cos(2*pi*(h*x+k*y+l*z));\
       sine  =sin(2*pi*(h*x+k*y+l*z));\
@@ -515,21 +561,21 @@ foreach h_k_l ( 0_0_0 `awk '{print $1"_"$2"_"$3}' hkl.txt` )
         rz=2*sqrt(azc*azc+azs*azs);if(rz==0)rz=1e-13;\
         ro=2*sqrt(aoc*aoc+aos*aos);if(ro==0)ro=1e-13;\
         rB=2*sqrt(aBc*aBc+aBs*aBs);if(rB==0)rB=1e-10;\
-        px=atan2(axs/rx,axc/rx);if(px==0)px=1e-10;\
-        py=atan2(ays/ry,ayc/ry);if(py==0)py=1e-10;\
-        pz=atan2(azs/rz,azc/rz);if(pz==0)pz=1e-10;\
-        po=atan2(aos/ro,aoc/ro);if(po==0)po=1e-10;\
-        pB=atan2(aBs/rB,aBc/rB);if(pB==0)pB=1e-10;\
-        printf("a_dx%d%d%d = %g\n",h,k,l,rx*mult);\
-        printf("a_dy%d%d%d = %g\n",h,k,l,ry*mult);\
-        printf("a_dz%d%d%d = %g\n",h,k,l,rz*mult);\
-        printf("a_do%d%d%d = %g\n",h,k,l,ro*mult);\
-        printf("a_dB%d%d%d = %g\n",h,k,l,rB);\
-        if(! h000)printf("phi_dx%d%d%d = %g\n",h,k,l,px);\
-        if(! h000)printf("phi_dy%d%d%d = %g\n",h,k,l,py);\
-        if(! h000)printf("phi_dz%d%d%d = %g\n",h,k,l,pz);\
-        if(! h000)printf("phi_do%d%d%d = %g\n",h,k,l,po);\
-        if(! h000)printf("phi_dB%d%d%d = %g\n",h,k,l,pB);\
+        px=atan2(axc/rx,axs/rx);if(px==0)px=1e-10;\
+        py=atan2(ayc/ry,ays/ry);if(py==0)py=1e-10;\
+        pz=atan2(azc/rz,azs/rz);if(pz==0)pz=1e-10;\
+        po=atan2(aoc/ro,aos/ro);if(po==0)po=1e-10;\
+        pB=atan2(aBc/rB,aBs/rB);if(pB==0)pB=1e-10;\
+        printf("a_dx%s = %g\n",ehkl[h,k,l],rx*mult);\
+        printf("a_dy%s = %g\n",ehkl[h,k,l],ry*mult);\
+        printf("a_dz%s = %g\n",ehkl[h,k,l],rz*mult);\
+        printf("a_do%s = %g\n",ehkl[h,k,l],ro*mult);\
+        printf("a_dB%s = %g\n",ehkl[h,k,l],rB);\
+        if(! h000)printf("phi_dx%s = %g\n",ehkl[h,k,l],px);\
+        if(! h000)printf("phi_dy%s = %g\n",ehkl[h,k,l],py);\
+        if(! h000)printf("phi_dz%s = %g\n",ehkl[h,k,l],pz);\
+        if(! h000)printf("phi_do%s = %g\n",ehkl[h,k,l],po);\
+        if(! h000)printf("phi_dB%s = %g\n",ehkl[h,k,l],pB);\
         }' |\
 tee -a fitparams_init.gnuplot >> $logfile
 
@@ -544,6 +590,29 @@ awk '! seen[$1]{print;++seen[$1]}' |\
 cat >! ${tempfile}
 mv ${tempfile} fitparams.gnuplot
 
+# drop very weak coefficients
+set bigcoff = `awk '/^a/ && ! /_eff /{print sqrt($3*$3)}' fitparams.gnuplot | sort -gr | head -n 1`
+set thresh = `echo $bigcoff $drop_frac | awk '{print $1*$2}'`
+echo "dropping coefficients less than $thresh "
+echo $thresh |\
+cat - fitparams.gnuplot |\
+awk 'NR==1 && $2+0>0{thresh=$1/$2;next}\
+  sqrt($3*$3)<thresh{next}\
+  {print}' |\
+cat >! ${tempfile}
+mv ${tempfile} fitparams.gnuplot
+set test = `egrep "a_dx" fitparams.gnuplot | egrep -v _err | wc -l`
+echo "$test coefficients left"
+
+
+# add spots for error bars
+cat fitparams.gnuplot |\
+awk '$1~/_err$/{print;++seen[$1];next}\
+   seen[$1"_err"]{next}\
+   {print;$1=$1"_err";$3=1e-10;print}' |\
+cat >! ${tempfile}
+mv ${tempfile} fitparams.gnuplot
+
 
 after_rejects:
 #============================
@@ -551,7 +620,7 @@ after_rejects:
 
 # clean up fitparams so that values don't get too small to fit?
 cat fitparams.gnuplot |\
-awk '$3+0!=0 && $3!="1e-10" && sqrt($3*$3)<1e-5{$3=1e-5} {print}' |\
+awk '$3+0!=0 && $3!="1e-10" && sqrt($3*$3)<1e-5 && $1!~/_err$/{$3=1e-5} {print}' |\
 cat >! ${tempfile}
 set test = `diff fitparams.gnuplot $tempfile | egrep "^<" | wc -l`
 if($test != 0) then
@@ -568,11 +637,29 @@ endif
 
 # construct fit commands for gnuplot to match this param file
 cat fitparams.gnuplot |\
-awk '/^a/{hkl=substr($1,5);x=substr($1,4,1);a[x hkl]=$3}\
-       /^phi/{hkl=substr($1,7);x=substr($1,6,1);p[x hkl]=$3}\
-       END{for(xhkl in a) print xhkl,a[xhkl]+0,p[xhkl]+0}' |\
+awk '$1~/_err$/{next}\
+  /^a/{hkl=substr($1,5);x=substr($1,4,1);a[x hkl]=$3}\
+  /^phi/{hkl=substr($1,7);x=substr($1,6,1);p[x hkl]=$3}\
+  END{for(xhkl in a) print xhkl,a[xhkl]+0,p[xhkl]+0}' |\
 sort >! ${tempfile}apsi.txt 
 #  pairwise table of fittable values
+
+# convert into mtz file
+cat ${tempfile}apsi.txt |\
+awk '{x=substr($0,1,1);hkl=substr($1,2);\
+   gsub("m","-",hkl);gsub("p","+",hkl);gsub("_"," ",hkl);\
+   a[hkl,x]=$2;phi[hkl,x]=$3;++seen[hkl]}\
+  END{for(hkl in seen){\
+   print hkl,a[hkl,"x"],phi[hkl,"x"],a[hkl,"y"],phi[hkl,"y"],a[hkl,"z"],phi[hkl,"z"]}}' |\
+sort -g >! ${tempfile}coeffs.hkl
+f2mtz hklin ${tempfile}coeffs.hkl hklout init.mtz << EOF | tee f2mtz1.log > $logfile
+CELL $CELL
+SYMM 1
+labou H K L dx PHIdx dy PHIdy dz PHIdz
+ctypo H H H F P F P F P
+EOF
+
+
 
 # zero value becomes a flag for do-not-fit
 set n = 3
@@ -582,7 +669,7 @@ foreach x ( x y z o B )
     # generate the fit command
     egrep "^$x" ${tempfile}apsi.txt |\
     awk -v n=$n 'NR==1{x=substr($1,1,1);\
-            printf("fit real(d%s(x,y,z)) \"fitme\" using 1:2:3:%d:(1) via ",x,n);first=1}\
+            printf("fit d%s(x,y,z) \"fitme\" using 1:2:3:%d:(1) via ",x,n);first=1}\
         {xhkl=$1}\
         $2!=0{\
             if(! first)printf(",");first=0;\
@@ -603,12 +690,16 @@ foreach x ( x y z o B )
     # define the function to fit in gnuplot5
     egrep "^$x" ${tempfile}apsi.txt |\
     awk -v mult=$mult 'NR==1{x=substr($1,1,1);\
-            print "d"x"(x,y,z)=real(\\"}\
-        {h=substr($1,2,1);k=substr($1,3,1);l=substr($1,4,1);\
-            printf(" +a_d%s%d%d%d/%s",x,h,k,l,mult);\
+            print "d"x"(x,y,z)=\\"}\
+        $1~/_err$/{next}\
+        {ehkl=substr($1,2);hkl=ehkl;\
+            gsub("m","-",hkl);gsub("p","+",hkl);\
+            split(hkl,w,"_");\
+            h=w[1];k=w[2];l=w[3];\
+            printf(" +a_d%s%s/%s",x,ehkl,mult);\
             if($3+0==0){print "\\";next}\
-            printf("*exp(2*pi*i*(%d*x+%d*y+%d*z+phi_d%s%d%d%d))\\\n",h,k,l,x,h,k,l);\
-        } END{print ")"}' |\
+            printf("*sin(2*pi*(%+d*x %+d*y %+d*z+phi_d%s%s))\\\n",h,k,l,x,ehkl);\
+        } END{print ""}' |\
     tee -a func.gnuplot >> $logfile
 end
 
@@ -616,6 +707,14 @@ end
 
 #========================================================================
 #    this is the part that needs gnuplot5
+
+if($?NOFIT) then
+    echo "nofit: skipping gnuplot5 — using DFT (slow-FT) starting values directly"
+    foreach x ( x y z o B )
+        egrep "_d${x}" fitparams.gnuplot >! fitparams_${x}.gnuplot
+    end
+    goto nofit_done
+endif
 
 echo "launching fitting jobs..."
 onintr killfit
@@ -633,10 +732,10 @@ foreach x ( x y z o B )
     if( "$test" == "1" ) continue
 
     gnuplot5 << EOF >&! fitrun_${x}.log &
-    i = sqrt(-1)
     c(x) = column(x)
     set dummy x,y,z
     $FIT_LIMIT
+    set fit errorvariables
     load 'func.gnuplot'
     load 'fitparams_${x}.gnuplot'
     load 'fit${x}.gnuplot'
@@ -659,12 +758,13 @@ foreach x ( x y z o B )
     if(! -e fitrun_${x}.log) continue
     set test = `grep -i singular fitrun_${x}.log | wc -l`
     if($test) then
-        mv fitrun_${x}.log bad_fitrun_order${order}_${x}.log
-        echo "WARNING: fit for $x is unstable. see bad_fitrun_order${order}_${x}.log"
-echo "GOTHERE"
-exit
+        mv fitrun_${x}.log bad_fitrun_nhkls${nhkls}_${x}.log
+        set BAD = "ERROR: fit for $x is unstable. see bad_fitrun_nhkls${nhkls}_${x}.log"
+        goto exit
     endif
 end
+
+nofit_done:
 
 
 #========================================================================
@@ -693,6 +793,35 @@ awk 'NR==1{a=$1;b=$2;c=$3;mult=$NF}\
    /^a_dz/{print $0,sqrt($NF*$NF)*c/mult}' |\
 sort -k5g > /dev/null
 
+# filter out bad signal-to-noise
+# for each a_d* param, compute SNR = |fitted_a| / fitted_a_err (last _err line wins)
+# drop params (and associated phi) where SNR < drop_snr
+if($drop_snr != "0") then
+    cat fitparams.gnuplot |\
+    awk -v snrcut=$drop_snr '
+        {line[NR]=$0}
+        !/err/ && /^a_d/ {hkl=$1; sub(/^a_/,"",hkl); val[hkl]=$3}
+        /_err$/ {n=$1; sub(/_err$/,"",n); sub(/^a_/,"",n); err[n]=$3}
+        END {
+            for(n in val) {
+                a=val[n]; if(a<0)a=-a
+                e=err[n]; if(e<0)e=-e
+                if(e>0 && a/e < snrcut) bad[n]=1
+            }
+            dropped=0
+            for(i=1;i<=NR;++i) {
+                l=line[i]; split(l,w); n=w[1]
+                sub(/^a_/,"",n); sub(/^phi_/,"",n); sub(/_err$/,"",n)
+                if(bad[n]) {++dropped; next}
+                print l
+            }
+            if(dropped>0) print "SNR-pruned",dropped,"params (SNR <",snrcut")" > "/dev/stderr"
+        }' |\
+    cat >! ${tempfile}
+    mv ${tempfile} fitparams.gnuplot
+endif
+
+
 # look for parameters that are far too correlated?
 echo -n >! param_correlations.txt
 foreach x ( x y z o B )
@@ -716,7 +845,42 @@ diff fitparams.gnuplot fitparams_edited.gnuplot
 
 
 echo -n "biggest coefficient: "
-awk '/^a_/' fitparams_x.gnuplot | sort -k3gr | awk '{print;exit}'
+awk '/^a_/ && ! /_err/' fitparams_[xyz].gnuplot | sort -k3gr | awk '{print;exit}'
+
+
+# convert to mtz file
+cat fitparams.gnuplot |\
+awk '/^a/{ehkl=substr($1,5);x=substr($1,4,1)}\
+  /^phi/{ehkl=substr($1,7);x=substr($1,6,1)}\
+  {split(ehkl,w,"_");hkl=w[1]"_"w[2]"_"w[3]}\
+  $1~/_err$/ && /^a/{siga[x hkl]=$3;next}\
+  $1~/_err$/ && /^p/{sigp[x hkl]=$3;next}\
+    /^a/{a[x hkl]=$3}\
+  /^phi/{p[x hkl]=$3}\
+       END{for(xhkl in a) print xhkl,a[xhkl]+0,siga[xhkl]+0,p[xhkl]+0,sigp[xhkl]+0}' |\
+sort >! ${tempfile}apsi.txt 
+#  pairwise table of fittable values and their error bars
+
+# convert into mtz file
+cat ${tempfile}apsi.txt |\
+awk '{x=substr($0,1,1);hkl=substr($1,2);\
+   gsub("m","-",hkl);gsub("p","+",hkl);gsub("_"," ",hkl);\
+   a[hkl,x]=$2;phi[hkl,x]=$4;\
+   siga[hkl,x]=$3;sigp[hkl,x]=$5;\
+   ++seen[hkl]}\
+  END{RTD=45/atan2(1,1); for(hkl in seen){\
+   print hkl,a[hkl,"x"],siga[hkl,"x"],phi[hkl,"x"]*RTD,sigp[hkl,"x"]*RTD,\
+    a[hkl,"y"],siga[hkl,"y"],phi[hkl,"y"]*RTD,sigp[hkl,"y"]*RTD,\
+    a[hkl,"z"],siga[hkl,"z"],phi[hkl,"z"]*RTD,sigp[hkl,"z"]*RTD}}' |\
+sort -g >! ${tempfile}coeffs.hkl
+f2mtz hklin ${tempfile}coeffs.hkl hklout coeffs.mtz << EOF | tee f2mtz2.log > $logfile
+CELL $CELL
+SYMM 1
+labou H K L dx SIGdx PHIdx SIGPdx dy SIGdy PHIdy SIGPdy dz SIGdz PHIdz SIGPdz
+ctypo H H H F Q P Q F Q P Q F Q P Q
+EOF
+
+
 
 
 bend_pdb:
@@ -737,13 +901,12 @@ foreach x ( x y z B o )
 
   gnuplot << EOF &
 frac = $frac
-i = sqrt(-1)
 c(x) = column(x)
 load 'func.gnuplot'
 load 'fitparams.gnuplot'
 
 set table "${tempfile}atom_${x}.txt"
-plot '${tempfile}this.frac' using (c(0)+1):(c($n)+frac*real(d${x}(c(2),c(3),c(4))))
+plot '${tempfile}this.frac' using (c(0)+1):(c($n)+frac*d${x}(c(2),c(3),c(4)))
 EOF
 end
 wait
@@ -779,32 +942,32 @@ END
 EOF-conv
 
 # make sure it has the space group in the header
-echo "SPACE $SG" | pdbset xyzin ${tempfile}bent.pdb xyzout bent${order}_${id1}.pdb >> $logfile
-echo "transformed $id1 to match $id2 is bent${order}_${id1}.pdb"
+echo "SPACE $SG" | pdbset xyzin ${tempfile}bent.pdb xyzout bent${nhkls}_${id1}.pdb >> $logfile
+echo "transformed $id1 to match $id2 is bent${nhkls}_${id1}.pdb"
 
 # since pdbset and coordconv screw up names, transplant these from the original
-# keeping only XYZ and B from the bending results
-head -n 4 bent${order}_${id1}.pdb | egrep "^CRYST|^SCALE" >! ${tempfile}.pdb
+# keeping only XYZ, occ and B from the bending results
+head -n 4 bent${nhkls}_${id1}.pdb | egrep "^CRYST|^SCALE" >! ${tempfile}.pdb
 cat $pdb1 |\
 awk '/^ATOM|^HETAT/{++n;\
       print "REST",n,"|",substr($0,67);\
       print substr($0,1,30),"OLDNAME",n}' |\
-cat bent${order}_${id1}.pdb - |\
+cat bent${nhkls}_${id1}.pdb - |\
 awk '/^REST/{rest[$2]=substr($0,index($0,"|")+2)}\
     / OLDNAME /{n=$NF;print substr($0,1,30) xyzOB[n] rest[n];next}\
    /^ATOM|^HETAT/{++n;xyzOB[n]=substr($0,31,3*8+2*6)}' |\
 cat >> ${tempfile}.pdb
-mv ${tempfile}.pdb bent${order}_${id1}.pdb
+mv ${tempfile}.pdb bent${nhkls}_${id1}.pdb
 
 echo "residual after shifts:"
 if(! -e ${tempfile}remaining.pdb) cp $pdb2 ${tempfile}remaining.pdb
-cat ${tempfile}remaining.pdb bent${order}_${id1}.pdb | egrep -v "HETAT" |\
+cat ${tempfile}remaining.pdb bent${nhkls}_${id1}.pdb | egrep -v "HETAT" |\
  awk '$NF != "H"' |\
  rmsd | grep -v WARN
 
 if("$geotest" == "true" || "$geotest" == "True") then
     echo "evaluating chemical geometry after distortion"
-    refmac5 xyzin bent${order}_${id1}.pdb xyzout ${tempfile}junk.pdb << EOF >&! ${tempfile}geo.log
+    refmac5 xyzin bent${nhkls}_${id1}.pdb xyzout ${tempfile}junk.pdb << EOF >&! ${tempfile}geo.log
     refi type ideal
     ncyc 1
 EOF
@@ -819,12 +982,12 @@ endif
 
 if("$reject" != 0) then
 
-    cat ${tempfile}remaining.pdb bent${order}_${id1}.pdb | egrep -v "HETAT" |\
+    cat ${tempfile}remaining.pdb bent${nhkls}_${id1}.pdb | egrep -v "HETAT" |\
      awk '$NF != "H"' |\
      rmsd -v debug=1 |\
      grep -v WARN |\
      tee ${tempfile}moves.txt |\
-     awk '/moved/{print substr($0,23,8)}' |\
+     awk '/moved/{print substr($0,25,8)}' |\
        sort -g |\
        awk '# compute median old fashioned way\
             {++n;v[n]=$1} \
@@ -841,7 +1004,7 @@ if("$reject" != 0) then
     rm -f ${tempfile}thresh.txt
 
     cat ${tempfile}moves.txt |\
-    awk -v threshold=$threshold '/moved/ && substr($0,23,8)+0>threshold' |\
+    awk -v threshold=$threshold '/moved/ && substr($0,25,8)+0>threshold' |\
     cat >! ${tempfile}rejects.txt
     set nrejects = `cat ${tempfile}rejects.txt | wc -l`
     echo "rejecting $nrejects outliers > $reject * MAD from median"
@@ -852,7 +1015,7 @@ if("$reject" != 0) then
     cat >! ${tempfile}new.pdb
     mv ${tempfile}new.pdb ${tempfile}remaining.pdb
 
-    egrep "^CRYST|^SCALE" bent${order}_${id1}.pdb >! ${tempfile}rejectme.pdb
+    egrep "^CRYST|^SCALE" bent${nhkls}_${id1}.pdb >! ${tempfile}rejectme.pdb
     cat ${tempfile}rejects.txt ${tempfile}remaining.pdb |\
     awk '/moved/{++rejected[substr($0,1,15)];next} {id=substr($0,12,15)}\
        /^ATOM|^HETAT/ && rejected[id]{print}' |\
@@ -893,8 +1056,8 @@ EOF
 endif
 
 if(! -e "$user_fitparams") then
-    cp fitparams.gnuplot fitparams_${order}.gnuplot
-    cp func.gnuplot func_${order}.gnuplot
+    cp fitparams.gnuplot fitparams_${nhkls}.gnuplot
+    cp func.gnuplot func_${nhkls}.gnuplot
 else
     if($?REFIT) cp fitparams.gnuplot fitparams_refit.gnuplot
 endif
@@ -942,24 +1105,22 @@ echo "map header is $header bytes"
 foreach x ( x y z )
 
   gnuplot << EOF &
-i = sqrt(-1)
 c(x) = column(x)
 load 'func.gnuplot'
 load 'fitparams.gnuplot'
 
 set table "${tempfile}delta_${x}.txt"
-plot 'mapdump.frac' using (c(0)+1):(real(d${x}(c(2),c(3),c(4))))
+plot 'mapdump.frac' using (c(0)+1):(d${x}(c(2),c(3),c(4)))
 EOF
 end
 
 gnuplot << EOF &
-i = sqrt(-1)
 c(x) = column(x)
 load 'func.gnuplot'
 load 'fitparams.gnuplot'
 
 set table "${tempfile}delta_r.txt"
-r(x,y,z) = sqrt(real(dx(c(2),c(3),c(4)))**2 +real(dy(c(2),c(3),c(4)))**2 +real(dz(c(2),c(3),c(4)))**2)
+r(x,y,z) = sqrt(dx(c(2),c(3),c(4))**2 +dy(c(2),c(3),c(4))**2 +dz(c(2),c(3),c(4))**2)
 plot 'mapdump.frac' using (c(0)+1):(r(c(2),c(3),c(4)))
 EOF
 
@@ -990,7 +1151,7 @@ end
 
 bend_map:
 #========================================================================
-#     go on to next order now, if there is no map
+#     go on to next nhkls now, if there is no map
 
 
 # no map and user-defined bend = nothing left to do
@@ -1038,13 +1199,12 @@ foreach x ( x y z )
   @ n = ( $n + 1 )
 
   gnuplot << EOF &
-i = sqrt(-1)
 c(x) = column(x)
 load 'func.gnuplot'
 load 'fitparams.gnuplot'
 
 set table "${tempfile}atom_${x}.txt"
-plot 'mapdump.frac' using (c(0)+1):(c($n)-real(d${x}(c(2),c(3),c(4))))
+plot 'mapdump.frac' using (c(0)+1):(c($n)-d${x}(c(2),c(3),c(4)))
 EOF
 end
 wait
@@ -1149,19 +1309,19 @@ endif
 
 # force rewrite of header stats
 echo scale factor 1 |\
-mapmask mapin ${tempfile}new.map mapout bent${order}.map > $logfile
-ls -l $mapfile bent${order}.map
+mapmask mapin ${tempfile}new.map mapout bent${nhkls}.map > $logfile
+ls -l $mapfile bent${nhkls}.map
 
 
 set aligner = "$pdb1"
 if(-e "$user_fitparams") set aligner = "$user_fitparams"
-echo "bent${order}.map is now a version of $mapfile aligned with $aligner"
+echo "bent${nhkls}.map is now a version of $mapfile aligned with $aligner"
 
 # we are not looping if user specified params
 if(-e "$user_fitparams") goto cleanup
 
 #========================================================================
-#    end of big loop over orders
+#    end of big loop over nhkls
 end
 
 cleanup:
