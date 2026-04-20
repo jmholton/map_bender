@@ -96,27 +96,40 @@ set starttime = `date +%s`
 #    help message if run with no arguments
 
 if($#argv == 0) then
-    cat << EOF 
-usage: $0 bendme.pdb reference.pdb [bendme.map] [reso=10] \
-      [frac=x] [reject=6] [dimensions=xyz] \
-      [fitparams_x.gnuplot] [refit] [deltamaps]
+    cat << EOF
+usage: $0 bendme.pdb reference.pdb [bendme.map] \
+      [nhkls=30] [starthkls=$starthkls] [batchhkls=$batchhkls] [reso=$reso] \
+      [frac=$frac] [reject=$reject] [dimensions=xyz] \
+      [drop_frac=$drop_frac] [drop_snr=$drop_snr] \
+      [geotest=$geotest] [fitscale=$fitscale] [fit_limit=1e-6] [Bblur=$Bblur] \
+      [fitparams_x.gnuplot] [refit] [nofit] [deltamaps]
 
 where:
-bendme.pdb     defines the frame to be distorted to match the reference
-reference.pdb  defines the reference frame and cell
+bendme.pdb     PDB to be distorted to match the reference
+reference.pdb  reference PDB; defines the target frame and cell
+bendme.map     any CCP4 map in the frame of bendme.pdb; will be spline-interpolated
+               into the reference frame (optional)
 
-bendme.map     is a map that will be spline interpolated into the reference frame
+nhkls          max number of Fourier (HKL) coefficients to fit. Default: $maxhkls
+starthkls      number of coefficients in the first iteration. Default: $starthkls
+batchhkls      coefficients added per iteration. Default: $batchhkls
+reso           resolution cutoff (A) for HKL generation. Default: $reso
+frac           how far along the bend path to place the output (0-1). Default: $frac
+reject         drop atom pairs with shifts > reject x MAD from median. Default: off
+dimensions     coordinate fields to fit; any subset of x y z o B. Default: x y z
+drop_frac      pre-fit: drop DFT amplitudes below this fraction of the max. Default: $drop_frac
+drop_snr       post-fit: drop fitted params with |a|/sigma_a below this. Default: $drop_snr
+geotest        run refmac5 geometry check at each step (slow). Default: $geotest
+fitscale       internal amplitude scale factor (avoids gnuplot underflow). Default: $fitscale
+fit_limit      gnuplot FIT_LIMIT convergence criterion. Default: gnuplot's built-in
+Bblur          apply B-factor blur (A^2) to the map before re-sampling. Default: $Bblur
+fitparams_x.gnuplot  apply a previously-fitted shift function; skip the fitting step
+refit          force re-fitting even when fitparams are provided
+nofit          skip gnuplot fitting; use raw DFT starting values (fast but inaccurate)
+deltamaps      write CCP4 maps of shift magnitudes dx, dy, dz, dr over the whole cell
+nodeltamaps    suppress deltamaps even if set by default
 
-nhkls          is the number of hkl coefficients of 3D polysine functions to use in the fit. Default: $maxhkls
-frac           is how far along the bend path to place the output.  Default: $frac
-reject         reject outlier shifts > 6x the median absolute deviation. Default: no rejection
-dimensions     aspects of PDB files to fit, default: xyz (not occ or B)
-fitparams_x.gnuplot  - use a previously-fitted function, skip the fit step
-refit          do the fit step even if a fitparams.gnuplot is provided
-nofit          skip gnuplot fitting, use DFT (slow-FT) values directly — much faster, slightly less accurate
-deltamaps      generate electron density maps of the shift magnitudes in x,y,z and r over whole cell
-
-both PDB files must always be provided because they contain the two unit cells.
+both PDB files must always be provided because they define the two unit cells.
 EOF
     exit 9
 endif

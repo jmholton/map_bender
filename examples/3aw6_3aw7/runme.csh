@@ -17,7 +17,7 @@
 # To just apply the pre-fitted solution (< 1 minute):
 #   bendfinder.com 3aw7_refine_001.pdb 3aw6_refine_001.pdb fitparams_30.gnuplot
 #
-# To also re-sample the 2Fo-Fc map into the reference frame:
+# To also re-sample a map into the reference frame (any CCP4 map works):
 #   bendfinder.com 3aw7_refine_001.pdb 3aw6_refine_001.pdb 3aw7_2fofc.map fitparams_30.gnuplot
 
 set script = `dirname $0`/../../bendfinder.com

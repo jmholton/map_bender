@@ -1,12 +1,12 @@
 # map_bender / bendfinder.com
 
-Finds a smooth, periodic coordinate-shift field that maps one crystal form of a protein onto another. The shift field is expressed as a truncated Fourier series using real Miller-index sine functions — physically motivated basis functions that respect the periodicity of the crystal lattice.
+Finds a smooth, periodic coordinate-shift field that maps the coordinates of one crystal onto a reference crystal of the same protein. The shift field is expressed as a truncated Fourier series using real Miller-index sine functions — physically motivated basis functions that respect the periodicity of the crystal lattice.
 
 Primary author: James Holton
 
 ## What it does
 
-Given two PDB files of the same protein in different (non-isomorphous) crystal forms, `bendfinder.com` computes a smooth 3D vector field **Δr(x,y,z)** such that applying that field to the coordinates of `bendme.pdb` minimises the all-atom RMSD to `reference.pdb`. Optionally, a 2Fo-Fc electron density map can be re-sampled into the reference frame.
+Given two PDB files of the same protein (same or different crystal forms), `bendfinder.com` computes a smooth 3D vector field **Δr(x,y,z)** such that applying that field to the coordinates of `bendme.pdb` minimises the all-atom RMSD to `reference.pdb`. Optionally, any CCP4 map in the frame of `bendme.pdb` can be spline-interpolated into the reference frame.
 
 The shift field is parameterised as:
 

@@ -15,7 +15,7 @@ The unit cell contracts ~2.5% isotropically as humidity decreases from 84.2% to 
 |------|-------------|
 | `3aw7_refine_001.pdb` | Moving PDB — the structure to be bent |
 | `3aw6_refine_001.pdb` | Reference PDB — the target frame |
-| `3aw7_2fofc.map` | 2Fo-Fc electron density map for 3aw7 (CCP4 format) |
+| `3aw7_2fofc.map` | 2Fo-Fc electron density map for 3aw7 (CCP4 format; any map can be used) |
 | `fitparams_30.gnuplot` | Pre-fitted Fourier coefficients at nhkls=30 |
 | `bent30_3aw7_refine_001.pdb` | 3aw7 after applying the nhkls=30 shift field |
 | `bendfinder_nhkls30.log` | Full output from the nhkls=30 run |
@@ -31,7 +31,7 @@ bendfinder.com 3aw7_refine_001.pdb 3aw6_refine_001.pdb fitparams_30.gnuplot
 
 This applies the pre-computed shift field and reports RMSD without re-fitting.
 
-**Apply to the 2Fo-Fc map as well:**
+**Apply to a map as well** (any CCP4 map in the frame of the moving PDB):
 
 ```tcsh
 bendfinder.com 3aw7_refine_001.pdb 3aw6_refine_001.pdb 3aw7_2fofc.map fitparams_30.gnuplot
