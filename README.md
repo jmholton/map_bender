@@ -69,7 +69,7 @@ Earlier versions used only positive (h,k,l) and a complex-exponential basis, whi
 - Sorts by **resolution** (d-spacing), so the largest-scale (most physically meaningful) deformations are fitted first — analogous to fitting low-order terms before high-order ones.
 - Uses **real sine functions**, which avoids complex arithmetic in gnuplot and makes the fitted parameters directly interpretable as amplitude and phase.
 
-Benchmark on lysozyme crystal forms 3aw6/3aw7:
+Benchmark on lysozyme 3aw6/3aw7 (same crystal form, two relative humidity conditions — 71.9% vs 84.2% — causing ~2.5% cell contraction):
 
 | HKLs fitted | RMSD(CA) | Time  | Old approach equivalent        |
 |-------------|----------|-------|-------------------------------|

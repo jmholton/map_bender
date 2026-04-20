@@ -1,13 +1,13 @@
 # Example: lysozyme 3aw7 → 3aw6
 
-Hen egg-white lysozyme in two crystal forms with slightly different unit cells:
+Hen egg-white lysozyme measured at two relative humidity conditions, both in the same space group but with slightly different unit cells due to crystal dehydration:
 
-| File | PDB ID | Space group | a=b (Å) | c (Å) |
-|------|--------|-------------|---------|-------|
-| `3aw7_refine_001.pdb` | 3aw7 | P4₃2₁2 | 77.0 | 37.3 |
-| `3aw6_refine_001.pdb` | 3aw6 | P4₃2₁2 | 79.0 | 38.2 |
+| File | PDB ID | Space group | a=b (Å) | c (Å) | RH |
+|------|--------|-------------|---------|-------|----|
+| `3aw7_refine_001.pdb` | 3aw7 | P4₃2₁2 | 77.0 | 37.3 | 84.2% |
+| `3aw6_refine_001.pdb` | 3aw6 | P4₃2₁2 | 79.0 | 38.2 | 71.9% |
 
-The shift field is dominated by a ~2.5% isotropic cell expansion. This makes it a good test case: the dominant term is a simple dilation, but higher-order terms reveal real structural differences between the two crystal forms.
+The unit cell contracts ~2.5% isotropically as humidity decreases from 84.2% to 71.9%. The shift field captures both this bulk contraction and the local conformational changes that accompany it.
 
 ## Files
 

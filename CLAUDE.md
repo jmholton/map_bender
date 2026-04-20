@@ -19,8 +19,8 @@ The git repo lives at `./map_bender/` (relative to this directory). The working 
   lyso_test_031419/         gold-standard reference run
     bendfinder.log          reference results: order 0=0.771, 1=0.413, 2=0.327, 3=0.246, 4=0.215, 5=0.209
     bendfinder.com          script version used for that gold-standard run
-    3aw7_refine_001.pdb     moving PDB (lysozyme form 2)
-    3aw6_refine_001.pdb     reference PDB (lysozyme form 1)
+    3aw7_refine_001.pdb     moving PDB (lysozyme at 84.2% RH, a=b=77.0 c=37.3 A)
+    3aw6_refine_001.pdb     reference PDB (lysozyme at 71.9% RH, a=b=79.0 c=38.2 A)
     3aw7_2fofc.map          2Fo-Fc map for re-sampling
   test1/                    oldest reference run (positive-only HKLs, complex exponential basis)
     bendfinder.com          original script (2017)
