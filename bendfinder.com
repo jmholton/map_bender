@@ -811,27 +811,28 @@ sort -k5g > /dev/null
 # drop params (and associated phi) where SNR < drop_snr
 if($drop_snr != "0") then
     cat fitparams.gnuplot |\
-    awk -v snrcut=$drop_snr '
-        {line[NR]=$0}
-        !/err/ && /^a_d/ {hkl=$1; sub(/^a_/,"",hkl); val[hkl]=$3}
-        /_err$/ {n=$1; sub(/_err$/,"",n); sub(/^a_/,"",n); err[n]=$3}
-        END {
-            for(n in val) {
-                a=val[n]; if(a<0)a=-a
-                e=err[n]; if(e<0)e=-e
-                if(e>0 && a/e < snrcut) bad[n]=1
-            }
-            dropped=0
-            for(i=1;i<=NR;++i) {
-                l=line[i]; split(l,w); n=w[1]
-                sub(/^a_/,"",n); sub(/^phi_/,"",n); sub(/_err$/,"",n)
-                if(bad[n]) {++dropped; next}
-                print l
-            }
-            if(dropped>0) print "SNR-pruned",dropped,"params (SNR <",snrcut")" > "/dev/stderr"
+    awk -v snrcut=$drop_snr '\
+        {line[NR]=$0}\
+        /^a_d/ && index($1,"_err")==0 {hkl=$1; sub(/^a_/,"",hkl); val[hkl]=$3}\
+        /_err$/ {n=$1; sub(/_err$/,"",n); sub(/^a_/,"",n); err[n]=$3}\
+        END {\
+            for(n in val) {\
+                a=val[n]; if(a<0)a=-a\
+                e=err[n]; if(e<0)e=-e\
+                if(e>0 && a/e < snrcut) bad[n]=1\
+            }\
+            dropped=0\
+            for(i=1;i<=NR;++i) {\
+                l=line[i]; split(l,w); n=w[1]\
+                sub(/^a_/,"",n); sub(/^phi_/,"",n); sub(/_err$/,"",n)\
+                if(bad[n]) {++dropped; continue}\
+                print l\
+            }\
+            if(dropped>0) print "SNR-pruned",dropped,"params (SNR <",snrcut")"\
         }' |\
     cat >! ${tempfile}
-    mv ${tempfile} fitparams.gnuplot
+    egrep "^SNR-pruned" ${tempfile}
+    egrep -v "^SNR-pruned" ${tempfile} >! fitparams.gnuplot
 endif
 
 
