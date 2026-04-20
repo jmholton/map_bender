@@ -1,0 +1,995 @@
+expanding /home/jamesh/projects/map_bender/lyso_test_031419/3aw7_refine_001.pdb from P43212 to P1
+expanding /home/jamesh/projects/map_bender/lyso_test_031419/3aw6_refine_001.pdb from P43212 to P1
+largest fractional CA shift: 0.0173901 for 75CA LEU A 7
+generating basis functions out to 3 A resolution
+18605  complex coefficients for each dimension: x y z
+
+=================  Starting nhkls 5 fit at 1 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.020333 
+5 coefficients left
+launching fitting jobs...
+[1] 1612343
+[2] 1612351
+[3] 1612359
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.09256829149098         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1612593
+[2] 1612594
+[3] 1612595
+[4] 1612596
+[5] 1612597
+[5]  - Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent5_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.327139 (129 CA pairs)
+RMSD(all)= 0.570193 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.41303	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 6 fit at 9 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00709257 
+6 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = -1.63375651504123e-06
+launching fitting jobs...
+[1] 1612769
+[2] 1612777
+[3] 1612785
+[3]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.09257567815554         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1612862
+[2] 1612863
+[3] 1612864
+[4] 1612865
+[5] 1612866
+[5]  - Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent6_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.322725 (129 CA pairs)
+RMSD(all)= 0.56785 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.41366	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 7 fit at 11 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00709258 
+7 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = 9.33629152234175e-06
+launching fitting jobs...
+[1] 1613034
+[2] 1613042
+[3] 1613050
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.07882063344727         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1613145
+[2] 1613146
+[3] 1613147
+[4] 1613148
+[5] 1613149
+[5]  + Done                          gnuplot << EOF
+[4]  - Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent7_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.326319 (129 CA pairs)
+RMSD(all)= 0.569642 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.3984	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 8 fit at 14 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00707882 
+8 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = 9.99991810097137e-06
+launching fitting jobs...
+[1] 1613352
+[2] 1613360
+[3] 1613368
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.07476259319142         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1613639
+[2] 1613640
+[3] 1613641
+[4] 1613642
+[5] 1613643
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent8_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.326039 (129 CA pairs)
+RMSD(all)= 0.5696 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.3941	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 9 fit at 21 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00707476 
+9 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = 9.12037928982458e-06
+launching fitting jobs...
+[1] 1613934
+[2] 1613942
+[3] 1613950
+[3]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.07910788263137         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1614143
+[2] 1614144
+[3] 1614145
+[4] 1614146
+[5] 1614147
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent9_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.277132 (129 CA pairs)
+RMSD(all)= 0.545333 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.34553	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 10 fit at 34 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00707911 
+10 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = 9.96970278016258e-06
+launching fitting jobs...
+[1] 1614330
+[2] 1614338
+[3] 1614346
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.08354807680515         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1614758
+[2] 1614759
+[3] 1614760
+[4] 1614761
+[5] 1614762
+[5]    Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent10_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.277207 (129 CA pairs)
+RMSD(all)= 0.542805 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.26948	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 11 fit at 50 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00708355 
+11 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = 6.66662220444082e-07
+launching fitting jobs...
+[1] 1614952
+[2] 1614960
+[3] 1614968
+[3]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.05666234906251         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1615252
+[2] 1615253
+[3] 1615254
+[4] 1615255
+[5] 1615256
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent11_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.276044 (129 CA pairs)
+RMSD(all)= 0.542584 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.30701	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 12 fit at 72 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00705666 
+12 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = -1.16662368324495e-06
+launching fitting jobs...
+[1] 1615447
+[2] 1615455
+[3] 1615463
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.03028518470435         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1615731
+[2] 1615732
+[3] 1615733
+[4] 1615734
+[5] 1615735
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent12_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.282148 (129 CA pairs)
+RMSD(all)= 0.542732 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.2617	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 13 fit at 96 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00703029 
+13 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = -2.77624763255691e-06
+launching fitting jobs...
+[1] 1615938
+[2] 1615947
+[3] 1615955
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.02951621052904         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1616217
+[2] 1616218
+[3] 1616219
+[4] 1616220
+[5] 1616221
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent13_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.279939 (129 CA pairs)
+RMSD(all)= 0.543098 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.29032	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 14 fit at 117 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00702952 
+14 coefficients left
+launching fitting jobs...
+[1] 1616417
+[2] 1616425
+[3] 1616433
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 7.02862609668937         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1616733
+[2] 1616734
+[3] 1616735
+[4] 1616736
+[5] 1616737
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent14_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.276619 (129 CA pairs)
+RMSD(all)= 0.541034 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.28002	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 15 fit at 144 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00702863 
+15 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = -8.48811775215025e-06
+launching fitting jobs...
+[1] 1616937
+[2] 1616945
+[3] 1616953
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.9345286552829          
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1617355
+[2] 1617356
+[3] 1617357
+[4] 1617358
+[5] 1617359
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent15_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.268373 (129 CA pairs)
+RMSD(all)= 0.535809 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.26291	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 16 fit at 186 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00693453 
+16 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = -9.21456913259358e-06
+launching fitting jobs...
+[1] 1617563
+[2] 1617571
+[3] 1617579
+[3]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.82784656539379         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1618174
+[2] 1618175
+[3] 1618176
+[4] 1618177
+[5] 1618178
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent16_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.265421 (129 CA pairs)
+RMSD(all)= 0.532637 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.24455	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 17 fit at 235 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00682785 
+17 coefficients left
+WARNING: augmenting 3 very small values:
+< phi_dx1_1_0 = 8.15566413806378e-06
+< phi_dy1_0_0 = 7.81654400829249e-06
+< phi_dy1_1_0 = -2.71753161510795e-06
+launching fitting jobs...
+[1] 1618395
+[2] 1618403
+[3] 1618411
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.81683617967741         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1619111
+[2] 1619112
+[3] 1619113
+[4] 1619114
+[5] 1619115
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent17_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.261821 (129 CA pairs)
+RMSD(all)= 0.531415 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.25132	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 18 fit at 315 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00681684 
+18 coefficients left
+launching fitting jobs...
+[1] 1619334
+[2] 1619342
+[3] 1619350
+[3]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.80677092860197         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1619630
+[2] 1619631
+[3] 1619632
+[4] 1619633
+[5] 1619634
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent18_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.262497 (129 CA pairs)
+RMSD(all)= 0.532634 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.29703	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 19 fit at 359 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00680677 
+19 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = -6.76523976995366e-06
+launching fitting jobs...
+[1] 1619859
+[2] 1619867
+[3] 1619875
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.79488627523446         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1620450
+[2] 1620451
+[3] 1620452
+[4] 1620453
+[5] 1620454
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent19_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.258187 (129 CA pairs)
+RMSD(all)= 0.528991 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.29277	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 20 fit at 415 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00679489 
+20 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_1_0 = -2.8937907604902e-06
+launching fitting jobs...
+[1] 1620684
+[2] 1620692
+[3] 1620708
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.78408260439034         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1622000
+[2] 1622001
+[3] 1622002
+[4] 1622003
+[5] 1622004
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent20_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.245101 (129 CA pairs)
+RMSD(all)= 0.523687 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.26289	for   OE1 GLN A 121   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 21 fit at 580 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00678408 
+21 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = -5.81399230985182e-06
+launching fitting jobs...
+[1] 1622228
+[2] 1622236
+[3] 1622244
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.78173726942494         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1622727
+[2] 1622728
+[3] 1622729
+[4] 1622730
+[5] 1622731
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent21_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.222125 (129 CA pairs)
+RMSD(all)= 0.515085 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.30329	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 22 fit at 615 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00678174 
+22 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = 7.42679509697121e-06
+launching fitting jobs...
+[1] 1623021
+[2] 1623029
+[3] 1623037
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.77928066460021         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1623666
+[2] 1623667
+[3] 1623668
+[4] 1623669
+[5] 1623670
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent22_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.218086 (129 CA pairs)
+RMSD(all)= 0.514921 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.26672	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 23 fit at 690 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00677928 
+23 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = -6.4689892332334e-06
+launching fitting jobs...
+[1] 1623903
+[2] 1623911
+[3] 1623919
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.77780924518317         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1624744
+[2] 1624745
+[3] 1624746
+[4] 1624747
+[5] 1624748
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent23_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.222287 (129 CA pairs)
+RMSD(all)= 0.516669 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.29327	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 24 fit at 820 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00677781 
+24 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = 8.55432067454687e-06
+launching fitting jobs...
+[1] 1625013
+[2] 1625021
+[3] 1625029
+[3]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.77747149175503         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1625694
+[2] 1625695
+[3] 1625696
+[4] 1625697
+[5] 1625698
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent24_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.220221 (129 CA pairs)
+RMSD(all)= 0.515573 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.27013	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 25 fit at 872 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00677747 
+25 coefficients left
+WARNING: augmenting 1 very small values:
+< phi_dy1_0_0 = 9.99956207951055e-06
+launching fitting jobs...
+[1] 1625939
+[2] 1625947
+[3] 1625955
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.77612610010932         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1627376
+[2] 1627377
+[3] 1627378
+[4] 1627379
+[5] 1627380
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent25_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.216412 (129 CA pairs)
+RMSD(all)= 0.513442 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.25118	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 26 fit at 964 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00677613 
+26 coefficients left
+WARNING: augmenting 3 very small values:
+< phi_dy0_2_0 = 3.24401114878133e-06
+< phi_dy1_0_0 = 8.32323848790508e-06
+< phi_dy1_1_0 = 4.2187157882933e-06
+launching fitting jobs...
+[1] 1627662
+[2] 1627670
+[3] 1627678
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.77271204079949         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1628512
+[2] 1628513
+[3] 1628514
+[4] 1628515
+[5] 1628516
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent26_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.214857 (129 CA pairs)
+RMSD(all)= 0.511693 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.23457	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 27 fit at 1070 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00677271 
+27 coefficients left
+WARNING: augmenting 2 very small values:
+< phi_dy0_2_0 = 9.82363031884405e-06
+< phi_dy1_0_0 = 7.57601291613842e-06
+launching fitting jobs...
+[1] 1628767
+[2] 1628775
+[3] 1628783
+[3]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dy1_0_0       = 6.77129431584861         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1630519
+[2] 1630520
+[3] 1630521
+[4] 1630522
+[5] 1630523
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent27_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.215963 (129 CA pairs)
+RMSD(all)= 0.51229 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.23781	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 28 fit at 1196 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00677129 
+28 coefficients left
+WARNING: augmenting 2 very small values:
+< phi_dy0_2_0 = 9.99998164239647e-06
+< phi_dy1_0_0 = 9.99968469897509e-06
+launching fitting jobs...
+[1] 1630781
+[2] 1630789
+[3] 1630797
+[3]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  - Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.76538781458936         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1631861
+[2] 1631862
+[3] 1631863
+[4] 1631864
+[5] 1631865
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent28_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.215282 (129 CA pairs)
+RMSD(all)= 0.511341 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.22493	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 29 fit at 1309 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.00676539 
+29 coefficients left
+WARNING: augmenting 2 very small values:
+< phi_dy0_2_0 = -8.84606038930269e-06
+< phi_dy1_0_0 = -3.82710918695105e-06
+launching fitting jobs...
+[1] 1632125
+[2] 1632134
+[3] 1632142
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.78190293233845         
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1632967
+[2] 1632968
+[3] 1632969
+[4] 1632970
+[5] 1632971
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent29_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.216818 (129 CA pairs)
+RMSD(all)= 0.512253 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.23187	for   NH2 ARG A  61   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  Starting nhkls 30 fit at 1421 s
+
+doing slow-ft to get starting values...
+done with slow-ft
+dropping coefficients less than 0.0067819 
+30 coefficients left
+launching fitting jobs...
+[1] 1633250
+[2] 1633258
+[3] 1633266
+[3]    Done                          gnuplot << EOF >& fitrun_${x}.log
+[2]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+[1]  + Done                          gnuplot << EOF >& fitrun_${x}.log
+biggest coefficient: a_dx0_1_0       = 6.797181893461           
+applying smoothed shifts to 3aw7_refine_001 
+[1] 1634276
+[2] 1634277
+[3] 1634278
+[4] 1634279
+[5] 1634280
+[5]  + Done                          gnuplot << EOF
+[4]  + Done                          gnuplot << EOF
+[3]  + Done                          gnuplot << EOF
+[2]  + Done                          gnuplot << EOF
+[1]  + Done                          gnuplot << EOF
+combining dimensions together...
+converting back to orthogonal coordinates.
+transformed 3aw7_refine_001 to match 3aw6_refine_001 is bent30_3aw7_refine_001.pdb
+residual after shifts:
+1001 atom pairs found
+RMSD(CA )= 0.210978 (129 CA pairs)
+RMSD(all)= 0.511095 (1001 atom pairs)
+RMSD(Bfac)= 10.6814
+MAXD(all)= 4.24378	for   NH1 ARG A 125   
+MAXD(Bfac)= -19.56	for   NH1 ARG A  45   
+
+=================  all done at 1503 s
+
