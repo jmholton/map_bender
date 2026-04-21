@@ -26,10 +26,10 @@ Both PDB files must be provided even when applying a pre-fitted function, becaus
 
 ## Requirements
 
-- **tcsh**
-- **CCP4 suite** (coordconv, pdbset, mapmask, mapdump, unique, sftools, mtzdump, f2mtz, fft, refmac5)
-- **gnuplot ≥ 5** (accessible as `gnuplot` or `gnuplot5`)
-- **mapman** from the Uppsala Software Factory RAVE suite (only needed when a map file is provided)
+- **tcsh** (prototype version only)
+- **CCP4 suite** (coordconv, pdbset, mapmask, mapdump, unique, sftools, mtzdump, f2mtz, fft, refmac5) (prototype version only)
+- **gnuplot ≥ 5** (accessible as `gnuplot` or `gnuplot5`) (prototype version only)
+- **mapman** from the Uppsala Software Factory RAVE suite (only needed when a map file is provided) (prototype version only)
 
 ## Options
 

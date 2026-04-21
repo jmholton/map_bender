@@ -2,7 +2,7 @@
 
 ## Project overview
 
-`bendfinder.com` is a tcsh script that fits a smooth, periodic 3D coordinate-shift field between two non-isomorphous crystal forms of the same protein. The shift field is a Fourier series indexed by Miller indices (h,k,l).
+`bendfinder.com` is a prototype script that fits a smooth, periodic 3D coordinate-shift field between two non-isomorphous crystal forms of the same protein. The shift field is a Fourier series indexed by Miller indices (h,k,l).
 
 The git repo lives at `./map_bender/` (relative to `../`). The working development copy is `../bendfinder.com`. Keep both in sync when making changes — they must stay identical.
 
@@ -18,7 +18,7 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
     origins.com
     LICENSE
     examples/3aw6_3aw7/         canonical lysozyme example (checked into git)
-  lyso_test_031419/             gold-standard reference run (old tcsh version)
+  lyso_test_031419/             gold-standard reference run (old prototype version)
     bendfinder.log              order 0=0.771, 1=0.413, 2=0.327, 3=0.246, 4=0.215, 5=0.209
     bendfinder.com              original script used for gold-standard
     3aw7_refine_001.pdb         moving PDB (lysozyme form 2)
@@ -44,7 +44,7 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
   test_goldstd/                 benchmark run (new vs gold-standard)
 ```
 
-## Algorithm summary (current tcsh version)
+## Algorithm summary (prototype version)
 
 1. Both PDBs expanded from their space group to P1 (via CCP4 `pdbset`).
 2. Atom pairs matched by residue+atom name; fractional Δr = shift at each atom.
@@ -137,7 +137,7 @@ a_dx0_1_0_err = 0.058        ← fitted σ, use this
 
 Lines ~796–822 (after gnuplot fit, before correlation analysis). awk reads fitparams.gnuplot, computes SNR = |a| / σ_a, drops params below threshold. Output routing: informational `SNR-pruned N params` line is mixed in tempfile; `egrep ^SNR-pruned` displays it, `egrep -v ^SNR-pruned` strips it before writing fitparams.gnuplot (prevents gnuplot parse errors).
 
-## tcsh pitfalls (bugs fixed — do not reintroduce)
+## tcsh features to keep in mind
 
 1. **Multi-line awk in single quotes**: tcsh requires `\` at the end of every internal line of a `'...'` string. Bare newlines cause `Unmatched '.` at runtime.
 2. **`!` in awk patterns**: tcsh expands `!` for history substitution before quote parsing. `!/pattern/` triggers `Event not found`. Use `index($field,"str")==0` instead.
@@ -215,7 +215,7 @@ LAPACK is already used internally by scipy for lstsq; no need to call it from C.
 
 ### Comparison
 
-| Feature | tcsh + gnuplot | Python + lstsq |
+| Feature | prototype + gnuplot | Python + lstsq |
 |---------|---------------|----------------|
 | Parameterization | (a, φ) nonlinear | (A, B) linear |
 | Incremental loop | Required (load-bearing) | Not needed |
