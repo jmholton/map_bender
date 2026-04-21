@@ -3,7 +3,7 @@
 
 Usage:
   cd dhfr/
-  srun /programs/ccp4-8.0/bin/ccp4-python run_test.py [pdb1 mtz1 pdb2 mtz2] [nhkls=N]
+  srun /programs/ccp4-8.0/bin/ccp4-python run_test.py [pdb1 mtz1 pdb2 mtz2] [nhkls=N|fitreso=X]
 
 Defaults to 1rx1 (moving) vs 1rx2 (reference).
 Output: bent<N>.pdb, 1rx1_2fofc.map, 1rx2_2fofc.map, bent<N>.map, psdvf.mtz
@@ -22,6 +22,7 @@ USE_SRUN = True   # set False to run inline (for debugging)
 pdb1 = '1rx1.pdb'; mtz1 = '1rx1.mtz'
 pdb2 = '1rx2.pdb'; mtz2 = '1rx2.mtz'
 nhkls = 100
+fitreso = None
 for arg in sys.argv[1:]:
     if arg.endswith('.pdb'):
         if '1' in arg or pdb1 == '1rx1.pdb':
@@ -30,6 +31,8 @@ for arg in sys.argv[1:]:
             pdb2 = arg
     elif arg.startswith('nhkls='):
         nhkls = int(arg.split('=')[1])
+    elif arg.startswith('fitreso='):
+        fitreso = float(arg.split('=')[1])
     elif arg.startswith('pdb1='):
         pdb1 = arg.split('=', 1)[1]
     elif arg.startswith('pdb2='):
@@ -118,7 +121,7 @@ make_2fofc_map(f'{stem2}_refine_001.mtz', f'{stem2}_2fofc.map')
 print(f'\n── Step 3: bendfinder shift-field fit ────────────────────────────────')
 print(f"  moving={pdb1}  reference={pdb2}  nhkls={nhkls}")
 
-result = bend_fit(pdb1, pdb2, nhkls=nhkls, reso=3.0, drop_snr=1.0, use_symm=True)
+result = bend_fit(pdb1, pdb2, nhkls=nhkls, fitreso=fitreso, reso=3.0, drop_snr=1.0, use_symm=True)
 n_active = int(result.active.sum())
 print(f"  RMSD(CA) = {result.rmsd:.3f} Å   active HKLs = {n_active}")
 

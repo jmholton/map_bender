@@ -5,8 +5,9 @@ Usage:
     bendfinder.py moving.pdb reference.pdb [map.ccp4] [key=value ...]
 
 Parameters:
-    nhkls=30        max Fourier terms (default 30)
-    reso=3          resolution cutoff in Angstroms (default 3)
+    nhkls=30        max Fourier terms (default 30); overridden by fitreso
+    fitreso=X       use all HKLs with d ≥ X Å (e.g. fitreso=20); sets nhkls automatically
+    reso=3          resolution cutoff for HKL list in Angstroms (default 3)
     drop_snr=1      post-fit SNR threshold (default 1; 0 = disable)
     frac=1          scale factor for applied shifts (default 1)
     geotest=false   run refmac5 geometry check (default false)
@@ -983,7 +984,7 @@ class BendResult:
     dimensions: str       # e.g. 'xyz'
 
 
-def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, drop_snr=1.0,
+def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.0,
              dimensions='xyz', geotest=False, frac=1.0, verbose=True,
              use_symm=True):
     """Fit a Fourier shift field between pdb1 (moving) and pdb2 (reference).
@@ -1019,6 +1020,19 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, drop_snr=1.0,
     all_hkls = generate_hkls(cell1, reso)
     ntotal   = len(all_hkls)
     print(f"{ntotal - 1}  complex coefficients for each dimension: {dimensions}")
+
+    if fitreso is not None:
+        # Count HKLs with d >= fitreso; all_hkls is sorted by d desc, DC term first
+        Gs = _reciprocal_metric(cell1)
+        nhkls = 1  # always include DC
+        for hv in all_hkls[1:]:
+            inv_d2 = float(hv.astype(float) @ Gs @ hv.astype(float))
+            if inv_d2 > 0 and 1.0 / np.sqrt(inv_d2) >= fitreso:
+                nhkls += 1
+            else:
+                break  # sorted desc, so first miss ends the run
+        if verbose:
+            print(f"fitreso={fitreso} A → nhkls={nhkls}")
 
     nhkls_use = min(nhkls, ntotal)
     hkls      = all_hkls[:nhkls_use]
@@ -1139,6 +1153,7 @@ def _parse_args(argv):
     params = {
         'nhkls':      30,
         'reso':       3.0,
+        'fitreso':    None,
         'drop_snr':   1.0,
         'frac':       1.0,
         'geotest':    False,
@@ -1162,6 +1177,8 @@ def _parse_args(argv):
             val = val.strip()
             if key in ('nhkls', 'starthkls', 'maxhkls'):
                 params['nhkls'] = int(val)
+            elif key == 'fitreso':
+                params['fitreso'] = float(val)
             elif key == 'reso':
                 params['reso'] = float(val)
             elif key == 'drop_snr':
@@ -1205,7 +1222,8 @@ def main():
     else:
         result = bend_fit(
             pdb1, pdb2,
-            nhkls=p['nhkls'], reso=p['reso'], drop_snr=p['drop_snr'],
+            nhkls=p['nhkls'], reso=p['reso'], fitreso=p['fitreso'],
+            drop_snr=p['drop_snr'],
             dimensions=p['dimensions'], geotest=p['geotest'], frac=p['frac'],
             use_symm=p['use_symm'],
         )
