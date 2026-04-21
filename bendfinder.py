@@ -10,6 +10,7 @@ Parameters:
     drop_snr=1      post-fit SNR threshold (default 1; 0 = disable)
     frac=1          scale factor for applied shifts (default 1)
     geotest=false   run refmac5 geometry check (default false)
+    use_symm=true   enforce space-group symmetry constraint (default true)
     dimensions=xyz  which shifts to fit (subset of xyzoBà; default xyz)
     fitparams=file  load pre-computed fitparams.npy and skip fitting
     deltamaps       write delta-x/y/z/r maps in addition to bent map
@@ -232,6 +233,230 @@ def generate_hkls(cell, reso):
             unique.append(key)
 
     return np.array([(0, 0, 0)] + unique, dtype=int)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Space-group symmetry for PSDVF fitting
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_proper_symops(sg_name):
+    """Return list of (R, t) for proper (det=+1) rotation operators of sg_name.
+
+    R : (3,3) float — rotation matrix in fractional coordinates
+    t : (3,)  float — translation in fractional coordinates
+    """
+    sg = gemmi.find_spacegroup_by_name(sg_name)
+    result = []
+    for op in sg.operations():
+        R = np.array(op.rot, dtype=float) / 24.0
+        t = np.array(op.tran, dtype=float) / 24.0
+        if round(np.linalg.det(R)) == 1:
+            result.append((R, t))
+    return result
+
+
+def assign_canonical(hkls, proper_ops):
+    """Assign each Friedel-unique HKL to its canonical orbit representative.
+
+    The canonical HKL is the lexicographic minimum of {R_k^T H} over all
+    proper operators k, reduced to Friedel-unique form.
+
+    Returns
+    -------
+    canon_hkls   : (M, 3) int — one canonical HKL per orbit (M ≤ N)
+    hkl_to_canon : (N,) int  — index into canon_hkls for each input HKL
+    hkl_all_ops  : list of N lists of (k, flip) — ALL operators mapping
+                   R_k^T canon → ±HKL[i]; flip=True means negation was needed
+    """
+    rot_mats = [np.round(R).astype(int) for R, _ in proper_ops]
+    hkl_set = {tuple(int(x) for x in h) for h in hkls}
+
+    def to_friedel(h):
+        """Return (friedel_form, flipped).  flipped=True if negation was needed."""
+        h = tuple(int(round(x)) for x in h)
+        if h in hkl_set:
+            return h, False
+        neg = tuple(-x for x in h)
+        if neg in hkl_set:
+            return neg, True
+        return None, False
+
+    canon_map = {}
+    canon_list = []
+    hkl_to_canon = np.zeros(len(hkls), dtype=int)
+    hkl_all_ops  = []          # list of lists; filled in second pass below
+
+    for i, h in enumerate(hkls):
+        h_t = tuple(int(x) for x in h)
+        orbit = []
+        for j, R in enumerate(rot_mats):
+            fu, _ = to_friedel(R.T @ np.array(h))
+            if fu is not None:
+                orbit.append((fu, j))
+        if not orbit:
+            orbit = [(h_t, 0)]
+
+        canon = min(set(fu for fu, _ in orbit))   # lexicographic min
+
+        if canon not in canon_map:
+            canon_map[canon] = len(canon_list)
+            canon_list.append(canon)
+        hkl_to_canon[i] = canon_map[canon]
+        hkl_all_ops.append([])    # placeholder; filled below
+
+    canon_hkls = np.array(canon_list, dtype=int)
+
+    # Second pass: for each HKL i find ALL (k, flip) where R_k^T canon → ±H_i
+    for i, h in enumerate(hkls):
+        h_t = tuple(int(x) for x in h)
+        m   = hkl_to_canon[i]
+        canon = canon_hkls[m]
+        ops_for_i = []
+        for k, R in enumerate(rot_mats):
+            fu, flipped = to_friedel(R.T @ canon)
+            if fu == h_t:
+                ops_for_i.append((k, flipped))
+        hkl_all_ops[i] = ops_for_i
+
+    return canon_hkls, hkl_to_canon, hkl_all_ops
+
+
+def build_design_matrix_symm(frac_coords, canon_hkls, proper_ops,
+                             hkl_to_canon, hkl_all_ops):
+    """Build (3N, 6M) symmetry-adapted design matrix for PSDVF.
+
+    Free parameters per canonical HKL m: A_x,A_y,A_z (cols 6m+0..2) and
+    B_x,B_y,B_z (cols 6m+3..5).  Row 3n+α = atom n, dimension α.
+
+    X[3n+α, 6m+β]   = Σ_k R_k[β,α] sin(2π H_m·(R_k x_n + t_k))
+    X[3n+α, 6m+3+β] = Σ_k R_k[β,α] cos(2π H_m·(R_k x_n + t_k))
+
+    Only operators k whose image R_k^T H_c is in the Friedel-unique HKL basis
+    are included (via hkl_all_ops).  Operators mapping to HKLs outside the
+    truncated basis are omitted, keeping the design matrix consistent with
+    expand_ab_canon.
+    """
+    N, M = len(frac_coords), len(canon_hkls)
+    X = np.zeros((3 * N, 6 * M))
+    canon_f = canon_hkls.astype(float)
+
+    # valid_mk[m, k] = True if operator k maps H_c_m to a basis HKL
+    n_ops = len(proper_ops)
+    valid_mk = np.zeros((M, n_ops), dtype=bool)
+    for j in range(len(hkl_all_ops)):
+        m = hkl_to_canon[j]
+        for k, _flip in hkl_all_ops[j]:
+            valid_mk[m, k] = True
+
+    for ki, (R, t) in enumerate(proper_ops):
+        x_t = frac_coords @ R.T + t                    # (N, 3)
+        ph  = TWO_PI * (x_t @ canon_f.T)               # (N, M)
+        s = np.sin(ph)                                  # (N, M)
+        c = np.cos(ph)
+        # Zero columns for canonicals where this op maps outside the basis
+        s[:, ~valid_mk[:, ki]] = 0.0
+        c[:, ~valid_mk[:, ki]] = 0.0
+        for alpha in range(3):
+            for beta in range(3):
+                r = R[beta, alpha]                      # (R^T)[alpha,beta]
+                if r == 0.0:
+                    continue
+                X[alpha::3, beta::6]   += r * s
+                X[alpha::3, 3+beta::6] += r * c
+    return X
+
+
+def fit_lstsq_symm(X, b, drop_snr=1.0, max_rounds=5):
+    """Joint 3D lstsq with per-canonical-HKL SNR pruning.
+
+    X : (3N, 6M) symmetry-adapted design matrix
+    b : (3N,)    interleaved shifts [Δx_0,Δy_0,Δz_0, Δx_1,...]
+
+    Returns
+    -------
+    params       : (6M,) float — fitted (A,B) vectors for each canonical HKL
+    active_canon : (M,)  bool  — surviving canonical HKLs
+    snr_canon    : (M,)  float — SNR per canonical HKL
+    """
+    M = X.shape[1] // 6
+    n = X.shape[0]
+    active = np.ones(M, dtype=bool)
+    params_full = np.zeros(6 * M)
+    snr_full    = np.zeros(M)
+
+    for _ in range(max_rounds):
+        col_mask = np.repeat(active, 6)
+        Xa = X[:, col_mask]
+        ai = np.where(active)[0]
+
+        U, s, Vt = np.linalg.svd(Xa, full_matrices=False)
+        s_thresh = s.max() * max(Xa.shape) * np.finfo(float).eps * 100
+        s_inv = np.zeros_like(s)
+        nz = s > s_thresh
+        s_inv[nz] = 1.0 / s[nz]
+
+        sol   = Vt.T @ (s_inv * (U.T @ b))
+        resid = b - Xa @ sol
+        rank  = int(nz.sum())
+        dof   = max(n - rank, 1)
+        sig2  = float(np.dot(resid, resid)) / dof
+
+        cov_diag = sig2 * np.sum((Vt * s_inv[:, None])**2, axis=0)   # (p,)
+
+        # SNR per canonical HKL: 6-parameter block norm
+        p_blk   = sol.reshape(-1, 6)        # (M_active, 6)
+        cov_blk = cov_diag.reshape(-1, 6)
+        a     = np.sqrt(np.sum(p_blk**2,   axis=1))
+        sig_a = np.sqrt(np.sum(cov_blk,    axis=1))   # sqrt(sum of variances)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            snr_a = np.where(sig_a > 0, a / sig_a, 0.0)
+
+        params_full[col_mask] = sol
+        snr_full[ai] = snr_a
+
+        if drop_snr <= 0:
+            break
+        drop = snr_a < drop_snr
+        if not drop.any():
+            break
+        active[ai[drop]] = False
+
+    params_full[np.repeat(~active, 6)] = 0.0
+    return params_full, active, snr_full
+
+
+def expand_ab_canon(params, active_canon, canon_hkls, hkls,
+                    hkl_to_canon, hkl_all_ops, proper_ops):
+    """Expand canonical (A,B) params to full Friedel-unique AB (3, N_hkls, 2).
+
+    Each Friedel-unique HKL j collects contributions from ALL operators k
+    that map canon_m to ±H_j.  For operator k with flip flag f:
+        A_j += (-1)^f * R_k^T (A_c cos φ_k - B_c sin φ_k)   [sin(-H·r)=-sin(H·r)]
+        B_j +=           R_k^T (A_c sin φ_k + B_c cos φ_k)
+    where φ_k = 2π H_c · t_k.
+    """
+    N_hkls = len(hkls)
+    AB = np.zeros((3, N_hkls, 2))
+    for j in range(N_hkls):
+        m = hkl_to_canon[j]
+        if not active_canon[m]:
+            continue
+        Ac  = params[6*m:6*m+3]
+        Bc  = params[6*m+3:6*m+6]
+        Hc  = canon_hkls[m].astype(float)
+        A_j = np.zeros(3)
+        B_j = np.zeros(3)
+        for k, flip in hkl_all_ops[j]:
+            R, t = proper_ops[k]
+            phi  = TWO_PI * float(np.dot(Hc, t))
+            cph, sph = np.cos(phi), np.sin(phi)
+            dA = R.T @ (Ac * cph - Bc * sph)
+            dB = R.T @ (Ac * sph + Bc * cph)
+            A_j += -dA if flip else dA
+            B_j += dB
+        AB[:, j, 0] = A_j
+        AB[:, j, 1] = B_j
+    return AB
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -624,7 +849,8 @@ class BendResult:
 
 
 def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, drop_snr=1.0,
-             dimensions='xyz', geotest=False, frac=1.0, verbose=True):
+             dimensions='xyz', geotest=False, frac=1.0, verbose=True,
+             use_symm=True):
     """Fit a Fourier shift field between pdb1 (moving) and pdb2 (reference).
 
     Returns BendResult with fitted coefficients and RMSD.
@@ -669,12 +895,40 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, drop_snr=1.0,
     shifts = fitme[:, dim_indices]   # (N_atoms, N_dims)
 
     frac_coords = fitme[:, :3]
-    X = build_design_matrix(frac_coords, hkls)
+
+    # Use symmetry-constrained fitting when all xyz dims are present and sg > P1
+    proper_ops = get_proper_symops(sg1)
+    do_symm = (use_symm and len(proper_ops) > 1
+               and all(d in dim_list for d in 'xyz'))
 
     dt = time.time() - t0
     print(f"\n=================  Starting nhkls {nhkls_use} fit at {dt:.0f} s\n")
 
-    AB, active, snr = fit_lstsq(X, shifts, drop_snr=drop_snr)
+    if do_symm:
+        canon_hkls, hkl_to_canon, hkl_all_ops = assign_canonical(hkls, proper_ops)
+        n_canon = len(canon_hkls)
+        print(f"{n_canon} canonical HKLs ({len(proper_ops)} proper symops, "
+              f"reduction {nhkls_use}/{n_canon}={nhkls_use/max(n_canon,1):.1f}x)")
+        X_symm = build_design_matrix_symm(frac_coords, canon_hkls, proper_ops,
+                                           hkl_to_canon, hkl_all_ops)
+        xyz_col = [dim_list.index(d) for d in 'xyz']
+        shifts_xyz  = shifts[:, xyz_col]       # (N, 3) in x,y,z order
+        shifts_flat = shifts_xyz.ravel()       # (3N,) interleaved
+        params, active_c, snr_c = fit_lstsq_symm(
+            X_symm, shifts_flat, drop_snr=drop_snr)
+        AB_xyz = expand_ab_canon(params, active_c, canon_hkls, hkls,
+                                 hkl_to_canon, hkl_all_ops, proper_ops)
+        # Build full AB (N_dims, N_hkls, 2) — xyz from symm fit
+        AB = np.zeros((len(dim_list), nhkls_use, 2))
+        for new_i, d in enumerate(dim_list):
+            if d in 'xyz':
+                AB[new_i] = AB_xyz['xyz'.index(d)]
+        # Propagate active/snr from canonical → Friedel-unique
+        active = np.array([active_c[hkl_to_canon[j]] for j in range(nhkls_use)])
+        snr    = np.array([snr_c[hkl_to_canon[j]]    for j in range(nhkls_use)])
+    else:
+        X = build_design_matrix(frac_coords, hkls)
+        AB, active, snr = fit_lstsq(X, shifts, drop_snr=drop_snr)
 
     n_dropped = nhkls_use - int(active.sum())
     if n_dropped > 0:
@@ -753,6 +1007,7 @@ def _parse_args(argv):
         'drop_snr':   1.0,
         'frac':       1.0,
         'geotest':    False,
+        'use_symm':   True,
         'dimensions': 'xyz',
         'fitparams':  None,
         'deltamaps':  False,
@@ -780,6 +1035,8 @@ def _parse_args(argv):
                 params['frac'] = float(val)
             elif key == 'geotest':
                 params['geotest'] = val.lower() in ('true', '1', 'yes')
+            elif key == 'use_symm':
+                params['use_symm'] = val.lower() not in ('false', '0', 'no')
             elif key == 'dimensions':
                 params['dimensions'] = val
             elif key == 'fitparams':
@@ -815,6 +1072,7 @@ def main():
             pdb1, pdb2,
             nhkls=p['nhkls'], reso=p['reso'], drop_snr=p['drop_snr'],
             dimensions=p['dimensions'], geotest=p['geotest'], frac=p['frac'],
+            use_symm=p['use_symm'],
         )
         nhkls = int(result.active.sum())
 
