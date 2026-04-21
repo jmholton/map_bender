@@ -12,7 +12,7 @@ Parameters:
     geotest=false   run refmac5 geometry check (default false)
     use_symm=true   enforce space-group symmetry constraint (default true)
     dimensions=xyz  which shifts to fit (subset of xyzoBà; default xyz)
-    fitparams=file  load pre-computed fitparams.npy and skip fitting
+    fitparams=file  load pre-computed fitparams.mtz and skip fitting
     deltamaps       write delta-x/y/z/r maps in addition to bent map
 
 Public API:
@@ -803,31 +803,111 @@ def make_delta_maps(map_path, hkls, AB_xyz, nhkls):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# fitparams save / load (numpy format)
+# fitparams save / load (MTZ format)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
-    # np.savez appends .npz automatically; strip .npz suffix first so the
-    # caller's path is the actual filename on disk.
     path = str(path)
-    if path.endswith('.npz'):
-        path = path[:-4]
-    np.savez(path,
-             hkls=hkls, AB=AB, active=active, snr=snr,
-             cell1=np.array(cell1), cell2=np.array(cell2),
-             dimensions=np.array(list(dimensions)),
-             rmsd=np.array(rmsd))
-    return path + '.npz'
+    for suffix in ('.npz', '.mtz'):
+        if path.endswith(suffix):
+            path = path[:-len(suffix)]
+            break
+    path = path + '.mtz'
+
+    n_hkls = len(hkls)
+    n_dims = len(dimensions)
+
+    mtz = gemmi.Mtz()
+    mtz.spacegroup = gemmi.find_spacegroup_by_name('P 1')
+    mtz.cell = gemmi.UnitCell(*cell1)
+    mtz.title = 'bendfinder shift-field coefficients'
+    mtz.history = [
+        'BENDFINDER cell1 ' + ' '.join(f'{x:.6g}' for x in cell1),
+        'BENDFINDER cell2 ' + ' '.join(f'{x:.6g}' for x in cell2),
+        f'BENDFINDER dimensions {dimensions}',
+        f'BENDFINDER rmsd {rmsd:.6f}',
+    ]
+
+    mtz.add_dataset('bendfinder')
+    mtz.add_column('H', 'H')
+    mtz.add_column('K', 'H')
+    mtz.add_column('L', 'H')
+    for dim in dimensions:
+        mtz.add_column(f'A{dim.upper()}', 'R')
+        mtz.add_column(f'B{dim.upper()}', 'R')
+    mtz.add_column('SNR', 'R')
+    mtz.add_column('ACTIVE', 'R')
+
+    n_cols = 3 + 2 * n_dims + 2
+    data = np.zeros((n_hkls, n_cols), dtype=np.float32)
+    data[:, 0] = hkls[:, 0]
+    data[:, 1] = hkls[:, 1]
+    data[:, 2] = hkls[:, 2]
+    for d in range(n_dims):
+        data[:, 3 + 2*d]     = AB[d, :, 0]
+        data[:, 3 + 2*d + 1] = AB[d, :, 1]
+    data[:, 3 + 2*n_dims]     = snr
+    data[:, 3 + 2*n_dims + 1] = active.astype(np.float32)
+
+    mtz.set_data(data)
+    mtz.write_to_file(path)
+    return path
 
 
 def load_fitparams(path):
     path = str(path)
-    if not path.endswith('.npz'):
-        path = path + '.npz'
-    d = np.load(path, allow_pickle=False)
-    return (d['hkls'], d['AB'], d['active'].astype(bool), d['snr'],
-            tuple(d['cell1']), tuple(d['cell2']),
-            ''.join(d['dimensions']), float(d['rmsd']))
+    if not (path.endswith('.mtz') or path.endswith('.npz')):
+        if os.path.exists(path + '.mtz'):
+            path = path + '.mtz'
+        elif os.path.exists(path + '.npz'):
+            path = path + '.npz'
+
+    # Backward compat: read old numpy format
+    if path.endswith('.npz'):
+        d = np.load(path, allow_pickle=False)
+        return (d['hkls'], d['AB'], d['active'].astype(bool), d['snr'],
+                tuple(d['cell1']), tuple(d['cell2']),
+                ''.join(d['dimensions']), float(d['rmsd']))
+
+    mtz = gemmi.read_mtz_file(path)
+
+    cell1 = tuple(mtz.cell.parameters)
+    cell2 = cell1
+    dimensions = 'xyz'
+    rmsd = 0.0
+    for line in mtz.history:
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != 'BENDFINDER':
+            continue
+        key = parts[1]
+        if key == 'cell1':
+            cell1 = tuple(float(x) for x in parts[2:8])
+        elif key == 'cell2':
+            cell2 = tuple(float(x) for x in parts[2:8])
+        elif key == 'dimensions':
+            dimensions = parts[2]
+        elif key == 'rmsd':
+            rmsd = float(parts[2])
+
+    data = np.array(mtz, copy=False)
+    labels = [c.label for c in mtz.columns]
+
+    H = data[:, labels.index('H')].astype(int)
+    K = data[:, labels.index('K')].astype(int)
+    L = data[:, labels.index('L')].astype(int)
+    hkls = np.stack([H, K, L], axis=1)
+
+    n_hkls = len(hkls)
+    n_dims = len(dimensions)
+    AB = np.zeros((n_dims, n_hkls, 2))
+    for d, dim in enumerate(dimensions):
+        AB[d, :, 0] = data[:, labels.index(f'A{dim.upper()}')]
+        AB[d, :, 1] = data[:, labels.index(f'B{dim.upper()}')]
+
+    snr    = data[:, labels.index('SNR')]
+    active = data[:, labels.index('ACTIVE')].astype(bool)
+
+    return hkls, AB, active, snr, cell1, cell2, dimensions, rmsd
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1078,7 +1158,7 @@ def main():
 
         # Save fitparams
         fp_path = save_fitparams(
-            f"fitparams{nhkls}.npz", result.hkls, result.AB, result.active, result.snr,
+            f"fitparams{nhkls}.mtz", result.hkls, result.AB, result.active, result.snr,
             result.cell1, result.cell2, result.dimensions, result.rmsd)
         print(f"fitparams saved to {fp_path}")
 
