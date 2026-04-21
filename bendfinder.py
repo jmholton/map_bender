@@ -871,7 +871,7 @@ def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
     mtz.add_column('K', 'H')
     mtz.add_column('L', 'H')
     for dim in dimensions:
-        mtz.add_column(f'D{dim.upper()}', 'F')   # amplitude of d{x,y,z} shift (fractional Å)
+        mtz.add_column(f'd{dim.upper()}', 'F')   # amplitude of d{x,y,z} shift (fractional Å)
         mtz.add_column(f'PH{dim.upper()}', 'P')  # phase in degrees
     mtz.add_column('SNR', 'R')
     mtz.add_column('ACTIVE', 'R')
@@ -945,7 +945,8 @@ def load_fitparams(path):
     AB = np.zeros((n_dims, n_hkls, 2))
     for d, dim in enumerate(dimensions):
         DIM = dim.upper()
-        amp_col = (f'D{DIM}' if f'D{DIM}' in labels else
+        amp_col = (f'd{DIM}' if f'd{DIM}' in labels else
+                   f'D{DIM}' if f'D{DIM}' in labels else
                    f'F{DIM}' if f'F{DIM}' in labels else None)
         if amp_col is not None:
             # Amplitude + phase in degrees
