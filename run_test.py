@@ -97,17 +97,14 @@ def make_2fofc_map(mtz_in, map_out):
         print(f"  {map_out} exists — skipping")
         return
     print(f"  FFT {mtz_in} → {map_out}")
-    tmp = map_out.replace('.map', '_asu.map')
-    # FFT: positional args; stdin carries keywords
-    stdin_fft = ('labin F1=2FOFCWT PHI=PH2FOFCWT\n'
-                 'grid sample 4.0\n'
-                 'end\n')
+    tmp = map_out.replace('.map', '_full.map')
     run([CCP4_FFT, 'hklin', mtz_in, 'mapout', tmp],
-        stdin=stdin_fft, logfile=map_out.replace('.map', '_fft.log'))
-    # mapmask: expand to full unit cell with canonical axis order
-    stdin_mm = ('XYZLIM CELL\nAXIS X Y Z\nEND\n')
+        stdin='labin F1=2FOFCWT PHI=PH2FOFCWT\ngrid sample 4.0\nend\n',
+        logfile=map_out.replace('.map', '_fft.log'))
+    # Canonical axis order and trim to ASU
     run([CCP4_MAPMASK, 'mapin', tmp, 'mapout', map_out],
-        stdin=stdin_mm, logfile=map_out.replace('.map', '_mapmask.log'))
+        stdin='XYZLIM ASU\nAXIS X Y Z\nEND\n',
+        logfile=map_out.replace('.map', '_mapmask.log'))
     os.remove(tmp)
     print(f"  → {map_out}")
 
