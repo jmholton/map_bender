@@ -12,7 +12,7 @@ Parameters:
     geotest=false   run refmac5 geometry check (default false)
     use_symm=true   enforce space-group symmetry constraint (default true)
     dimensions=xyz  which shifts to fit (subset of xyzoBà; default xyz)
-    fitparams=file  load pre-computed fitparams.mtz and skip fitting
+    fitparams=file  load pre-computed psdvf.mtz (or other fitparams) and skip fitting
     deltamaps       write delta-x/y/z/r maps in addition to bent map
 
 Public API:
@@ -1213,7 +1213,7 @@ def main():
 
         # Save fitparams
         fp_path = save_fitparams(
-            f"fitparams{nhkls}.mtz", result.hkls, result.AB, result.active, result.snr,
+            'psdvf', result.hkls, result.AB, result.active, result.snr,
             result.cell1, result.cell2, result.dimensions, result.rmsd)
         print(f"fitparams saved to {fp_path}")
 
