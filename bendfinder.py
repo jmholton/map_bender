@@ -842,19 +842,24 @@ def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
     mtz.add_column('K', 'H')
     mtz.add_column('L', 'H')
     for dim in dimensions:
-        mtz.add_column(f'A{dim.upper()}', 'R')
-        mtz.add_column(f'B{dim.upper()}', 'R')
+        mtz.add_column(f'F{dim.upper()}', 'F')   # amplitude (fractional Å)
+        mtz.add_column(f'PH{dim.upper()}', 'P')  # phase in degrees
     mtz.add_column('SNR', 'R')
     mtz.add_column('ACTIVE', 'R')
 
+    # Convert (A, B) Cartesian coefficients to (amplitude, phase in degrees).
+    # Shift field: dx = Σ a*cos(2π(hx+ky+lz) + phi)
+    # where A = -a*sin(phi_rad), B = a*cos(phi_rad)
+    # so a = sqrt(A²+B²), phi_rad = atan2(-A, B)
     n_cols = 3 + 2 * n_dims + 2
     data = np.zeros((n_hkls, n_cols), dtype=np.float32)
     data[:, 0] = hkls[:, 0]
     data[:, 1] = hkls[:, 1]
     data[:, 2] = hkls[:, 2]
     for d in range(n_dims):
-        data[:, 3 + 2*d]     = AB[d, :, 0]
-        data[:, 3 + 2*d + 1] = AB[d, :, 1]
+        A, B = AB[d, :, 0], AB[d, :, 1]
+        data[:, 3 + 2*d]     = np.sqrt(A**2 + B**2)
+        data[:, 3 + 2*d + 1] = np.degrees(np.arctan2(-A, B))
     data[:, 3 + 2*n_dims]     = snr
     data[:, 3 + 2*n_dims + 1] = active.astype(np.float32)
 
@@ -910,8 +915,17 @@ def load_fitparams(path):
     n_dims = len(dimensions)
     AB = np.zeros((n_dims, n_hkls, 2))
     for d, dim in enumerate(dimensions):
-        AB[d, :, 0] = data[:, labels.index(f'A{dim.upper()}')]
-        AB[d, :, 1] = data[:, labels.index(f'B{dim.upper()}')]
+        DIM = dim.upper()
+        if f'F{DIM}' in labels:
+            # Current format: amplitude + phase in degrees
+            a       = data[:, labels.index(f'F{DIM}')]
+            phi_rad = np.radians(data[:, labels.index(f'PH{DIM}')])
+            AB[d, :, 0] = -a * np.sin(phi_rad)   # A (sin coefficient)
+            AB[d, :, 1] =  a * np.cos(phi_rad)   # B (cos coefficient)
+        else:
+            # Legacy format: Cartesian A, B coefficients
+            AB[d, :, 0] = data[:, labels.index(f'A{DIM}')]
+            AB[d, :, 1] = data[:, labels.index(f'B{DIM}')]
 
     snr    = data[:, labels.index('SNR')]
     active = data[:, labels.index('ACTIVE')].astype(bool)
