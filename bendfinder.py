@@ -251,31 +251,24 @@ def build_design_matrix(frac_coords, hkls):
     return X
 
 
-def _fit_one_dim(Xa, b):
-    """Fit one dimension: b ≈ Xa @ [A,B,...].
+def _snr_from_svd(U, s, Vt, s_inv, Xa, b, n):
+    """Solve one dimension given a pre-computed thin SVD of Xa.
 
     Returns (AB array (M,2), snr array (M,)).
+    The SVD (U, s, Vt, s_inv) is shared across dimensions to avoid recomputing.
     """
-    sol, res, rank, _ = sp_lstsq(Xa, b)
-    n = len(b)
-    dof = max(n - rank, 1)
-    res_arr = np.atleast_1d(res)
-    if res_arr.size > 0:
-        sig2 = float(res_arr[0]) / dof
-    else:
-        sig2 = float(np.dot(b - Xa @ sol, b - Xa @ sol)) / dof
+    sol   = Vt.T @ (s_inv * (U.T @ b))
+    resid = b - Xa @ sol
+    rank  = int((s_inv > 0).sum())
+    dof   = max(n - rank, 1)
+    sig2  = float(np.dot(resid, resid)) / dof
 
-    # Covariance diagonal: sig2 * diag(V S⁻² Vᵀ) from thin SVD of Xa
-    _, s_svd, Vt = np.linalg.svd(Xa, full_matrices=False)
-    s_thresh = s_svd.max() * max(Xa.shape) * np.finfo(float).eps * 100
-    s_inv = np.zeros_like(s_svd)
-    nz = s_svd > s_thresh
-    s_inv[nz] = 1.0 / s_svd[nz]
+    # cov diagonal: sig2 * diag(V S⁻² Vᵀ)  — O(p²) not O(n·p)
     cov_diag = sig2 * np.sum((Vt * s_inv[:, None])**2, axis=0)   # (p,)
 
-    AB      = sol.reshape(-1, 2)           # (M, 2)
-    cov_AB  = cov_diag.reshape(-1, 2)     # (M, 2)
-    A, B    = AB[:, 0], AB[:, 1]
+    AB     = sol.reshape(-1, 2)
+    cov_AB = cov_diag.reshape(-1, 2)
+    A, B   = AB[:, 0], AB[:, 1]
     varA, varB = cov_AB[:, 0], cov_AB[:, 1]
 
     a = np.sqrt(A**2 + B**2)
@@ -289,6 +282,9 @@ def _fit_one_dim(Xa, b):
 
 def fit_lstsq(X, shifts, drop_snr=1.0, max_rounds=5):
     """Linear fit with iterative SNR pruning.
+
+    SVD of the design matrix is computed ONCE per round and shared across all
+    dimensions — ~3× faster than per-dimension SVD.
 
     Parameters
     ----------
@@ -304,6 +300,7 @@ def fit_lstsq(X, shifts, drop_snr=1.0, max_rounds=5):
     """
     N_hkls = X.shape[1] // 2
     N_dims  = shifts.shape[1]
+    n       = X.shape[0]
     active  = np.ones(N_hkls, dtype=bool)
     AB_full  = np.zeros((N_dims, N_hkls, 2))
     snr_full = np.zeros(N_hkls)
@@ -313,9 +310,16 @@ def fit_lstsq(X, shifts, drop_snr=1.0, max_rounds=5):
         Xa = X[:, col_mask]
         ai = np.where(active)[0]
 
+        # One SVD shared across all dimensions
+        U, s, Vt = np.linalg.svd(Xa, full_matrices=False)
+        s_thresh = s.max() * max(Xa.shape) * np.finfo(float).eps * 100
+        s_inv = np.zeros_like(s)
+        nz = s > s_thresh
+        s_inv[nz] = 1.0 / s[nz]
+
         snr_sum = np.zeros(len(ai))
         for d in range(N_dims):
-            AB_d, snr_d = _fit_one_dim(Xa, shifts[:, d])
+            AB_d, snr_d = _snr_from_svd(U, s, Vt, s_inv, Xa, shifts[:, d], n)
             AB_full[d, ai, :] = AB_d
             snr_sum += snr_d
 
@@ -329,6 +333,8 @@ def fit_lstsq(X, shifts, drop_snr=1.0, max_rounds=5):
             break
         active[ai[drop]] = False
 
+    # Zero out dropped HKLs so they don't contribute to the shift field
+    AB_full[:, ~active, :] = 0.0
     return AB_full, active, snr_full
 
 
