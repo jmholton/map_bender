@@ -581,6 +581,27 @@ def eval_shift_field(frac_coords, hkls, AB):
     return shifts.T
 
 
+def eval_divergence(frac_coords, hkls, AB):
+    """Analytic divergence div(δ) = ∂δx/∂x + ∂δy/∂y + ∂δz/∂z in fractional coords.
+
+    Equal to det(J) - 1 to first order, where J = I + ∇δ is the Jacobian of the
+    forward transformation.  Multiply resampled density by (1 - div(δ)) to
+    account for the change in voxel volume under the transformation.
+
+    AB : (3, N_hkls, 2) — must have exactly 3 dimensions (x, y, z).
+    Returns (N_pos,) divergence values.
+    """
+    phase  = TWO_PI * (frac_coords @ hkls.astype(float).T)   # (N, M)
+    sin_ph = np.sin(phase)
+    cos_ph = np.cos(phase)
+    h, k, l = hkls[:, 0].astype(float), hkls[:, 1].astype(float), hkls[:, 2].astype(float)
+    # ∂δx/∂x = Σ_j 2π h_j (Ax_j cos - Bx_j sin)
+    ddx = TWO_PI * ((AB[0, :, 0] * cos_ph - AB[0, :, 1] * sin_ph) @ h)
+    ddy = TWO_PI * ((AB[1, :, 0] * cos_ph - AB[1, :, 1] * sin_ph) @ k)
+    ddz = TWO_PI * ((AB[2, :, 0] * cos_ph - AB[2, :, 1] * sin_ph) @ l)
+    return ddx + ddy + ddz
+
+
 def rmsd_ca(fitme, ca_mask, hkls, AB_xyz, cell2, frac=1.0):
     """RMSD of CA atoms in Å between predicted bent pdb1 and pdb2.
 
@@ -732,7 +753,7 @@ def interpolate_map(data, hdr, probe_frac):
 # Bent map (replace mapman + floatgen pipeline)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_bent_map(map_path, hkls, AB_xyz, outpath, cell2=None):
+def make_bent_map(map_path, hkls, AB_xyz, outpath, cell2=None, use_jacobian=False):
     """Resample map_path through the shift field and write outpath.
 
     For each grid point g in the OUTPUT map, we find where it came from
@@ -742,6 +763,8 @@ def make_bent_map(map_path, hkls, AB_xyz, outpath, cell2=None):
 
     cell2: reference-crystal unit cell (a,b,c,α,β,γ).  The output map
     is in the reference frame, so its header should carry cell2.
+    use_jacobian: if True, multiply each voxel by (1 - div(δ)) to account
+    for the change in voxel volume under the coordinate transformation.
     """
     data, hdr = read_ccp4(map_path)
     nc, nr, ns = hdr['nc'], hdr['nr'], hdr['ns']
@@ -773,6 +796,12 @@ def make_bent_map(map_path, hkls, AB_xyz, outpath, cell2=None):
     # Sample the map at (grid_point - shift): negative because we invert
     source_frac = frac_pts - delta                      # (N, 3)
     new_vals = interpolate_map(data, hdr, source_frac)  # (N,)
+
+    if use_jacobian:
+        # Scale each voxel by (1 - div(δ)) to conserve density under the
+        # coordinate transformation (first-order Jacobian correction).
+        div = eval_divergence(frac_pts, hkls, AB_xyz)  # (N,)
+        new_vals = new_vals * (1.0 - div)
 
     new_data = new_vals.reshape(ns, nr, nc)
     write_ccp4(outpath, new_data, hdr, cell_override=cell2)
@@ -842,7 +871,7 @@ def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
     mtz.add_column('K', 'H')
     mtz.add_column('L', 'H')
     for dim in dimensions:
-        mtz.add_column(f'F{dim.upper()}', 'F')   # amplitude (fractional Å)
+        mtz.add_column(f'D{dim.upper()}', 'F')   # amplitude of d{x,y,z} shift (fractional Å)
         mtz.add_column(f'PH{dim.upper()}', 'P')  # phase in degrees
     mtz.add_column('SNR', 'R')
     mtz.add_column('ACTIVE', 'R')
@@ -916,14 +945,16 @@ def load_fitparams(path):
     AB = np.zeros((n_dims, n_hkls, 2))
     for d, dim in enumerate(dimensions):
         DIM = dim.upper()
-        if f'F{DIM}' in labels:
-            # Current format: amplitude + phase in degrees
-            a       = data[:, labels.index(f'F{DIM}')]
+        amp_col = (f'D{DIM}' if f'D{DIM}' in labels else
+                   f'F{DIM}' if f'F{DIM}' in labels else None)
+        if amp_col is not None:
+            # Amplitude + phase in degrees
+            a       = data[:, labels.index(amp_col)]
             phi_rad = np.radians(data[:, labels.index(f'PH{DIM}')])
-            AB[d, :, 0] = -a * np.sin(phi_rad)   # A (sin coefficient)
-            AB[d, :, 1] =  a * np.cos(phi_rad)   # B (cos coefficient)
+            AB[d, :, 0] = -a * np.sin(phi_rad)
+            AB[d, :, 1] =  a * np.cos(phi_rad)
         else:
-            # Legacy format: Cartesian A, B coefficients
+            # Legacy Cartesian A, B coefficients
             AB[d, :, 0] = data[:, labels.index(f'A{DIM}')]
             AB[d, :, 1] = data[:, labels.index(f'B{DIM}')]
 
