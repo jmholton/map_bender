@@ -1058,11 +1058,15 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.
         n_canon = len(canon_hkls)
         print(f"{n_canon} canonical HKLs ({len(proper_ops)} proper symops, "
               f"reduction {nhkls_use}/{n_canon}={nhkls_use/max(n_canon,1):.1f}x)")
-        X_symm = build_design_matrix_symm(frac_coords, canon_hkls, proper_ops,
+        # Use only ASU atoms (op0): build_design_matrix_symm applies all ops
+        # internally, so feeding all P1 copies would double-count the data.
+        asu_mask    = np.array([uid.endswith('_op0') for uid in uids])
+        frac_asu    = fitme[asu_mask, :3]
+        X_symm = build_design_matrix_symm(frac_asu, canon_hkls, proper_ops,
                                            hkl_to_canon, hkl_all_ops)
         xyz_col = [dim_list.index(d) for d in 'xyz']
-        shifts_xyz  = shifts[:, xyz_col]       # (N, 3) in x,y,z order
-        shifts_flat = shifts_xyz.ravel()       # (3N,) interleaved
+        shifts_xyz  = shifts[asu_mask][:, xyz_col]   # (N_asu, 3)
+        shifts_flat = shifts_xyz.ravel()              # (3*N_asu,) interleaved
         params, active_c, snr_c = fit_lstsq_symm(
             X_symm, shifts_flat, drop_snr=drop_snr)
         AB_xyz = expand_ab_canon(params, active_c, canon_hkls, hkls,
