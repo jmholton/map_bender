@@ -37,6 +37,8 @@ import gemmi
 
 TWO_PI = 2.0 * np.pi
 
+_BACKBONE = frozenset({'N', 'CA', 'C', 'O'})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Unit cell math
@@ -93,8 +95,72 @@ def _cell_tuple(gc):
     return (gc.a, gc.b, gc.c, gc.alpha, gc.beta, gc.gamma)
 
 
-def expand_to_p1(pdb_path):
+def _altloc_spread_tol(st, fallback=1.0):
+    """Derive altloc tolerance from backbone atoms that have multiple conformers.
+
+    For each backbone atom (N/CA/C/O) with ≥2 altloc positions, compute the
+    max distance of any position from the centroid.  Return the median of
+    those spreads if ≥5 such atoms are found, else return fallback (Å).
+    """
+    spreads = []
+    for model in st:
+        for chain in model:
+            for res in chain:
+                if res.name in ('HOH', 'WAT', 'H2O'):
+                    continue
+                by_name = {}
+                for atom in res:
+                    if atom.element == gemmi.Element('H'):
+                        continue
+                    aname = atom.name.strip()
+                    if aname not in _BACKBONE:
+                        continue
+                    orth = np.array([atom.pos.x, atom.pos.y, atom.pos.z])
+                    by_name.setdefault(aname, []).append(orth)
+                for positions in by_name.values():
+                    if len(positions) < 2:
+                        continue
+                    pos_arr = np.array(positions)
+                    centroid = pos_arr.mean(axis=0)
+                    spread = float(np.max(np.linalg.norm(pos_arr - centroid, axis=1)))
+                    spreads.append(spread)
+    if len(spreads) >= 5:
+        return float(np.median(spreads)), len(spreads)
+    return fallback, len(spreads)
+
+
+def reject_outliers(fitme, ca_mask, uids, cell, mad_sigma=3.0):
+    """Remove atom pairs whose Å shift magnitude is an outlier (MAD filter).
+
+    Returns keep_mask (N,) bool alongside filtered arrays.
+    """
+    shift_orth = frac_to_orth(fitme[:, 3:6], cell)
+    mags = np.linalg.norm(shift_orth, axis=1)
+    med = np.median(mags)
+    mad = np.median(np.abs(mags - med))
+    sigma_eq = mad / 0.6745          # MAD → equivalent normal sigma
+    tol = med + mad_sigma * sigma_eq
+    keep = mags <= tol
+    n_drop = int((~keep).sum())
+    if n_drop:
+        print(f"  outlier rejection: dropped {n_drop}/{len(mags)} atoms "
+              f"(|Δr|>{tol:.3f} Å; median={med:.3f}, σ_MAD={sigma_eq:.3f} Å)")
+    return (fitme[keep], ca_mask[keep],
+            [u for u, k in zip(uids, keep) if k], keep)
+
+
+def expand_to_p1(pdb_path, altloc_filter=False, altloc_fallback=1.0):
     """Read PDB and expand ASU to P1 with all crystallographic symmetry ops.
+
+    Parameters
+    ----------
+    altloc_filter : bool
+        If True, collect all altloc positions for each atom and average them
+        when the max spread from centroid is within the derived tolerance;
+        atoms whose altlocs spread more than the tolerance are dropped.
+        The tolerance is the median backbone-altloc spread if ≥5 such atoms
+        are available, otherwise altloc_fallback Å.
+        If False (default), only altloc 'A' (or no-altloc) atoms are kept.
 
     Returns
     -------
@@ -117,6 +183,14 @@ def expand_to_p1(pdb_path):
 
     ops = list(sg_obj.operations())   # identity is ops[0]
 
+    # Derive altloc tolerance once from backbone disorder, if requested
+    if altloc_filter:
+        altloc_tol, n_bb = _altloc_spread_tol(st, fallback=altloc_fallback)
+        src = f'backbone median ({n_bb} atoms)' if n_bb >= 5 else f'fallback ({n_bb} backbone altlocs)'
+        print(f"  altloc tol={altloc_tol:.3f} Å [{src}]")
+    else:
+        altloc_tol = None
+
     atoms = []
     for oi, op in enumerate(ops):
         for model in st:
@@ -124,26 +198,55 @@ def expand_to_p1(pdb_path):
                 for res in chain:
                     if res.name in ('HOH', 'WAT', 'H2O'):
                         continue
-                    for atom in res:
-                        if atom.element == gemmi.Element('H'):
-                            continue
-                        if atom.altloc not in ('\x00', 'A', ' ', '\0'):
-                            continue
-                        orth = np.array([atom.pos.x, atom.pos.y, atom.pos.z])
+                    rname = res.name.strip()
+                    cname = chain.name.strip()
+                    rnum  = res.seqid.num
+                    icode = res.seqid.icode.strip()
+
+                    if altloc_tol is not None:
+                        # Collect all altloc positions per atom name, then filter
+                        by_name = {}
+                        for atom in res:
+                            if atom.element == gemmi.Element('H'):
+                                continue
+                            aname = atom.name.strip()
+                            orth = np.array([atom.pos.x, atom.pos.y, atom.pos.z])
+                            d = by_name.setdefault(aname,
+                                                   {'pos': [], 'bfac': [], 'occ': []})
+                            d['pos'].append(orth)
+                            d['bfac'].append(atom.b_iso)
+                            d['occ'].append(atom.occ)
+                        atom_iter = []
+                        for aname, d in by_name.items():
+                            pos_arr = np.array(d['pos'])
+                            centroid = pos_arr.mean(axis=0)
+                            spread = float(np.max(
+                                np.linalg.norm(pos_arr - centroid, axis=1)))
+                            if spread > altloc_tol:
+                                continue   # incompatible conformers — skip
+                            atom_iter.append((aname, centroid,
+                                              float(np.mean(d['bfac'])),
+                                              float(np.mean(d['occ']))))
+                    else:
+                        # Default: keep only no-altloc or altloc-A atoms
+                        atom_iter = []
+                        for atom in res:
+                            if atom.element == gemmi.Element('H'):
+                                continue
+                            if atom.altloc not in ('\x00', 'A', ' ', '\0'):
+                                continue
+                            aname = atom.name.strip()
+                            orth = np.array([atom.pos.x, atom.pos.y, atom.pos.z])
+                            atom_iter.append((aname, orth, atom.b_iso, atom.occ))
+
+                    for aname, orth, bfac, occ in atom_iter:
                         frac = M_inv @ orth
                         nf = op.apply_to_xyz(frac.tolist())
                         nf = [f % 1.0 for f in nf]
-
-                        aname = atom.name.strip()
-                        rname = res.name.strip()
-                        cname = chain.name.strip()
-                        rnum  = res.seqid.num
-                        icode = res.seqid.icode.strip()
-
                         uid = f"{cname}_{rnum}{icode}_{rname}_{aname}_op{oi}"
                         atoms.append({
                             'x': nf[0], 'y': nf[1], 'z': nf[2],
-                            'bfac': atom.b_iso, 'occ': atom.occ,
+                            'bfac': bfac, 'occ': occ,
                             'chain': cname, 'resnum': rnum, 'icode': icode,
                             'resname': rname, 'atomname': aname,
                             'is_ca': (aname == 'CA'),
@@ -986,7 +1089,8 @@ class BendResult:
 
 def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.0,
              dimensions='xyz', geotest=False, frac=1.0, verbose=True,
-             use_symm=True):
+             use_symm=True, atom_sel='auto', outlier_sigma=3.0,
+             altloc_filter=False, altloc_fallback=1.0):
     """Fit a Fourier shift field between pdb1 (moving) and pdb2 (reference).
 
     Returns BendResult with fitted coefficients and RMSD.
@@ -995,15 +1099,42 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.
 
     if verbose:
         print(f"expanding {pdb1_path} from", end=' ', flush=True)
-    atoms1, cell1, sg1 = expand_to_p1(pdb1_path)
+    atoms1, cell1, sg1 = expand_to_p1(pdb1_path,
+                                       altloc_filter=altloc_filter,
+                                       altloc_fallback=altloc_fallback)
     if verbose:
         print(f"{sg1} to P1")
         print(f"expanding {pdb2_path} from", end=' ', flush=True)
-    atoms2, cell2, sg2 = expand_to_p1(pdb2_path)
+    atoms2, cell2, sg2 = expand_to_p1(pdb2_path,
+                                       altloc_filter=altloc_filter,
+                                       altloc_fallback=altloc_fallback)
     if verbose:
         print(f"{sg2} to P1")
 
     fitme, ca_mask, uids = match_atoms(atoms1, atoms2)
+
+    # ── Atom selection ────────────────────────────────────────────────────────
+    # 'auto'     : all atoms, MAD outlier rejection applied
+    # 'all'      : all atoms, no filtering
+    # 'backbone' : N/CA/C/O only
+    # 'ca'       : CA only
+    if atom_sel == 'auto':
+        fitme, ca_mask, uids, _ = reject_outliers(
+            fitme, ca_mask, uids, cell1, mad_sigma=outlier_sigma)
+        fit_mask = np.ones(len(fitme), dtype=bool)
+    elif atom_sel == 'ca':
+        fit_mask = ca_mask.copy()
+    elif atom_sel == 'backbone':
+        fit_mask = np.array([uid.split('_')[-2] in _BACKBONE for uid in uids])
+    else:   # 'all'
+        fit_mask = np.ones(len(fitme), dtype=bool)
+
+    if verbose and atom_sel != 'all':
+        print(f"  atom_sel={atom_sel!r}: {fit_mask.sum()} atoms used for fitting")
+
+    fitme_fit   = fitme[fit_mask]
+    ca_mask_fit = ca_mask[fit_mask]
+    uids_fit    = [u for u, k in zip(uids, fit_mask) if k]
 
     # Report largest CA fractional shift
     ca_shifts = fitme[ca_mask, 3:6]
@@ -1041,9 +1172,8 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.
     dim_col = {'x': 3, 'y': 4, 'z': 5, 'o': 6, 'B': 7}
     dim_list = [d for d in dimensions if d in dim_col]
     dim_indices = [dim_col[d] for d in dim_list]
-    shifts = fitme[:, dim_indices]   # (N_atoms, N_dims)
-
-    frac_coords = fitme[:, :3]
+    shifts      = fitme_fit[:, dim_indices]   # (N_fit, N_dims)
+    frac_coords = fitme_fit[:, :3]
 
     # Use symmetry-constrained fitting when all xyz dims are present and sg > P1
     proper_ops = get_proper_symops(sg1)
@@ -1060,8 +1190,8 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.
               f"reduction {nhkls_use}/{n_canon}={nhkls_use/max(n_canon,1):.1f}x)")
         # Use only ASU atoms (op0): build_design_matrix_symm applies all ops
         # internally, so feeding all P1 copies would double-count the data.
-        asu_mask    = np.array([uid.endswith('_op0') for uid in uids])
-        frac_asu    = fitme[asu_mask, :3]
+        asu_mask    = np.array([uid.endswith('_op0') for uid in uids_fit])
+        frac_asu    = fitme_fit[asu_mask, :3]
         X_symm = build_design_matrix_symm(frac_asu, canon_hkls, proper_ops,
                                            hkl_to_canon, hkl_all_ops)
         xyz_col = [dim_list.index(d) for d in 'xyz']
