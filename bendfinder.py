@@ -678,7 +678,8 @@ def read_ccp4(path):
 def write_ccp4(path, data, hdr_template, cell_override=None):
     """Write a CCP4 map, borrowing the header from hdr_template.
 
-    Overwrites DMIN/DMAX/DMEAN/RMS (words 20-23) with actual stats.
+    Overwrites DMIN/DMAX/DMEAN (words 20-22) and RMS (word 54) with
+    actual stats.  ISPG (word 23, byte 88) is preserved from the template.
     cell_override: optional (a,b,c,al,be,ga) to replace cell in header.
     """
     raw = bytearray(hdr_template['raw_header'])
@@ -686,7 +687,7 @@ def write_ccp4(path, data, hdr_template, cell_override=None):
     mn, mx = float(data.min()), float(data.max())
     mean   = float(data.mean())
     rms    = float(np.sqrt(np.mean(data**2)))
-    for off, val in zip((76, 80, 84, 88), (mn, mx, mean, rms)):
+    for off, val in zip((76, 80, 84, 212), (mn, mx, mean, rms)):
         struct.pack_into('<f', raw, off, val)
 
     if cell_override is not None:
@@ -699,17 +700,21 @@ def write_ccp4(path, data, hdr_template, cell_override=None):
 
 
 def _frac_to_grid_indices(frac_xyz, hdr):
-    """Convert fractional coords (N,3) → grid indices [sec, row, col] (3, N)."""
+    """Convert fractional coords (N,3) → grid indices [sec, row, col] (3, N).
+
+    ncstart/nrstart/nsstart belong to the MAPC/MAPR/MAPS axes respectively,
+    not necessarily to the X/Y/Z crystallographic axes — so we build a
+    per-axis-number lookup before indexing.
+    """
     nx, ny, nz = hdr['nx'], hdr['ny'], hdr['nz']
     ncstart, nrstart, nsstart = hdr['ncstart'], hdr['nrstart'], hdr['nsstart']
     mapc, mapr, maps = hdr['mapc'], hdr['mapr'], hdr['maps']
 
-    # Grid coordinates for x, y, z axes
-    gxyz = {
-        1: frac_xyz[:, 0] * nx - ncstart,
-        2: frac_xyz[:, 1] * ny - nrstart,
-        3: frac_xyz[:, 2] * nz - nsstart,
-    }
+    # start[ax] = origin offset for crystallographic axis ax (1=X, 2=Y, 3=Z)
+    start = {mapc: ncstart, mapr: nrstart, maps: nsstart}
+    Nxyz  = {1: nx, 2: ny, 3: nz}
+
+    gxyz = {ax: frac_xyz[:, ax-1] * Nxyz[ax] - start[ax] for ax in (1, 2, 3)}
     return np.array([gxyz[maps], gxyz[mapr], gxyz[mapc]])
 
 
@@ -727,13 +732,16 @@ def interpolate_map(data, hdr, probe_frac):
 # Bent map (replace mapman + floatgen pipeline)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_bent_map(map_path, hkls, AB_xyz, outpath):
+def make_bent_map(map_path, hkls, AB_xyz, outpath, cell2=None):
     """Resample map_path through the shift field and write outpath.
 
     For each grid point g in the OUTPUT map, we find where it came from
     in the INPUT map: sample at (g - δ(g)).  The negative sign is because
     the shift field maps the moving frame → reference frame; to resample
     we need the inverse.
+
+    cell2: reference-crystal unit cell (a,b,c,α,β,γ).  The output map
+    is in the reference frame, so its header should carry cell2.
     """
     data, hdr = read_ccp4(map_path)
     nc, nr, ns = hdr['nc'], hdr['nr'], hdr['ns']
@@ -747,14 +755,16 @@ def make_bent_map(map_path, hkls, AB_xyz, outpath):
     col_idx = np.arange(nc)
     sec_g, row_g, col_g = np.meshgrid(sec_idx, row_idx, col_idx, indexing='ij')
 
-    # Map column/row/section axes to x/y/z based on MAPC/MAPR/MAPS
+    # Map column/row/section axes to x/y/z based on MAPC/MAPR/MAPS.
+    # axis_to_frac[ax] = grid-index array for crystallographic axis ax (1=X,2=Y,3=Z)
+    # start[ax]        = ASU origin along ax (belongs to MAPC/MAPR/MAPS, not X/Y/Z)
     axis_to_frac = {mapc: col_g, mapr: row_g, maps: sec_g}
-    N_grid = {mapc: nx, mapr: ny, maps: nz}
     start  = {mapc: ncstart, mapr: nrstart, maps: nsstart}
+    Nxyz   = {1: nx, 2: ny, 3: nz}   # full unit-cell grid sizes per axis
 
-    frac_x = (axis_to_frac[1].ravel() + start[1]) / N_grid[1]
-    frac_y = (axis_to_frac[2].ravel() + start[2]) / N_grid[2]
-    frac_z = (axis_to_frac[3].ravel() + start[3]) / N_grid[3]
+    frac_x = (axis_to_frac[1].ravel() + start[1]) / Nxyz[1]
+    frac_y = (axis_to_frac[2].ravel() + start[2]) / Nxyz[2]
+    frac_z = (axis_to_frac[3].ravel() + start[3]) / Nxyz[3]
     frac_pts = np.stack([frac_x, frac_y, frac_z], axis=1)   # (N, 3)
 
     # Shift field at each grid point (fractional)
@@ -765,7 +775,7 @@ def make_bent_map(map_path, hkls, AB_xyz, outpath):
     new_vals = interpolate_map(data, hdr, source_frac)  # (N,)
 
     new_data = new_vals.reshape(ns, nr, nc)
-    write_ccp4(outpath, new_data, hdr)
+    write_ccp4(outpath, new_data, hdr, cell_override=cell2)
     print(f"bent map written to {outpath}")
     return outpath
 
@@ -780,14 +790,13 @@ def make_delta_maps(map_path, hkls, AB_xyz, nhkls):
     col_idx = np.arange(nc)
     sec_g, row_g, col_g = np.meshgrid(sec_idx, row_idx, col_idx, indexing='ij')
     mapc, mapr, maps = hdr['mapc'], hdr['mapr'], hdr['maps']
-    N_grid = {hdr['mapc']: hdr['nx'], hdr['mapr']: hdr['ny'], hdr['maps']: hdr['nz']}
-    start  = {hdr['mapc']: hdr['ncstart'], hdr['mapr']: hdr['nrstart'],
-              hdr['maps']: hdr['nsstart']}
+    start  = {mapc: hdr['ncstart'], mapr: hdr['nrstart'], maps: hdr['nsstart']}
+    Nxyz   = {1: hdr['nx'], 2: hdr['ny'], 3: hdr['nz']}
     axis_to_frac = {mapc: col_g, mapr: row_g, maps: sec_g}
 
-    frac_x = (axis_to_frac[1].ravel() + start[1]) / N_grid[1]
-    frac_y = (axis_to_frac[2].ravel() + start[2]) / N_grid[2]
-    frac_z = (axis_to_frac[3].ravel() + start[3]) / N_grid[3]
+    frac_x = (axis_to_frac[1].ravel() + start[1]) / Nxyz[1]
+    frac_y = (axis_to_frac[2].ravel() + start[2]) / Nxyz[2]
+    frac_z = (axis_to_frac[3].ravel() + start[3]) / Nxyz[3]
     frac_pts = np.stack([frac_x, frac_y, frac_z], axis=1)
 
     delta = eval_shift_field(frac_pts, hkls, AB_xyz)  # (N, 3) fractional
@@ -1068,7 +1077,7 @@ def bend_apply_map(map_path, result, frac=1.0, outpath=None, delta=False):
     for new_i, old_i in enumerate(xyz_dims):
         AB_xyz[new_i] = result.AB[old_i]
 
-    make_bent_map(map_path, result.hkls, AB_xyz, outpath)
+    make_bent_map(map_path, result.hkls, AB_xyz, outpath, cell2=result.cell2)
     if delta:
         make_delta_maps(map_path, result.hkls, AB_xyz, nhkls)
     return outpath
@@ -1198,7 +1207,7 @@ def main():
             print(f"WARNING: map file not found: {mapfile}", file=sys.stderr)
         else:
             bent_map = f"bent{nhkls}.map"
-            make_bent_map(mapfile, hkls, AB_xyz, bent_map)
+            make_bent_map(mapfile, hkls, AB_xyz, bent_map, cell2=cell2)
             if p['deltamaps']:
                 make_delta_maps(mapfile, hkls, AB_xyz, nhkls)
 
