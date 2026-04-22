@@ -1300,26 +1300,34 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                                        altloc_filter=altloc_filter,
                                        altloc_fallback=altloc_fallback)
     if verbose:
-        print(f"{sg1} to P1")
+        print(f"{sg1} to P1", flush=True)
         print(f"expanding {pdb2_path} from", end=' ', flush=True)
     atoms2, cell2, sg2 = expand_to_p1(pdb2_path,
                                        altloc_filter=altloc_filter,
                                        altloc_fallback=altloc_fallback)
     if verbose:
-        print(f"{sg2} to P1")
+        print(f"{sg2} to P1", flush=True)
 
+    if verbose:
+        print("matching atoms...", end=' ', flush=True)
     fitme, ca_mask, uids, bfacs = match_atoms(atoms1, atoms2)
+    if verbose:
+        print(f"{ca_mask.sum()} CA pairs", flush=True)
 
     # Permanent initial outlier rejection (B-factor + shift MAD)
+    if verbose:
+        print("rejecting outliers...", end=' ', flush=True)
     fitme, ca_mask, uids, bfacs, _ = reject_outliers(
         fitme, ca_mask, uids, cell1, mad_sigma=outlier_sigma,
         bfacs=bfacs, b_sigma=b_sigma)
+    if verbose:
+        print(f"{ca_mask.sum()} CA remaining", flush=True)
 
     ca_shifts = fitme[ca_mask, 3:6]
     ca_mags   = np.sqrt(np.sum(ca_shifts**2, axis=1))
     ca_ids    = [u for u, m in zip(uids, ca_mask) if m]
     max_i     = int(np.argmax(ca_mags))
-    print(f"largest fractional CA shift: {ca_mags[max_i]:.7f} for {ca_ids[max_i]}")
+    print(f"largest fractional CA shift: {ca_mags[max_i]:.7f} for {ca_ids[max_i]}", flush=True)
     if ca_mags[max_i] > 0.1:
         raise ValueError(f"Largest fractional CA shift {ca_mags[max_i]:.4f} > 0.1 cells. "
                          "Check structure alignment.")
@@ -1329,18 +1337,26 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
     dim_list = [d for d in dimensions if d in dim_col]
     dim_indices = [dim_col[d] for d in dim_list]
 
+    if verbose:
+        print("getting symops...", end=' ', flush=True)
     proper_ops = get_proper_symops(sg1)
     do_symm = (use_symm and len(proper_ops) > 1
                and all(d in dim_list for d in 'xyz'))
     asu_mask = np.array([uid.endswith('_op0') for uid in uids])
+    if verbose:
+        print(f"{len(proper_ops)} proper ops, do_symm={do_symm}", flush=True)
 
     # Build full HKL pool down to pool_reso, sorted coarse→fine
+    if verbose:
+        print(f"generating HKLs to {pool_reso} Å...", end=' ', flush=True)
     all_hkls = generate_hkls(cell1, pool_reso)   # (N+1, 3), DC at index 0
     Gs     = _reciprocal_metric(cell1)
     hkl_ndc = all_hkls[1:]                        # non-DC HKLs
     hv_f    = hkl_ndc.astype(float)
     inv_d2  = np.sum((hv_f @ Gs) * hv_f, axis=1)
     d_all   = np.where(inv_d2 > 0, 1.0 / np.sqrt(inv_d2), np.inf)  # (N,)
+    if verbose:
+        print(f"{len(hkl_ndc)} HKLs in pool", flush=True)
 
     # Initial batch: all HKLs with d >= fitreso_start
     n_initial = int(np.sum(d_all >= fitreso_start - 1e-9))
@@ -1360,7 +1376,7 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
 
     if verbose:
         print(f"\nProgressive fit: fitreso {fitreso_start}→{pool_reso} Å, "
-              f"batch={batch_hkls}, od_margin={od_margin}, drop_snr={drop_snr}")
+              f"batch={batch_hkls}, od_margin={od_margin}, drop_snr={drop_snr}", flush=True)
 
     while True:
         hkls_now = all_hkls[:n_used]
@@ -1382,7 +1398,7 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
         if od_ratio < od_margin:
             if verbose:
                 print(f"  [iter {iter_count:2d}] fitreso={eff_reso:.2f}Å "
-                      f"OD={od_ratio:.2f} < {od_margin} — stopping")
+                      f"OD={od_ratio:.2f} < {od_margin} — stopping", flush=True)
             break
 
         # ── Fit ──────────────────────────────────────────────────────────────
@@ -1443,7 +1459,7 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
             drop_str = f"  -{n_dropped_resid} resid" if n_dropped_resid else ""
             print(f"  [iter {iter_count:2d}] fitreso={eff_reso:.2f}Å  "
                   f"nhkls={n_hkls-1}  canon={n_canon}  OD={od_ratio:.2f}  "
-                  f"active={n_active}  RMSD={rmsd:.3f}Å{drop_str}  {dt:.0f}s")
+                  f"active={n_active}  RMSD={rmsd:.3f}Å{drop_str}  {dt:.0f}s", flush=True)
 
         result_AB     = AB
         result_active = active
@@ -1466,7 +1482,7 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
     dt_total = time.time() - t0
     print(f"\nProgressive fit done: {iter_count} iterations  "
           f"RMSD(CA)={result_rmsd:.3f} Å  "
-          f"({n_ca} CA, {n_active} active HKLs, {dt_total:.0f} s)")
+          f"({n_ca} CA, {n_active} active HKLs, {dt_total:.0f} s)", flush=True)
 
     return BendResult(
         hkls=result_hkls, AB=result_AB, active=result_active, snr=result_snr,
