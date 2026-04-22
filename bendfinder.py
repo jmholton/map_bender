@@ -833,7 +833,7 @@ def write_ccp4(path, data, hdr_template, cell_override=None):
     mn, mx = float(data.min()), float(data.max())
     mean   = float(data.mean())
     rms    = float(np.sqrt(np.mean(data**2)))
-    for off, val in zip((76, 80, 84, 212), (mn, mx, mean, rms)):
+    for off, val in zip((76, 80, 84, 216), (mn, mx, mean, rms)):
         struct.pack_into('<f', raw, off, val)
 
     if cell_override is not None:
