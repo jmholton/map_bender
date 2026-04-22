@@ -129,8 +129,11 @@ def _altloc_spread_tol(st, fallback=1.0):
     return fallback, len(spreads)
 
 
-def reject_outliers(fitme, ca_mask, uids, cell, mad_sigma=3.0):
+def reject_outliers(fitme, ca_mask, uids, cell, mad_sigma=3.0,
+                    bfacs=None, b_sigma=None):
     """Remove atom pairs whose Å shift magnitude is an outlier (MAD filter).
+
+    Optionally also reject atoms with outlier B-factors (max(B1,B2) > MAD threshold).
 
     Returns keep_mask (N,) bool alongside filtered arrays.
     """
@@ -141,12 +144,28 @@ def reject_outliers(fitme, ca_mask, uids, cell, mad_sigma=3.0):
     sigma_eq = mad / 0.6745          # MAD → equivalent normal sigma
     tol = med + mad_sigma * sigma_eq
     keep = mags <= tol
-    n_drop = int((~keep).sum())
-    if n_drop:
-        print(f"  outlier rejection: dropped {n_drop}/{len(mags)} atoms "
+    n_drop_shift = int((~keep).sum())
+    if n_drop_shift:
+        print(f"  shift outlier rejection: dropped {n_drop_shift}/{len(mags)} atoms "
               f"(|Δr|>{tol:.3f} Å; median={med:.3f}, σ_MAD={sigma_eq:.3f} Å)")
+
+    if bfacs is not None and b_sigma is not None:
+        bmax = np.maximum(bfacs[:, 0], bfacs[:, 1])
+        b_med = np.median(bmax)
+        b_mad = np.median(np.abs(bmax - b_med))
+        b_sig_eq = b_mad / 0.6745
+        b_tol = b_med + b_sigma * b_sig_eq
+        b_keep = bmax <= b_tol
+        n_drop_b = int((~b_keep & keep).sum())
+        if n_drop_b:
+            print(f"  B-factor outlier rejection: dropped additional {n_drop_b} atoms "
+                  f"(B>{b_tol:.1f} Å²; median={b_med:.1f}, σ_MAD={b_sig_eq:.1f} Å²)")
+        keep = keep & b_keep
+
     return (fitme[keep], ca_mask[keep],
-            [u for u, k in zip(uids, keep) if k], keep)
+            [u for u, k in zip(uids, keep) if k],
+            bfacs[keep] if bfacs is not None else None,
+            keep)
 
 
 def expand_to_p1(pdb_path, altloc_filter=False, altloc_fallback=1.0):
@@ -263,9 +282,10 @@ def match_atoms(atoms1, atoms2):
     fitme   : ndarray (N, 8) — xf yf zf  dxf dyf dzf  do  dB
     ca_mask : ndarray (N,) bool
     uids    : list[str]
+    bfacs   : ndarray (N, 2) — [B1, B2] for each matched pair
     """
     idx2 = {a['uid']: a for a in atoms2}
-    rows, ca, uids = [], [], []
+    rows, ca, uids, bfacs = [], [], [], []
     for a1 in atoms1:
         a2 = idx2.get(a1['uid'])
         if a2 is None:
@@ -283,10 +303,12 @@ def match_atoms(atoms1, atoms2):
         ])
         ca.append(a1['is_ca'])
         uids.append(a1['uid'])
+        bfacs.append([a1['bfac'], a2['bfac']])
     if not rows:
         raise ValueError("No atoms matched between the two structures — "
                          "check space groups match.")
-    return np.array(rows, dtype=float), np.array(ca, dtype=bool), uids
+    return (np.array(rows, dtype=float), np.array(ca, dtype=bool),
+            uids, np.array(bfacs, dtype=float))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1089,7 +1111,7 @@ class BendResult:
 
 def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.0,
              dimensions='xyz', geotest=False, frac=1.0, verbose=True,
-             use_symm=True, atom_sel='auto', outlier_sigma=3.0,
+             use_symm=True, atom_sel='auto', outlier_sigma=3.0, b_sigma=None,
              altloc_filter=False, altloc_fallback=1.0):
     """Fit a Fourier shift field between pdb1 (moving) and pdb2 (reference).
 
@@ -1111,7 +1133,7 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.
     if verbose:
         print(f"{sg2} to P1")
 
-    fitme, ca_mask, uids = match_atoms(atoms1, atoms2)
+    fitme, ca_mask, uids, bfacs = match_atoms(atoms1, atoms2)
 
     # ── Atom selection ────────────────────────────────────────────────────────
     # 'auto'     : all atoms, MAD outlier rejection applied
@@ -1119,8 +1141,9 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, reso=3.0, fitreso=None, drop_snr=1.
     # 'backbone' : N/CA/C/O only
     # 'ca'       : CA only
     if atom_sel == 'auto':
-        fitme, ca_mask, uids, _ = reject_outliers(
-            fitme, ca_mask, uids, cell1, mad_sigma=outlier_sigma)
+        fitme, ca_mask, uids, bfacs, _ = reject_outliers(
+            fitme, ca_mask, uids, cell1, mad_sigma=outlier_sigma,
+            bfacs=bfacs, b_sigma=b_sigma)
         fit_mask = np.ones(len(fitme), dtype=bool)
     elif atom_sel == 'ca':
         fit_mask = ca_mask.copy()
