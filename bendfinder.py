@@ -1267,6 +1267,214 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, fitreso=None, drop_snr=1.0,
     )
 
 
+def bend_fit_progressive(pdb1_path, pdb2_path,
+                         fitreso_start=20.0, fitreso_end=None,
+                         drop_snr=1.0, batch_hkls=20, od_margin=1.5,
+                         outlier_sigma=3.0, b_sigma=None,
+                         use_symm=True, dimensions='xyz',
+                         frac=1.0, verbose=True,
+                         altloc_filter=False, altloc_fallback=1.0):
+    """Fit a Fourier shift field progressively, admitting HKLs coarsest-first.
+
+    HKLs are admitted in batches from fitreso_start (coarsest, large d) down to
+    fitreso_end (finest, small d).  After each batch the fit residuals are
+    MAD-filtered to adaptively update the active atom set for the next iteration.
+    Stops when the overdetermination ratio (N_asu_active × 3) / (N_canon × 6)
+    drops below od_margin, or fitreso_end is reached.
+
+    Parameters
+    ----------
+    fitreso_start : float — d-spacing (Å) of the initial coarse batch; default 20 Å
+    fitreso_end   : float — finest d-spacing to reach; default 2 Å
+    batch_hkls    : int   — canonical HKLs to add per iteration
+    od_margin     : float — stop before OD ratio drops below this (default 1.5)
+
+    Returns a BendResult identical to bend_fit.
+    """
+    t0 = time.time()
+    pool_reso = fitreso_end if fitreso_end is not None else 2.0
+
+    if verbose:
+        print(f"expanding {pdb1_path} from", end=' ', flush=True)
+    atoms1, cell1, sg1 = expand_to_p1(pdb1_path,
+                                       altloc_filter=altloc_filter,
+                                       altloc_fallback=altloc_fallback)
+    if verbose:
+        print(f"{sg1} to P1")
+        print(f"expanding {pdb2_path} from", end=' ', flush=True)
+    atoms2, cell2, sg2 = expand_to_p1(pdb2_path,
+                                       altloc_filter=altloc_filter,
+                                       altloc_fallback=altloc_fallback)
+    if verbose:
+        print(f"{sg2} to P1")
+
+    fitme, ca_mask, uids, bfacs = match_atoms(atoms1, atoms2)
+
+    # Permanent initial outlier rejection (B-factor + shift MAD)
+    fitme, ca_mask, uids, bfacs, _ = reject_outliers(
+        fitme, ca_mask, uids, cell1, mad_sigma=outlier_sigma,
+        bfacs=bfacs, b_sigma=b_sigma)
+
+    ca_shifts = fitme[ca_mask, 3:6]
+    ca_mags   = np.sqrt(np.sum(ca_shifts**2, axis=1))
+    ca_ids    = [u for u, m in zip(uids, ca_mask) if m]
+    max_i     = int(np.argmax(ca_mags))
+    print(f"largest fractional CA shift: {ca_mags[max_i]:.7f} for {ca_ids[max_i]}")
+    if ca_mags[max_i] > 0.1:
+        raise ValueError(f"Largest fractional CA shift {ca_mags[max_i]:.4f} > 0.1 cells. "
+                         "Check structure alignment.")
+
+    # Dimension and symmetry setup
+    dim_col  = {'x': 3, 'y': 4, 'z': 5, 'o': 6, 'B': 7}
+    dim_list = [d for d in dimensions if d in dim_col]
+    dim_indices = [dim_col[d] for d in dim_list]
+
+    proper_ops = get_proper_symops(sg1)
+    do_symm = (use_symm and len(proper_ops) > 1
+               and all(d in dim_list for d in 'xyz'))
+    asu_mask = np.array([uid.endswith('_op0') for uid in uids])
+
+    # Build full HKL pool down to pool_reso, sorted coarse→fine
+    all_hkls = generate_hkls(cell1, pool_reso)   # (N+1, 3), DC at index 0
+    Gs     = _reciprocal_metric(cell1)
+    hkl_ndc = all_hkls[1:]                        # non-DC HKLs
+    hv_f    = hkl_ndc.astype(float)
+    inv_d2  = np.sum((hv_f @ Gs) * hv_f, axis=1)
+    d_all   = np.where(inv_d2 > 0, 1.0 / np.sqrt(inv_d2), np.inf)  # (N,)
+
+    # Initial batch: all HKLs with d >= fitreso_start
+    n_initial = int(np.sum(d_all >= fitreso_start - 1e-9))
+    n_initial = max(n_initial, batch_hkls)         # at least one batch
+    n_initial = min(n_initial, len(hkl_ndc))
+    n_used = n_initial + 1                         # +1 for DC at index 0
+
+    # fit_active tracks which atoms to use; updated by residual MAD each iter
+    fit_active = np.ones(len(fitme), dtype=bool)
+
+    result_AB     = None
+    result_active = None
+    result_snr    = None
+    result_hkls   = None
+    result_rmsd   = float('inf')
+    iter_count    = 0
+
+    if verbose:
+        print(f"\nProgressive fit: fitreso {fitreso_start}→{pool_reso} Å, "
+              f"batch={batch_hkls}, od_margin={od_margin}, drop_snr={drop_snr}")
+
+    while True:
+        hkls_now = all_hkls[:n_used]
+        n_hkls   = len(hkls_now)
+
+        # Symmetry reduction for current HKL set
+        if do_symm:
+            canon_hkls, hkl_to_canon, hkl_all_ops = assign_canonical(
+                hkls_now, proper_ops)
+            n_canon = len(canon_hkls)
+        else:
+            n_canon = n_hkls
+
+        # Overdetermination ratio — stop before fitting if too low
+        n_asu_active = int((asu_mask & fit_active).sum())
+        od_ratio = (n_asu_active * 3) / max(n_canon * 6, 1)
+        eff_reso  = float(d_all[n_used - 2])
+
+        if od_ratio < od_margin:
+            if verbose:
+                print(f"  [iter {iter_count:2d}] fitreso={eff_reso:.2f}Å "
+                      f"OD={od_ratio:.2f} < {od_margin} — stopping")
+            break
+
+        # ── Fit ──────────────────────────────────────────────────────────────
+        if do_symm:
+            asu_fit_mask = asu_mask & fit_active
+            frac_asu     = fitme[asu_fit_mask, :3]
+            shifts_xyz   = fitme[asu_fit_mask][:, [dim_col[d] for d in 'xyz']]
+            shifts_flat  = shifts_xyz.ravel()
+
+            X_symm = build_design_matrix_symm(frac_asu, canon_hkls, proper_ops,
+                                               hkl_to_canon, hkl_all_ops)
+            params, active_c, snr_c = fit_lstsq_symm(
+                X_symm, shifts_flat, drop_snr=drop_snr)
+            AB_xyz = expand_ab_canon(params, active_c, canon_hkls, hkls_now,
+                                     hkl_to_canon, hkl_all_ops, proper_ops)
+
+            AB = np.zeros((len(dim_list), n_hkls, 2))
+            for new_i, d in enumerate(dim_list):
+                if d in 'xyz':
+                    AB[new_i] = AB_xyz['xyz'.index(d)]
+            active = np.array([active_c[hkl_to_canon[j]] for j in range(n_hkls)])
+            snr    = np.array([snr_c[hkl_to_canon[j]]    for j in range(n_hkls)])
+            AB_xyz_eval = AB_xyz   # (3, n_hkls, 2)
+
+        else:
+            frac_fit = fitme[fit_active, :3]
+            shifts   = fitme[fit_active][:, dim_indices]
+            X        = build_design_matrix(frac_fit, hkls_now)
+            AB, active, snr = fit_lstsq(X, shifts, drop_snr=drop_snr)
+
+            xyz_dims = [dim_list.index(d) for d in 'xyz' if d in dim_list]
+            if len(xyz_dims) < 3:
+                AB_xyz_eval = np.zeros((3, n_hkls, 2))
+                for new_i, old_i in enumerate(xyz_dims):
+                    AB_xyz_eval[new_i] = AB[old_i]
+            else:
+                AB_xyz_eval = AB[xyz_dims]
+
+        # ── Residual MAD → update fit_active for next iteration ───────────
+        pred       = eval_shift_field(fitme[:, :3], hkls_now, AB_xyz_eval)
+        resid_frac = fitme[:, 3:6] - frac * pred
+        resid_orth = frac_to_orth(resid_frac, cell2)
+        resid_mag  = np.linalg.norm(resid_orth, axis=1)
+
+        med_r = np.median(resid_mag)
+        mad_r = np.median(np.abs(resid_mag - med_r))
+        sig_r = mad_r / 0.6745
+        tol_r = med_r + outlier_sigma * sig_r
+        fit_active_new   = resid_mag <= tol_r
+        n_dropped_resid  = int((~fit_active_new & fit_active).sum())
+        fit_active       = fit_active_new
+
+        # ── Progress report ───────────────────────────────────────────────
+        rmsd     = rmsd_ca(fitme, ca_mask, hkls_now, AB_xyz_eval, cell2, frac)
+        n_active = int(active.sum())
+        dt       = time.time() - t0
+        if verbose:
+            drop_str = f"  -{n_dropped_resid} resid" if n_dropped_resid else ""
+            print(f"  [iter {iter_count:2d}] fitreso={eff_reso:.2f}Å  "
+                  f"nhkls={n_hkls-1}  canon={n_canon}  OD={od_ratio:.2f}  "
+                  f"active={n_active}  RMSD={rmsd:.3f}Å{drop_str}  {dt:.0f}s")
+
+        result_AB     = AB
+        result_active = active
+        result_snr    = snr
+        result_hkls   = hkls_now
+        result_rmsd   = rmsd
+        iter_count   += 1
+
+        # Advance to next batch
+        n_next = n_used + batch_hkls
+        if n_next > len(all_hkls):
+            break
+        n_used = n_next
+
+    if result_hkls is None:
+        raise ValueError("No batches fitted — adjust fitreso_start/fitreso_end")
+
+    n_ca     = int(ca_mask.sum())
+    n_active = int(result_active.sum())
+    dt_total = time.time() - t0
+    print(f"\nProgressive fit done: {iter_count} iterations  "
+          f"RMSD(CA)={result_rmsd:.3f} Å  "
+          f"({n_ca} CA, {n_active} active HKLs, {dt_total:.0f} s)")
+
+    return BendResult(
+        hkls=result_hkls, AB=result_AB, active=result_active, snr=result_snr,
+        fitme=fitme, ca_mask=ca_mask, rmsd=result_rmsd,
+        cell1=cell1, cell2=cell2, dimensions=''.join(dim_list),
+    )
+
+
 def bend_apply_pdb(pdb1_path, pdb2_path, result, frac=1.0, outpath=None):
     """Apply BendResult to pdb1, write a bent PDB aligned with pdb2."""
     nhkls = int(result.active.sum())
