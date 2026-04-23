@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from scipy.linalg import lstsq as sp_lstsq
+from scipy.linalg import lstsq as sp_lstsq, svd as sp_svd
 from scipy.ndimage import map_coordinates
 import gemmi
 
@@ -514,7 +514,11 @@ def fit_lstsq_symm(X, b, drop_snr=1.0, max_rounds=5):
         Xa = X[:, col_mask]
         ai = np.where(active)[0]
 
-        U, s, Vt = np.linalg.svd(Xa, full_matrices=False)
+        try:
+            U, s, Vt = sp_svd(Xa, full_matrices=False, check_finite=False)
+        except np.linalg.LinAlgError:
+            U, s, Vt = sp_svd(Xa, full_matrices=False, check_finite=False,
+                               lapack_driver='gesvd')
         s_thresh = s.max() * max(Xa.shape) * np.finfo(float).eps * 100
         s_inv = np.zeros_like(s)
         nz = s > s_thresh
@@ -661,7 +665,11 @@ def fit_lstsq(X, shifts, drop_snr=1.0, max_rounds=5):
         ai = np.where(active)[0]
 
         # One SVD shared across all dimensions
-        U, s, Vt = np.linalg.svd(Xa, full_matrices=False)
+        try:
+            U, s, Vt = sp_svd(Xa, full_matrices=False, check_finite=False)
+        except np.linalg.LinAlgError:
+            U, s, Vt = sp_svd(Xa, full_matrices=False, check_finite=False,
+                               lapack_driver='gesvd')
         s_thresh = s.max() * max(Xa.shape) * np.finfo(float).eps * 100
         s_inv = np.zeros_like(s)
         nz = s > s_thresh
