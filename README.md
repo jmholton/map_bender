@@ -70,6 +70,9 @@ All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlie
 | Lysozyme | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.033 Å** | 118 s |
 | DHFR | 1rx1 → 1rx2 | P2₁2₁2₁ | 636 | **0.071 Å** | 191 s |
 | Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.060 Å** | 106 s |
+| Lysozyme raddam | 5kxk → 5kxl | P4₃2₁2 | 976 | **0.082 Å** | ~550 s |
+| Lysozyme raddam | 5kxk → 5kxm | P4₃2₁2 | 984 | **0.046 Å** | ~575 s |
+| Lysozyme raddam | 5kxk → 5kxn | P4₃2₁2 | 992 | **0.055 Å** | ~580 s |
 
 ### vs prototype (tcsh + gnuplot)
 
@@ -77,6 +80,9 @@ All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlie
 |--------|---------------|----------------|-------------|-------------|---------|
 | Lysozyme 3aw6/3aw7 | 0.209 Å | 2938 s | 0.033 Å | 118 s | **25×** |
 | Myoglobin 1mbo/1a6m | 0.229 Å | 237 s | 0.060 Å | 106 s | **2×** |
+| Raddam 5kxk→5kxl | 0.177 Å | 643 s | 0.082 Å | ~550 s | **same speed, 2× better** |
+| Raddam 5kxk→5kxm | 0.165 Å | 506 s | 0.046 Å | ~575 s | **3.6× better** |
+| Raddam 5kxk→5kxn | 0.220 Å | 558 s | 0.055 Å | ~580 s | **4× better** |
 
 The lysozyme comparison is against the gold-standard prototype run (order 5, 91 HKLs, 71.9% vs 84.2% relative humidity causing ~2.5% cell contraction). The Python version achieves 6× better RMSD in 1/25th the time, primarily because:
 - Linear (A, B) parameterisation allows all HKLs to be fitted simultaneously via SVD
