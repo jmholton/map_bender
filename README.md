@@ -1,75 +1,91 @@
-# map_bender / bendfinder.com
+# map_bender / bendfinder
 
-Finds a smooth, periodic coordinate-shift field that maps the coordinates of one crystal onto a reference crystal of the same protein. The shift field is expressed as a truncated Fourier series using real Miller-index sine functions — physically motivated basis functions that respect the periodicity of the crystal lattice.
+Finds a smooth, periodic coordinate-shift field that maps the coordinates of one crystal onto a reference crystal of the same protein. The shift field is expressed as a truncated Fourier series using real Miller-index sine/cosine functions — physically motivated basis functions that respect the periodicity of the crystal lattice.
 
 Primary author: James Holton
 
 ## What it does
 
-Given two PDB files of the same protein (same or different crystal forms), `bendfinder.com` computes a smooth 3D vector field **Δr(x,y,z)** such that applying that field to the coordinates of `bendme.pdb` minimises the all-atom RMSD to `reference.pdb`. Optionally, any CCP4 map in the frame of `bendme.pdb` can be spline-interpolated into the reference frame.
+Given two PDB files of the same protein (same or different crystal forms), `bendfinder.py` computes a smooth 3D vector field **Δr(x,y,z)** such that applying that field to the coordinates of `bendme.pdb` minimises the all-atom RMSD to `reference.pdb`. Optionally, any CCP4 map in the frame of `bendme.pdb` can be spline-interpolated into the reference frame.
 
 The shift field is parameterised as:
 
 ```
-Δd(x,y,z) = Σ_{hkl}  a_{hkl} / N  ·  sin(2π(hx + ky + lz) + φ_{hkl})
+Δd(x,y,z) = Σ_{hkl}  A_{hkl} · sin(2π(hx+ky+lz))  +  B_{hkl} · cos(2π(hx+ky+lz))
 ```
 
-where the sum runs over (h,k,l) triplets sorted by resolution (low resolution first), so the most physically meaningful large-scale deformations are captured first.
+where the sum runs over (h,k,l) triplets sorted by resolution (low resolution first), so the most physically meaningful large-scale deformations are captured first. Symmetry constraints are applied: in space group P4₃2₁2 (8 proper rotations), 247 canonical parameters control 1401 Friedel-unique coefficients.
 
 ## Quick start
 
-```tcsh
-bendfinder.com  bendme.pdb  reference.pdb  [nhkls=30]
-```
+```python
+from bendfinder import bend_fit_progressive, bend_apply_pdb
 
-Both PDB files must be provided even when applying a pre-fitted function, because they define the two unit cells. The script is self-deploying: the helper programs `rmsd`, `map2pdb.com`, `floatgen`, and `origins.com` are embedded at the end and extracted on first run.
+result = bend_fit_progressive('bendme.pdb', 'reference.pdb')
+bend_apply_pdb('bendme.pdb', 'reference.pdb', result, outpath='bent.pdb')
+print(f"CA RMSD: {result.rmsd:.3f} Å")
+```
 
 ## Requirements
 
-- **tcsh** (prototype version only)
-- **CCP4 suite** (coordconv, pdbset, mapmask, mapdump, unique, sftools, mtzdump, f2mtz, fft, refmac5) (prototype version only)
-- **gnuplot ≥ 5** (accessible as `gnuplot` or `gnuplot5`) (prototype version only)
-- **mapman** from the Uppsala Software Factory RAVE suite (only needed when a map file is provided) (prototype version only)
+- Python 3.8+ with numpy, scipy, gemmi
+- CCP4 Python environment (`ccp4-python`) recommended for map I/O
 
-## Options
+## Options (`bendfinder.py`)
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `nhkls=N` | 1000 | Maximum number of Fourier coefficients to fit |
-| `starthkls=N` | 5 | Number of coefficients in the first iteration |
-| `batchhkls=N` | 1 | Coefficients added per iteration |
-| `reso=R` | 3 | Resolution cutoff (Å) for HKL generation |
-| `frac=F` | 1 | How far along the bend path to place the output (0–1) |
-| `reject=M` | 0 | Reject atom pairs > M×MAD from median shift |
-| `dimensions=xyz` | xyz | Which PDB fields to fit (any subset of `x y z o B`) |
-| `drop_frac=F` | 0.001 | Pre-fit: drop DFT coefficients below this fraction of the maximum |
-| `drop_snr=S` | 1 | Post-fit: drop coefficients with fitted \|a\|/σ_a < S |
-| `geotest=false` | true | Run refmac5 geometry check at each iteration (slow) |
-| `nofit` | off | Skip gnuplot fitting; use raw DFT values directly (fast but inaccurate) |
-| `deltamaps` | off | Write electron density maps of shift magnitudes Δx, Δy, Δz, Δr |
-| `fitparams_N.gnuplot` | — | Apply a previously-fitted function without re-fitting |
-| `refit` | — | Force re-fitting even when a fitparams file is provided |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `fitreso_start` | 20.0 | Starting resolution (Å) — coarsest HKLs first |
+| `fitreso_end` | 7.0 | Stopping resolution (Å) — limited by overdetermination ratio |
+| `batch_hkls` | 100 | HKLs admitted per progressive iteration |
+| `od_margin` | 1.5 | Stop when (N_atoms × 3) / (N_canon × 6) drops below this |
+| `outlier_sigma` | 2.5 | Reject CA pairs > this many robust σ from median shift |
+| `b_sigma` | 3.0 | Reject CA pairs with B-factor > median + b_sigma × σ_MAD |
+| `drop_snr` | 0.0 | Drop HKLs with \|A,B\| / σ < drop_snr (0 = keep all) |
+| `use_symm` | True | Apply space-group proper-rotation constraints |
+| `dimensions` | 'xyz' | Which coordinate axes to fit |
+| `frac` | 1.0 | How far along the bend path to place the output (0–1) |
+| `verbose` | True | Print per-iteration progress |
 
 ## How it works
 
-1. Both PDB files are expanded from their crystallographic space group to P1.
-2. Atom pairs are matched by residue and atom name; fractional coordinate differences give the shift at each atom position.
-3. The CCP4 `unique` program generates all (h,k,l) indices out to `reso` Å, sorted by resolution.
-4. For each iteration (adding one HKL at a time), a direct Fourier transform (slow-FT) over atom positions gives starting values for the amplitude *a* and phase *φ* of each sine term.
-5. **Pre-fit filtering** (`drop_frac`): DFT coefficients below `drop_frac × max(|a|)` are dropped before the gnuplot fit.
-6. gnuplot 5's nonlinear Levenberg-Marquardt fitter jointly refines all active amplitudes and phases, minimising the sum of squared residuals over all atom pairs. Jobs for x, y, z run in parallel.
-7. **Post-fit SNR filtering** (`drop_snr`): after fitting, coefficients with `|a_fitted| / σ_a < drop_snr` are dropped. This removes statistically insignificant terms whose DFT values were inflated by dirty-beam aliasing (non-uniform atom sampling). Dropped terms re-enter as candidates on the next iteration.
-8. The fitted shift field is applied to the moving PDB and RMSD reported. The loop continues until `nhkls` coefficients have been tried.
+1. Both PDB files are expanded from their crystallographic space group to P1 (via gemmi).
+2. CA atom pairs are matched by residue and atom name. Outliers are rejected by shift magnitude and B-factor using robust statistics (median ± `outlier_sigma` × σ_MAD).
+3. All (h,k,l) indices out to `fitreso_end` Å are enumerated, sorted by resolution (low-res first), and deduplicated for Friedel symmetry.
+4. Proper-rotation symmetry of the space group is applied: each Friedel-unique HKL is assigned a canonical representative, reducing the free parameter count by the order of the point group (e.g. ×8 for P4₃2₁2).
+5. A joint design matrix **X** (shape 3N_atoms × 6M_canon) is built from the symmetry-expanded sine/cosine basis. All three coordinate axes are fitted simultaneously.
+6. **X @ params = shifts** is solved by SVD (scipy.linalg), giving the globally optimal (A, B) coefficients and their uncertainties from the covariance matrix.
+7. Steps 2–6 are repeated in a coarse-to-fine loop (`fitreso_start` → `fitreso_end`), admitting `batch_hkls` new HKLs per iteration. Atoms whose residuals remain large after each fit are down-weighted, so the model is not distorted by conformational outliers.
+8. The loop stops when the overdetermination ratio (atoms / canonical parameters) drops below `od_margin` — naturally limiting resolution to where the data can support the model.
+9. The fitted shift field is evaluated at all atom positions; bent PDB and optional map are written.
 
-### Why ±HKL and resolution sorting?
+## Benchmarks
 
-Earlier versions used only positive (h,k,l) and a complex-exponential basis, which requires gnuplot to handle complex arithmetic. The current approach:
+All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`).
 
-- Uses **both positive and negative** indices (via CCP4 `unique`), doubling the effective basis and capturing antisymmetric deformations.
-- Sorts by **resolution** (d-spacing), so the largest-scale (most physically meaningful) deformations are fitted first — analogous to fitting low-order terms before high-order ones.
-- Uses **real sine functions**, which avoids complex arithmetic in gnuplot and makes the fitted parameters directly interpretable as amplitude and phase.
+### Python version (`bendfinder.py`)
 
-Benchmark on lysozyme 3aw6/3aw7 (same crystal form, two relative humidity conditions — 71.9% vs 84.2% — causing ~2.5% cell contraction):
+| System | Crystal forms | Space group | CA pairs | CA RMSD | Time |
+|--------|--------------|-------------|----------|---------|------|
+| Lysozyme | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.033 Å** | 118 s |
+| DHFR | 1rx1 → 1rx2 | P2₁2₁2₁ | 636 | **0.071 Å** | 191 s |
+| Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.060 Å** | 106 s |
+
+### vs prototype (tcsh + gnuplot)
+
+| System | Prototype RMSD | Prototype time | Python RMSD | Python time | Speedup |
+|--------|---------------|----------------|-------------|-------------|---------|
+| Lysozyme 3aw6/3aw7 | 0.209 Å | 2938 s | 0.033 Å | 118 s | **25×** |
+| Myoglobin 1mbo/1a6m | 0.229 Å | 237 s | 0.060 Å | 106 s | **2×** |
+
+The lysozyme comparison is against the gold-standard prototype run (order 5, 91 HKLs, 71.9% vs 84.2% relative humidity causing ~2.5% cell contraction). The Python version achieves 6× better RMSD in 1/25th the time, primarily because:
+- Linear (A, B) parameterisation allows all HKLs to be fitted simultaneously via SVD
+- Space-group symmetry constraints reduce free parameters ~8× for P4₃2₁2
+- No incremental gnuplot fitting loop required
+
+The myoglobin prototype used nhkls=100; the Python version naturally fits more HKLs (401) before the overdetermination ratio stops it, contributing to the lower RMSD.
+
+### Prototype convergence (lysozyme 3aw6/3aw7, for reference)
 
 | HKLs fitted | RMSD(CA) | Time  | Old approach equivalent        |
 |-------------|----------|-------|-------------------------------|
@@ -78,27 +94,38 @@ Benchmark on lysozyme 3aw6/3aw7 (same crystal form, two relative humidity condit
 | 26          | 0.215 Å  | 1070 s| Order 4 (61 HKLs)             |
 | 30          | 0.211 Å  | 1503 s| Order 5 (91 HKLs, 2938 s)    |
 
-Roughly 3× fewer coefficients and 2× faster to reach equivalent accuracy.
+## Output
 
-## Output files
+`bend_fit_progressive` returns a result object with:
 
-| File | Description |
-|------|-------------|
-| `bentN_<pdb1>.pdb` | Input PDB with shift field applied after N coefficients |
-| `fitparams_N.gnuplot` | Fitted Fourier coefficients after N iterations |
-| `func.gnuplot` | gnuplot function definitions for the current shift field |
-| `fitparams_[xyz].gnuplot` | Per-dimension fitted parameters |
-| `fitrun_[xyz].log` | gnuplot fitting output including correlation matrix |
-| `param_correlations.txt` | Highly correlated parameter pairs (potential degeneracies) |
-| `allhkl.txt` | Full sorted HKL list used as basis |
-| `bent[N].map` | Re-sampled map at iteration N (when a map file is provided) |
+| Attribute | Description |
+|-----------|-------------|
+| `result.rmsd` | CA RMSD after bending (Å) |
+| `result.hkls` | Array of active (h,k,l) indices, shape (N,3) |
+| `result.AB` | Fourier coefficients, shape (3, N, 2) — [dim, hkl, sin/cos] |
+| `result.active` | Boolean mask of active HKLs |
+| `result.snr` | Signal-to-noise ratio per HKL |
+| `result.cell1`, `result.cell2` | Unit cell parameters for both crystals |
+| `result.dimensions` | Which coordinate axes were fitted |
+
+Key functions:
+
+| Function | Description |
+|----------|-------------|
+| `bend_fit_progressive(pdb1, pdb2, ...)` | Fit the shift field; returns result object |
+| `bend_apply_pdb(pdb1, pdb2, result, outpath=...)` | Write bent PDB |
+| `save_fitparams(path.mtz, ...)` | Save fitted coefficients to MTZ |
+| `load_fitparams(path.mtz)` | Load previously fitted coefficients |
+| `eval_shift_field(frac_pts, hkls, AB)` | Evaluate shift at arbitrary fractional coordinates |
+| `interpolate_map(map_data, header, frac_pts)` | Trilinear interpolation into a CCP4 map |
+| `read_ccp4(path)` / `write_ccp4(path, data, header)` | CCP4 map I/O |
 
 ## Files in this repository
 
 | File | Description |
 |------|-------------|
-| `bendfinder.com` | Main script (self-deploying; embeds helper programs) |
+| `bendfinder.py` | Main Python module |
+| `bendfinder.com` | Prototype tcsh script (historical reference) |
 | `origins.com` | Helper: test symmetry origin choices |
-| `mapman64_notes.csh` | Notes on building mapman for 64-bit Linux |
-| `mapman_regression_test.csh` | Regression test for mapman interpolation |
+| `examples/3aw6_3aw7/` | Lysozyme canonical example data |
 | `LICENSE` | License |
