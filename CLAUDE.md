@@ -1,226 +1,127 @@
-# map_bender / bendfinder.com — Claude context
+# map_bender / bendfinder — Claude context
 
 ## Project overview
 
-`bendfinder.com` is a prototype script that fits a smooth, periodic 3D coordinate-shift field between two non-isomorphous crystal forms of the same protein. The shift field is a Fourier series indexed by Miller indices (h,k,l).
+`bendfinder.py` fits a smooth, periodic 3D coordinate-shift field between two non-isomorphous crystal forms of the same protein. The shift field is a truncated Fourier series indexed by Miller indices (h,k,l).
 
-The git repo lives at `./map_bender/` (relative to `../`). The working development copy is `../bendfinder.com`. Keep both in sync when making changes — they must stay identical.
+The git repo lives at `./map_bender/` (relative to `../`). The working development copy is `../bendfinder.py`. **Keep both in sync when making changes — they must stay identical.**
+
+`bendfinder.com` (tcsh prototype) is historical reference only; development is Python-only.
 
 ## Directory structure
 
 ```
 ../                             working area, not in git
-  bendfinder.com                current development version (keep in sync with map_bender/)
+  bendfinder.py                 current development copy (keep in sync with map_bender/)
+  bendfinder.com                prototype tcsh script (historical reference)
+  diff.com                      Riso calculation: scaleit-based isomorphous R-factor
   map_bender/                   git repository
-    bendfinder.com
+    bendfinder.py
     CLAUDE.md                   this file
     README.md
     origins.com
     LICENSE
-    examples/3aw6_3aw7/         canonical lysozyme example (checked into git)
-  lyso_test_031419/             gold-standard reference run (old prototype version)
-    bendfinder.log              order 0=0.771, 1=0.413, 2=0.327, 3=0.246, 4=0.215, 5=0.209
-    bendfinder.com              original script used for gold-standard
-    3aw7_refine_001.pdb         moving PDB (lysozyme form 2)
-    3aw6_refine_001.pdb         reference PDB (lysozyme form 1)
-    3aw7_2fofc.map              2Fo-Fc map for re-sampling
-  test_temperature/             4kjk / 4kjj — same crystal, two temperatures, P212121
-    run4/                       nhkls=100 batchhkls=5: RMSD≈0.28 Å
-    run5/                       starthkls=100 single-shot: RMSD=0.316 Å (worse — see nofit)
-    nofit_N/                    single-shot nofit at N HKLs (diverges above N~30)
-  myoglobin/                    1mbo → 1a6m, P2₁, 151 CA pairs
-    run1/                       nhkls=100: RMSD=0.229 Å in 237 s
-  raddam/                       radiation damage series vs 5kxk (P4₃2₁2, 169 CA)
-    run_5kxl/                   RMSD=0.177 Å in 643 s
-    run_5kxm/                   RMSD=0.165 Å in 506 s  (smallest shift)
-    run_5kxn/                   RMSD=0.220 Å in 558 s
-  scan_3aw6_3aw7/               parameter scan results (geotest=false, nhkls=30)
-    batch1…batch5/              batchhkls scan; batch5 is fastest at same RMSD
-    snr2/ snr3/                 drop_snr scan
-    nhkls20/                    nhkls=20 reference
-    nofit_lyso_N/               single-shot nofit divergence tests
-  test1/                        oldest reference (positive-only HKLs, complex exponential)
-  test_new/                     sandbox
-  test_goldstd/                 benchmark run (new vs gold-standard)
+    examples/3aw6_3aw7/         canonical lysozyme example data (checked into git)
+  lyso/                         lysozyme 3aw6→3aw7 (P4₃2₁2, 1008 CA pairs)
+    lyso_fitreso_scan.py
+    3aw6.pdb, 3aw7.pdb
+    3aw6_2fofc.map, 3aw7_2fofc.map
+    fitreso_scan/               hkl00..hkl10, fr5..fr20 output subdirs
+  dhfr/                         DHFR 1rx1→1rx2 (P2₁2₁2₁, 636 CA pairs)
+    dhfr_fitreso_scan.py
+    fitreso_scan/
+  myoglobin/                    myoglobin 1mbo→1a6m (P2₁, 294 CA pairs)
+    myoglobin_fitreso_scan.py
+    fitreso_scan/
+  raddam/                       radiation damage 5kxk→5kxl/m/n (P4₃2₁2, ~980 CA pairs)
+    raddam_fitreso_scan.py      takes target (5kxl|5kxm|5kxn) as argv[1]
+    fitreso_scan_5kxl/, fitreso_scan_5kxm/, fitreso_scan_5kxn/
+  lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
 ```
 
-## Algorithm summary (prototype version)
+## Algorithm (Python version)
 
-1. Both PDBs expanded from their space group to P1 (via CCP4 `pdbset`).
-2. Atom pairs matched by residue+atom name; fractional Δr = shift at each atom.
-3. CCP4 `unique` generates all (h,k,l) to `reso` Å, sorted by d-spacing (low-res first).
-4. **Big loop** over nhkls (starthkls → maxhkls, stepping batchhkls):
-   - **Slow-FT**: compute DFT over atom positions **from current residuals** as starting values for new HKLs.
-   - **Pre-fit drop** (`drop_frac`): drop DFT amplitudes < drop_frac × max amplitude.
-   - **gnuplot5 fit**: jointly refine all active (a, φ) pairs; x/y/z run in parallel.
-   - **Post-fit SNR drop** (`drop_snr`): drop fitted params with |a|/σ_a < drop_snr. Dropped params re-enter next iteration (dirty-beam deconvolution).
-   - Rebuild fitparams.gnuplot, apply shift field, report RMSD(CA).
-
-**Critical**: the slow-FT operates on the *residual* (observed minus current model). Single-shot nofit (all HKLs at once without a prior model) diverges — see below.
+1. Both PDBs are expanded from their crystallographic space group to P1 via gemmi.
+2. CA atom pairs are matched by residue+atom name. Outliers rejected by shift magnitude (`outlier_sigma`) and B-factor (`b_sigma`) using robust statistics (MAD-based).
+3. All (h,k,l) out to `fitreso_end` Å are enumerated, sorted low-resolution first, deduplicated for Friedel symmetry.
+4. Proper-rotation symmetry of the space group is applied (`use_symm=True`): each Friedel-unique HKL is assigned a canonical representative, reducing free parameters by the point-group order (×8 for P4₃2₁2).
+5. A joint design matrix **X** (3N_atoms × 6M_canon) is built from symmetry-expanded sine/cosine basis. All three axes are fitted simultaneously.
+6. **X @ params = shifts** is solved by SVD (scipy.linalg), giving globally optimal (A, B) coefficients and covariance-matrix uncertainties.
+7. Steps 3–6 repeat coarse-to-fine (`fitreso_start` → `fitreso_end`), admitting `batch_hkls` new HKLs per iteration. The loop stops when the overdetermination ratio (atoms / canonical params) drops below `od_margin`.
+8. Optional `iter_callback(iter_i, nhkls, n_canon, rmsd, hkls, AB_xyz, active, snr)` is called after each iteration. `max_canon` stops the loop once n_canon ≥ that value.
 
 ## Key parameters
 
-| Param | Default | Role |
-|-------|---------|------|
-| `nhkls` | 1000 | Max Fourier terms |
-| `starthkls` | 5 | Start here |
-| `batchhkls` | 1 | Add this many per iteration |
-| `reso` | 3 | Å resolution cutoff for HKL list |
-| `drop_frac` | 0.001 | Pre-fit: fraction of max DFT amplitude |
-| `drop_snr` | 1 | Post-fit: SNR threshold (|a|/σ_a) |
-| `fitscale` | 1000 | Internal amplitude scale (avoids gnuplot underflow) |
-| `dimensions` | x y z | Which coordinate shifts to fit |
-| `geotest` | true | Run refmac5 geometry check (slow — set false for testing) |
-| `nofit` | unset | Skip gnuplot; use raw DFT values (see nofit pitfall below) |
+| Parameter | Default | Role |
+|-----------|---------|------|
+| `fitreso_start` | 20.0 | Coarsest resolution to admit (Å) |
+| `fitreso_end` | 7.0 | Finest resolution to admit (Å) |
+| `batch_hkls` | 100 | New HKLs admitted per iteration |
+| `od_margin` | 1.5 | Stop when atoms/(canon params) < od_margin |
+| `outlier_sigma` | 2.5 | CA pair rejection threshold (robust σ of shift magnitude) |
+| `b_sigma` | 3.0 | CA pair rejection threshold (B-factor; median + b_sigma×σ_MAD) |
+| `drop_snr` | 0.0 | Drop HKLs with \|A,B\|/σ < drop_snr (0 = keep all) |
+| `use_symm` | True | Apply space-group proper-rotation constraints |
+| `dimensions` | 'xyz' | Which coordinate axes to fit |
+| `iter_callback` | None | Called after each progressive iteration (see above) |
+| `max_canon` | None | Stop after first iteration where n_canon ≥ this value |
 
-## Parameter scan results (3aw6/3aw7, nhkls=30, geotest=false)
+## Fitreso scan scripts
 
-| Run | Change | RMSD(CA) | Time |
-|-----|--------|----------|------|
-| batch1 (baseline) | batchhkls=1 | 0.211 Å | 1503 s |
-| **batch5** | **batchhkls=5** | **0.210 Å** | **301 s** |
-| batch3 | batchhkls=3 | 0.217 Å | 331 s |
-| batch2 | batchhkls=2 | 0.217 Å | 495 s |
-| snr3 | drop_snr=3 | 0.211 Å | 710 s |
-| snr2 | drop_snr=2 | 0.211 Å | 719 s |
-| nhkls20 | nhkls=20 | 0.245 Å | 247 s |
+Each system has a `*_fitreso_scan.py` script that runs three sections and reports per-point: label, RMSD(CA), active HKLs, Rfac (Riso vs reference map), strongest positive and negative difference map peaks with nearest atom.
 
-**Best: `batchhkls=5`** — same RMSD as default, 5× faster. Higher drop_snr doesn't help at nhkls=30. nhkls=20 saves ~50 s at cost of 0.035 Å.
+**Section 1 — hkl00**: zero shift; just resample the moving map onto the reference grid via `interpolate_map`. Establishes the unregistered baseline.
 
-Gold-standard (old approach, order 5, 91 HKLs): RMSD=0.209 Å in 2938 s.
+**Section 2 — hkl01..hkl10**: single `bend_fit_progressive` call with `batch_hkls=1, max_canon=11, fitreso_start=100`. The `iter_callback` fires once per canonical HKL added (n_non_dc = n_canon − 1). Efficient: only one initialization (atom matching, outlier rejection) for all 10 checkpoints.
 
-## nofit single-shot divergence
+**Section 3 — fr20..fr5**: separate `bend_fit_progressive` calls with `fitreso_end` in [20,15,12,10,8,7,6,5] Å.
 
-`nofit` with `starthkls=nhkls` (all HKLs in one shot) **diverges** because each HKL computes its DFT amplitude from the full unmodeled shift, not the residual. Summing N such terms produces a divergent dirty-beam superposition.
+**Riso calculation**: `diff.com` (tcsh, uses CCP4 scaleit). Map→MTZ conversion is done with `gemmi.transform_map_to_f_phi` — no sfall required, works for any space group including P2₁.
 
-| nhkls | lyso nofit | temp nofit |
-|-------|-----------|-----------|
-| 5     | 0.497 Å   | 0.607 Å   |
-| 30    | **31.2 Å** | 0.665 Å  |
-| 300   | 31.2 Å    | **21.9 Å** |
-| 1000  | 31.2 Å    | 18.9 Å    |
+**Large-map memory**: `eval_shift_field` allocates an (N_voxels × N_hkls) phase matrix. For large maps (raddam: 3.7M voxels × 900+ HKLs ≈ 26 GB) this must be chunked. The raddam scan script uses `eval_shift_field_chunked` in 50k-voxel batches.
 
-The incremental loop with nofit is a greedy matching pursuit (CLEAN algorithm) that works by projecting each new HKL onto the current residual. It works but accumulates dirty-beam errors that the gnuplot fit step corrects.
+## Cubic b-spline boundary fix (interpolate_map)
 
-A linear lstsq solver (numpy) eliminates this entirely — fit all HKLs at once, globally optimal, no loop needed.
+`scipy.ndimage.map_coordinates` with `order=3, mode='wrap'` can produce overshoot at cell boundaries if adjacent grid rows have large density gradients. This creates spikes in difference maps at x=0, y=0, z=0.
 
-## Variable name encoding (gnuplot fitparams)
+**Fix**: `interpolate_map` pads by 5 voxels on each side with periodic copies (`np.pad(data, 5, mode='wrap')`) before calling `map_coordinates` with `mode='nearest'`. The IIR b-spline prefilter decays as 0.268^k, so 5-voxel padding gives <0.15% boundary error at any interior query point. Do not use `pad=2` (insufficient) or `order=1` (eliminates overshoot at the cost of cubic quality everywhere).
 
-Negative HKL indices encoded with `m`, positive with `p`, zero with nothing:
+## gemmi map→MTZ conversion
 
-- h=0, k=1, l=0  →  `a_dx0_1_0`
-- h=1, k=-1, l=0 →  `a_dx1_m1_0`
-- h=-1, k=0, l=1 →  `a_dxm1_0_1`
+The `map2mtz` function in scan scripts uses:
 
-## Important runtime files
-
-- `allhkl.txt` — full sorted HKL list; `0 0 0` always first
-- `ehkl.txt` — encoded HKL names for current iteration
-- `fitparams.gnuplot` — all fitted (a, φ, a_err, φ_err) for active HKLs
-- `fitparams_{x,y,z}.gnuplot` — per-dimension split (parallel gnuplot jobs)
-- `func.gnuplot` — gnuplot function definitions `dx(x,y,z)=...`
-- `fitme` — atom fractional coords + shifts (input to gnuplot)
-- `fitrun_{x,y,z}.log` — gnuplot output including correlation matrix
-- `param_correlations.txt` — pairs with |CC| > 0.90 (watch for degeneracy)
-
-## fitparams format
-
-gnuplot `update` appends fitted values, so each parameter has two `_err` lines — first is initialization (1e-10), second is actual σ. Always take the **last** occurrence:
-
-```
-a_dx0_1_0 = 7.03
-a_dx0_1_0_err = 1e-10        ← initialization, ignore
-a_dx0_1_0_err = 0.058        ← fitted σ, use this
+```python
+ccp4 = gemmi.read_ccp4_map(mapfile)
+ccp4.setup(float('nan'))
+sf   = gemmi.transform_map_to_f_phi(ccp4.grid, half_l=True)
+data = sf.prepare_asu_data(dmin=0.0)
+mtz  = gemmi.Mtz(with_base=True)
+mtz.spacegroup = ccp4.grid.spacegroup
+mtz.cell       = ccp4.grid.unit_cell
+mtz.add_dataset('dataset')
+mtz.add_column('F', 'F')
+mtz.add_column('PHI', 'P')
+...
+mtz.write_to_file(mtzfile)
 ```
 
-## Post-fit SNR pruning (drop_snr)
+This replaces the old sfall subprocess approach (which failed for P2₁ maps). No CCP4 programs needed for this step; gemmi handles axis ordering from the CCP4 header automatically.
 
-Lines ~796–822 (after gnuplot fit, before correlation analysis). awk reads fitparams.gnuplot, computes SNR = |a| / σ_a, drops params below threshold. Output routing: informational `SNR-pruned N params` line is mixed in tempfile; `egrep ^SNR-pruned` displays it, `egrep -v ^SNR-pruned` strips it before writing fitparams.gnuplot (prevents gnuplot parse errors).
+## Empirical results (fitreso scans)
 
-## tcsh features to keep in mind
+All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `batch_hkls=100`).
 
-1. **Multi-line awk in single quotes**: tcsh requires `\` at the end of every internal line of a `'...'` string. Bare newlines cause `Unmatched '.` at runtime.
-2. **`!` in awk patterns**: tcsh expands `!` for history substitution before quote parsing. `!/pattern/` triggers `Event not found`. Use `index($field,"str")==0` instead.
-3. **`next` in awk END block**: invalid in awk. Use `continue` inside a for loop in END.
-4. **PDB args are positional**: the script matches `*.pdb` glob in the arg loop. Pass PDB files as bare paths (`file1.pdb file2.pdb`), not `pdb1=file.pdb` — the literal string `pdb1=file.pdb` fails the `-e` existence check.
+| System | Space group | CA pairs | fr5 RMSD | fr5 Rfac | hkl00 Rfac |
+|--------|------------|----------|----------|----------|------------|
+| Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.034 Å | 33.2% | 59.5% |
+| DHFR 1rx1→1rx2 | P2₁2₁2₁ | 636 | 0.071 Å | 41.9% | 44.1% |
+| Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | — | — |
+| Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.082 Å | 20.6% | 13.4% |
+| Raddam 5kxk→5kxm | P4₃2₁2 | 984 | — | — | 11.0% |
+| Raddam 5kxk→5kxn | P4₃2₁2 | ~992 | — | — | — |
 
-## Helper programs (self-deployed)
-
-`bendfinder.com` is self-deploying. `rmsd`, `map2pdb.com`, `floatgen.c`, and `origins.com` are embedded as here-doc payloads, extracted into `$PATH` on first run (`deploy_scripts` label).
-
-## Common pitfalls
-
-- `gnuplot5` must be version ≥ 5 with `set fit errorvariables`. Script auto-detects.
-- `CCP4_SCR` must be set. Script aborts if not.
-- `drop_snr=0` disables SNR pruning entirely.
-- Fitting time scales O(N²) in active parameters/dimension. batchhkls=5 keeps gnuplot comfortable; above ~100 simultaneous params, L-M fails to converge.
-- On SLURM login nodes: `srun --cpus-per-task=3` (3 for parallel x/y/z gnuplot jobs).
-
----
-
-## Python / C port plan
-
-### Motivation
-
-The gnuplot (a, φ) nonlinear parameterization forces the incremental batchhkls loop because L-M fails above ~100 simultaneous parameters. Switching to a **linear (A, B) parameterization** eliminates this entirely:
-
-```
-dx = Σ_hkl [ A_hkl · sin(2π(hx+ky+lz)) + B_hkl · cos(2π(hx+ky+lz)) ]
-```
-
-Build design matrix X (atoms × 2·nhkls), solve `X @ [A,B] = shifts` with lstsq. Recover `a = sqrt(A²+B²)`, `φ = atan2(B,A)`. Uncertainties from covariance diagonal `σ²·(XᵀX)⁻¹`. All HKLs fit simultaneously, no incremental loop, guaranteed convergence.
-
-### Architecture
-
-```
-bendfinder.py               main script (replaces bendfinder.com)
-  pdb_io.py                 read PDB, match atoms, expand to P1 (via gemmi)
-  hkl.py                    enumerate HKLs to resolution cutoff (replaces CCP4 unique)
-  fit.py                    design matrix, lstsq, SNR pruning
-  apply.py                  evaluate shift field, write output PDB
-
-design_matrix.c (optional)  fast inner loop if numpy is too slow
-```
-
-### Phase 1 — Python core
-
-- **pdb_io.py**: read PDB, match atom pairs by resname+resnum+atomname, compute fractional Δr. Use `gemmi` for P1 expansion (replaces `pdbset`/`pdbcur`).
-- **hkl.py**: enumerate all (h,k,l) with d ≥ reso Å, sort by d descending, deduplicate Friedel pairs. Pure numpy — replaces CCP4 `unique`.
-- **fit.py**: build X; call `scipy.linalg.lstsq`; recover (a, φ, σ_a); SNR-prune (drop HKLs where |a|/σ_a < drop_snr); re-solve; repeat until stable (1–2 rounds typically).
-- **apply.py**: evaluate shift field at atom positions; write bent PDB.
-- Keep `refmac5` geotest and `rmsd` helper as external calls.
-
-### Phase 2 — C extension (if needed)
-
-Profile first. Likely bottleneck is building X: O(N_atoms × N_hkls) trig calls. If slow:
-
-```c
-// design_matrix.c — called via ctypes
-void build_design_matrix(
-    const double *atoms,  // Nx3 fractional coords
-    const int    *hkls,   // Mx3 Miller indices
-    int N, int M,
-    double *X);           // Nx2M output
-```
-
-LAPACK is already used internally by scipy for lstsq; no need to call it from C.
-
-### Phase 3 — Reduce CCP4 dependency
-
-- HKL generation: done in Phase 1 (pure Python/numpy).
-- P1 expansion: done in Phase 1 (gemmi).
-- Map resampling (deltamaps): keep CCP4 FFT for now; replace with `gemmi` later.
-- Geometry check (`geotest`): keep `refmac5` — no suitable free alternative.
-- `rmsd` helper: keep C binary or rewrite in Python with gemmi.
-
-### Comparison
-
-| Feature | prototype + gnuplot | Python + lstsq |
-|---------|---------------|----------------|
-| Parameterization | (a, φ) nonlinear | (A, B) linear |
-| Incremental loop | Required (load-bearing) | Not needed |
-| Convergence | L-M, can fail >~100 params | Guaranteed |
-| Uncertainties | gnuplot errorvariables | Covariance matrix |
-| nhkls limit | ~30–50/dimension | 1000+ trivially |
-| gnuplot dependency | Required | Eliminated |
-| CCP4 dependency | pdbset + unique + refmac5 | refmac5 only (Phase 3: none) |
+Notes:
+- Lyso Rfac plateaus at ~33% by fr20 and barely changes with higher resolution — real structural differences remain in the diff map (A/74ASN/O is the persistent −10σ peak).
+- DHFR Rfac barely improves (44% → 42%) — these crystal forms are more dissimilar; the FOL ligand and Mn ion dominate the diff map at all resolutions.
+- Raddam Rfac *starts* low (13–11%) because the fc maps are nearly identical; huge water peaks (±30–65σ) reflect water molecules appearing/disappearing with radiation dose.
+- Myoglobin Rfac pending (gemmi map2mtz re-run in progress); heme iron dominates diff map throughout (±35σ at A/154HEM/FE).

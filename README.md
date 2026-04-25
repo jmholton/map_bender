@@ -30,6 +30,7 @@ print(f"CA RMSD: {result.rmsd:.3f} Å")
 
 - Python 3.8+ with numpy, scipy, gemmi
 - CCP4 Python environment (`ccp4-python`) recommended for map I/O
+- CCP4 programs (scaleit, cad) required only for Riso computation via `diff.com`; map→MTZ conversion uses gemmi directly
 
 ## Options (`bendfinder.py`)
 
@@ -46,6 +47,8 @@ print(f"CA RMSD: {result.rmsd:.3f} Å")
 | `dimensions` | 'xyz' | Which coordinate axes to fit |
 | `frac` | 1.0 | How far along the bend path to place the output (0–1) |
 | `verbose` | True | Print per-iteration progress |
+| `iter_callback` | None | Called as `f(iter_i, nhkls, n_canon, rmsd, hkls, AB_xyz, active, snr)` after each progressive iteration |
+| `max_canon` | None | Stop after first iteration where n_canon ≥ this value; useful for stepping through canonical HKL checkpoints |
 
 ## How it works
 
@@ -65,14 +68,16 @@ All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlie
 
 ### Python version (`bendfinder.py`)
 
-| System | Crystal forms | Space group | CA pairs | CA RMSD | Time |
-|--------|--------------|-------------|----------|---------|------|
-| Lysozyme | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.033 Å** | 118 s |
-| DHFR | 1rx1 → 1rx2 | P2₁2₁2₁ | 636 | **0.071 Å** | 191 s |
-| Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.060 Å** | 106 s |
-| Lysozyme raddam | 5kxk → 5kxl | P4₃2₁2 | 976 | **0.082 Å** | ~550 s |
-| Lysozyme raddam | 5kxk → 5kxm | P4₃2₁2 | 984 | **0.046 Å** | ~575 s |
-| Lysozyme raddam | 5kxk → 5kxn | P4₃2₁2 | 992 | **0.055 Å** | ~580 s |
+| System | Crystal forms | Space group | CA pairs | CA RMSD | Riso (fr5) | Time |
+|--------|--------------|-------------|----------|---------|-----------|------|
+| Lysozyme | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.034 Å** | 33.2% | 335 s |
+| DHFR | 1rx1 → 1rx2 | P2₁2₁2₁ | 636 | **0.071 Å** | 41.9% | 287 s |
+| Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.063 Å** | — | 150 s |
+| Lysozyme raddam | 5kxk → 5kxl | P4₃2₁2 | 976 | **0.082 Å** | 20.6% | 112 s |
+| Lysozyme raddam | 5kxk → 5kxm | P4₃2₁2 | 984 | **0.046 Å** | — | — |
+| Lysozyme raddam | 5kxk → 5kxn | P4₃2₁2 | ~992 | — | — | — |
+
+Times are for the fr5 fitreso scan run (fitreso_start=20, fitreso_end=5 Å). Raddam times are faster because the Fc maps have smaller structural differences.
 
 ### vs prototype (tcsh + gnuplot)
 
@@ -123,8 +128,9 @@ Key functions:
 | `save_fitparams(path.mtz, ...)` | Save fitted coefficients to MTZ |
 | `load_fitparams(path.mtz)` | Load previously fitted coefficients |
 | `eval_shift_field(frac_pts, hkls, AB)` | Evaluate shift at arbitrary fractional coordinates |
-| `interpolate_map(map_data, header, frac_pts)` | Trilinear interpolation into a CCP4 map |
+| `interpolate_map(map_data, header, frac_pts)` | Tricubic spline interpolation into a CCP4 map; 5-voxel periodic padding prevents b-spline overshoot at cell boundaries |
 | `read_ccp4(path)` / `write_ccp4(path, data, header)` | CCP4 map I/O |
+| `read_ccp4_fullcell(path)` | Read CCP4 map and expand to full P1 unit cell via gemmi symmetry |
 
 ## Files in this repository
 
@@ -135,3 +141,15 @@ Key functions:
 | `origins.com` | Helper: test symmetry origin choices |
 | `examples/3aw6_3aw7/` | Lysozyme canonical example data |
 | `LICENSE` | License |
+
+## Fitreso scan workflow
+
+The scan scripts (`lyso/lyso_fitreso_scan.py`, `dhfr/dhfr_fitreso_scan.py`, `myoglobin/myoglobin_fitreso_scan.py`, `raddam/raddam_fitreso_scan.py`) evaluate bend quality as a function of resolution. Each script runs three sections:
+
+1. **hkl00** — no bending; resample moving map onto reference grid with zero shift. Gives the unregistered baseline Rfac.
+2. **hkl01..hkl10** — add canonical HKLs one at a time using a single `bend_fit_progressive` call with `batch_hkls=1, max_canon=11` and an `iter_callback` that snapshots the bent map at each n_non_DC checkpoint.
+3. **fr20..fr5** — separate `bend_fit_progressive` calls with `fitreso_end` stepped from 20 to 5 Å.
+
+For each scan point the script writes `bent.map`, `diff_norm.map` (z-scored difference), and `fitparams.mtz`, then computes Riso via `diff.com` and reports the strongest positive and negative difference-map peaks with their nearest atoms.
+
+Map→MTZ conversion uses `gemmi.transform_map_to_f_phi` (no sfall required).

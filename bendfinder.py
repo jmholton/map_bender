@@ -829,6 +829,29 @@ def read_ccp4(path):
     return data, hdr
 
 
+def read_ccp4_fullcell(path):
+    """Read a CCP4 map and expand to the full unit cell using gemmi symmetry.
+
+    Uses gemmi's setup() to fill the entire unit cell from the asymmetric unit,
+    then rearranges axes to match the original map's mapc/mapr/maps convention.
+    Returns (data float32 (ns_full, nr_full, nc_full), hdr dict with starts=0).
+    """
+    import gemmi
+    _, hdr = read_ccp4(path)
+    ccp4 = gemmi.read_ccp4_map(path, setup=True)
+    grid = ccp4.grid
+    # gemmi grid.array shape is (nu, nv, nw) = (NX, NY, NZ) after setup
+    garr = np.array(grid.array, dtype=np.float32)
+    mapc, mapr, maps = hdr['mapc'], hdr['mapr'], hdr['maps']
+    # Rearrange to (ns, nr, nc) = (maps-axis, mapr-axis, mapc-axis)
+    data = np.transpose(garr, (maps - 1, mapr - 1, mapc - 1))
+    Ng = {1: grid.nu, 2: grid.nv, 3: grid.nw}
+    hdr_full = dict(hdr)
+    hdr_full.update(nc=Ng[mapc], nr=Ng[mapr], ns=Ng[maps],
+                    ncstart=0, nrstart=0, nsstart=0)
+    return data, hdr_full
+
+
 def write_ccp4(path, data, hdr_template, cell_override=None):
     """Write a CCP4 map, borrowing the header from hdr_template.
 
@@ -843,6 +866,10 @@ def write_ccp4(path, data, hdr_template, cell_override=None):
     rms    = float(np.sqrt(np.mean(data**2)))
     for off, val in zip((76, 80, 84, 216), (mn, mx, mean, rms)):
         struct.pack_into('<f', raw, off, val)
+
+    # Update grid dimensions and starts from the header dict (may differ from template)
+    for off, key in ((0,'nc'),(4,'nr'),(8,'ns'),(16,'ncstart'),(20,'nrstart'),(24,'nsstart')):
+        struct.pack_into('<i', raw, off, int(hdr_template[key]))
 
     if cell_override is not None:
         for i, val in enumerate(cell_override):
@@ -873,13 +900,19 @@ def _frac_to_grid_indices(frac_xyz, hdr):
 
 
 def interpolate_map(data, hdr, probe_frac):
-    """Trilinear/tricubic interpolation of map data at fractional positions.
+    """Tricubic interpolation of map data at fractional positions.
 
     probe_frac : (N, 3) fractional coords to sample.
     Returns (N,) float32 density values.
+    Pads the array with 5 voxels of periodic (symmetry-mate) copies before
+    computing b-spline coefficients.  The IIR prefilter boundary influence
+    decays as 0.268^k, so 5 voxels of padding gives < 0.15% contamination
+    at query points, eliminating the mode='wrap' overshoot artifact.
     """
     idx = _frac_to_grid_indices(probe_frac, hdr)   # (3, N)
-    return map_coordinates(data, idx, order=3, mode='wrap').astype(np.float32)
+    pad = 5
+    padded = np.pad(data, pad, mode='wrap')
+    return map_coordinates(padded, idx + pad, order=3, mode='nearest').astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -943,33 +976,39 @@ def make_bent_map(map_path, hkls, AB_xyz, outpath, cell2=None, use_jacobian=Fals
 
 
 def make_delta_maps(map_path, hkls, AB_xyz, nhkls):
-    """Write delta-x, delta-y, delta-z, delta-r maps."""
-    data, hdr = read_ccp4(map_path)
-    nc, nr, ns = hdr['nc'], hdr['nr'], hdr['ns']
+    """Write delta-x, delta-y, delta-z, delta-r maps over the full P1 unit cell.
 
-    sec_idx = np.arange(ns)
-    row_idx = np.arange(nr)
-    col_idx = np.arange(nc)
-    sec_g, row_g, col_g = np.meshgrid(sec_idx, row_idx, col_idx, indexing='ij')
+    Maps are always written as full-cell P1 (starts=0, dimensions=Nxyz) so that
+    map viewers never need 'extend xtal' — the shift field is smooth everywhere
+    and vector components are not scalars under space-group symmetry.
+    """
+    _, hdr = read_ccp4(map_path)
     mapc, mapr, maps = hdr['mapc'], hdr['mapr'], hdr['maps']
-    start  = {mapc: hdr['ncstart'], mapr: hdr['nrstart'], maps: hdr['nsstart']}
-    Nxyz   = {1: hdr['nx'], 2: hdr['ny'], 3: hdr['nz']}
-    axis_to_frac = {mapc: col_g, mapr: row_g, maps: sec_g}
+    Nxyz = {1: hdr['nx'], 2: hdr['ny'], 3: hdr['nz']}
 
-    frac_x = (axis_to_frac[1].ravel() + start[1]) / Nxyz[1]
-    frac_y = (axis_to_frac[2].ravel() + start[2]) / Nxyz[2]
-    frac_z = (axis_to_frac[3].ravel() + start[3]) / Nxyz[3]
-    frac_pts = np.stack([frac_x, frac_y, frac_z], axis=1)
+    # Full unit cell grid: indices 0..Nxyz[axis]-1, frac = idx/Nxyz[axis]
+    nc_full = Nxyz[mapc]
+    nr_full = Nxyz[mapr]
+    ns_full = Nxyz[maps]
+    sec_g, row_g, col_g = np.meshgrid(np.arange(ns_full), np.arange(nr_full),
+                                       np.arange(nc_full), indexing='ij')
+    axis_to_grid = {mapc: col_g, mapr: row_g, maps: sec_g}
+    frac_pts = np.stack([axis_to_grid[1].ravel() / Nxyz[1],
+                         axis_to_grid[2].ravel() / Nxyz[2],
+                         axis_to_grid[3].ravel() / Nxyz[3]], axis=1)
 
     delta = eval_shift_field(frac_pts, hkls, AB_xyz)  # (N, 3) fractional
-    cell = hdr['cell']
-    delta_orth = frac_to_orth(delta, cell)             # (N, 3) Å
+    delta_orth = frac_to_orth(delta, hdr['cell'])      # (N, 3) Å
+
+    hdr_p1 = dict(hdr)
+    hdr_p1.update(nc=nc_full, nr=nr_full, ns=ns_full,
+                  ncstart=0, nrstart=0, nsstart=0)
 
     for i, label in enumerate('xyz'):
-        d = delta_orth[:, i].reshape(ns, nr, nc).astype(np.float32)
-        write_ccp4(f"delta_{label}{nhkls}.map", d, hdr)
-    dr = np.sqrt(np.sum(delta_orth**2, axis=1)).reshape(ns, nr, nc).astype(np.float32)
-    write_ccp4(f"delta_r{nhkls}.map", dr, hdr)
+        d = delta_orth[:, i].reshape(ns_full, nr_full, nc_full).astype(np.float32)
+        write_ccp4(f"delta_{label}{nhkls}.map", d, hdr_p1)
+    dr = np.sqrt(np.sum(delta_orth**2, axis=1)).reshape(ns_full, nr_full, nc_full).astype(np.float32)
+    write_ccp4(f"delta_r{nhkls}.map", dr, hdr_p1)
     print(f"delta maps written: delta_x/y/z/r{nhkls}.map")
 
 
@@ -1281,7 +1320,8 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                          outlier_sigma=2.5, b_sigma=3.0,
                          use_symm=True, dimensions='xyz',
                          frac=1.0, verbose=True,
-                         altloc_filter=False, altloc_fallback=1.0):
+                         altloc_filter=False, altloc_fallback=1.0,
+                         iter_callback=None, max_canon=None):
     """Fit a Fourier shift field progressively, admitting HKLs coarsest-first.
 
     HKLs are admitted in batches from fitreso_start (coarsest, large d) down to
@@ -1490,6 +1530,13 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
         result_hkls   = hkls_now
         result_rmsd   = rmsd
         iter_count   += 1
+
+        if iter_callback is not None:
+            iter_callback(iter_count, n_hkls - 1, n_canon, rmsd,
+                          hkls_now, AB_xyz_eval, active, snr)
+
+        if max_canon is not None and n_canon >= max_canon:
+            break
 
         # Advance to next batch
         n_next = n_used + batch_hkls
