@@ -132,6 +132,20 @@ Key functions:
 | `read_ccp4(path)` / `write_ccp4(path, data, header)` | CCP4 map I/O |
 | `read_ccp4_fullcell(path)` | Read CCP4 map and expand to full P1 unit cell via gemmi symmetry |
 
+## Space-group generality
+
+The shift field must respect the crystallographic symmetry of the space group:
+
+```
+Δr(R·x + t) = R · Δr(x)   for all {R, t} in the space group
+```
+
+`use_symm=True` (default) enforces this by fitting only canonical HKL representatives and expanding to the full Friedel-unique set via the point-group expansion formula. The free-parameter count is reduced by the order of the proper point group: ×2 for monoclinic, ×4 for orthorhombic, ×8 for P4₃2₁2, ×12 for cubic, etc.
+
+**All 65 Sohncke (protein-compatible) space groups are tested**, including all screw-axis and non-symmorphic settings, all Bravais lattice types (P, C, I, F, R), and all trigonal and hexagonal groups. The symmetry constraint is satisfied to machine precision (<10⁻¹² Å) in every case. The test (`test_symm_all_sgs.py`) places 8 atoms in a general ASU position, displaces each independently, expands both states to P1 via the SG operators, fits with and without the symmetry constraint, and checks the residual violation on a 15³ grid.
+
+**Implementation note.** In fractional coordinates, proper rotation matrices R are not in general orthogonal — R^T ≠ R^{−1} for trigonal and hexagonal crystal systems. The vectorial part of the symmetry expansion requires R^{−1}, not R^T. For all other crystal systems the two are equal, so the distinction only matters for trigonal/hexagonal.
+
 ## Files in this repository
 
 | File | Description |

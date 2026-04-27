@@ -84,7 +84,9 @@ Each system has a `*_fitreso_scan.py` script that runs three sections and report
 
 `scipy.ndimage.map_coordinates` with `order=3, mode='wrap'` can produce overshoot at cell boundaries if adjacent grid rows have large density gradients. This creates spikes in difference maps at x=0, y=0, z=0.
 
-**Fix**: `interpolate_map` pads by 5 voxels on each side with periodic copies (`np.pad(data, 5, mode='wrap')`) before calling `map_coordinates` with `mode='nearest'`. The IIR b-spline prefilter decays as 0.268^k, so 5-voxel padding gives <0.15% boundary error at any interior query point. Do not use `pad=2` (insufficient) or `order=1` (eliminates overshoot at the cost of cubic quality everywhere).
+All test-system maps are ASU maps (not full-cell): lysozyme covers ~½ cell in each axis; DHFR covers full X and Z but ¼ of Y; myoglobin is full-cell. For ASU maps, `mode='wrap'` wraps the boundary (e.g. x≈0.5) to x=0, which is a physically unrelated density — creating a flat artefact in the difference map near the ASU boundary.
+
+**Fix**: `interpolate_map` pads by 5 voxels on each side with `np.pad(data, 5, mode='reflect')` before calling `map_coordinates` with `mode='nearest'`. Reflection gives a smooth continuation at any boundary (ASU edge or unit-cell edge), so the IIR prefilter sees no discontinuity. The prefilter decays as 0.268^k, so 5-voxel padding gives <0.15% boundary error at any interior query point. Do not use `pad=2` (insufficient) or `order=1` (eliminates overshoot at the cost of cubic quality everywhere).
 
 ## gemmi map→MTZ conversion
 
@@ -106,6 +108,42 @@ mtz.write_to_file(mtzfile)
 ```
 
 This replaces the old sfall subprocess approach (which failed for P2₁ maps). No CCP4 programs needed for this step; gemmi handles axis ordering from the CCP4 header automatically.
+
+## Space-group generality and testing
+
+### Symmetry constraint
+
+The PSDVF must satisfy the crystallographic symmetry constraint for all proper operators {R_k, t_k} of the space group:
+
+```
+Δr(R_k x + t_k) = R_k · Δr(x)
+```
+
+where R_k and t_k are in fractional coordinates. `use_symm=True` enforces this by construction via `build_design_matrix_symm` and `expand_ab_canon`.
+
+**Critical implementation detail — R^{−1} vs R^T:** In fractional coordinates, proper rotation matrices R_k are NOT in general orthogonal (R_k^T ≠ R_k^{−1}). The correct vectorial transform for the shift field is R_k^{−1}, not R_k^T. For orthogonal crystal systems (cubic, tetragonal, orthorhombic, monoclinic) R_k is orthogonal so R_k^T = R_k^{−1} and the distinction doesn't matter. For **trigonal and hexagonal** systems the 3- and 6-fold fractional rotation matrices are not orthogonal, making this distinction essential. An earlier implementation used R_k^T throughout and gave violations of 1–100 Å for all trigonal/hexagonal SGs. The fix: `np.linalg.inv(R)` in both `build_design_matrix_symm` and `expand_ab_canon`.
+
+### test_symm_all_sgs.py
+
+`claude/test_symm_all_sgs.py` verifies the symmetry constraint across all 65 Sohncke (protein-compatible) space groups. Protocol per SG:
+
+1. Place 8 atoms at random general positions in the ASU.
+2. Apply small random fractional displacements δ_i to each ASU atom.
+3. Expand both reference and displaced states to P1 via all SG operators — displacement of op-k copy of atom i = R_k · δ_i (the correct crystallographic scenario: both structures in the same SG).
+4. Fit unconstrained (all P1 atoms, `build_design_matrix`) and constrained (ASU atoms only, `build_design_matrix_symm`).
+5. Evaluate the symmetry violation max|Δr(R·x+t) − R·Δr(x)| in Å on a 15³ grid.
+
+**HKL set must be orbit-complete.** The full `generate_hkls(cell, FITRESO)` set (no truncation) is used. The resolution sphere is preserved under any point-group rotation (d-spacing is invariant), so the full set at a given resolution is automatically orbit-complete. Truncating to a fixed number of HKLs breaks this closure for trigonal/hexagonal and produces spurious violations.
+
+**Results (after fix):**
+- Constrained fit: **65/65** SGs have violation < 10⁻⁶ Å (max ~3 × 10⁻¹³ Å — machine precision)
+- Unconstrained fit: **0/65** SGs have violation > 10⁻⁶ Å when the HKL set is orbit-complete and the data is SG-consistent
+
+The unconstrained fit also gives a SG-symmetric field in this controlled test because: (a) the input data is SG-consistent by construction, and (b) the orbit-complete HKL set makes the SG-symmetric solution the unique minimum-norm SVD result.
+
+### Centering translations (I, F, C, R)
+
+`get_proper_symops` accepts all operators with det(R) = +1, including centering translations (R = I, t = centering vector). For I 2 (SG 5, I-centered monoclinic) this correctly adds operators with t = (½,½,½), imposing Δr(x + ½,½,½) = Δr(x) — which in Fourier space restricts to h+k+l even (the I-centering systematic absence). Tested explicitly: I 1 2 1 passes at 4.6 × 10⁻¹⁵ Å.
 
 ## Empirical results (fitreso scans)
 

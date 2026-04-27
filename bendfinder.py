@@ -453,8 +453,12 @@ def build_design_matrix_symm(frac_coords, canon_hkls, proper_ops,
     Free parameters per canonical HKL m: A_x,A_y,A_z (cols 6m+0..2) and
     B_x,B_y,B_z (cols 6m+3..5).  Row 3n+α = atom n, dimension α.
 
-    X[3n+α, 6m+β]   = Σ_k R_k[β,α] sin(2π H_m·(R_k x_n + t_k))
-    X[3n+α, 6m+3+β] = Σ_k R_k[β,α] cos(2π H_m·(R_k x_n + t_k))
+    X[3n+α, 6m+β]   = Σ_k R_k^{-1}[α,β] sin(2π H_m·(R_k x_n + t_k))
+    X[3n+α, 6m+3+β] = Σ_k R_k^{-1}[α,β] cos(2π H_m·(R_k x_n + t_k))
+
+    NOTE: the vectorial factor is R_k^{-1}[α,β], NOT R_k^T[α,β].  These are
+    equal when R_k is orthogonal (cubic/tetragonal/orthorhombic/monoclinic)
+    but differ for trigonal/hexagonal fractional rotation matrices.
 
     Only operators k whose image R_k^T H_c is in the Friedel-unique HKL basis
     are included (via hkl_all_ops).  Operators mapping to HKLs outside the
@@ -474,8 +478,9 @@ def build_design_matrix_symm(frac_coords, canon_hkls, proper_ops,
             valid_mk[m, k] = True
 
     for ki, (R, t) in enumerate(proper_ops):
-        x_t = frac_coords @ R.T + t                    # (N, 3)
-        ph  = TWO_PI * (x_t @ canon_f.T)               # (N, M)
+        R_inv = np.linalg.inv(R)                        # R^{-1} for vector transform
+        x_t = frac_coords @ R.T + t                    # (N, 3): R_k x + t_k
+        ph  = TWO_PI * (x_t @ canon_f.T)               # (N, M): 2π H_c·(R_k x+t_k)
         s = np.sin(ph)                                  # (N, M)
         c = np.cos(ph)
         # Zero columns for canonicals where this op maps outside the basis
@@ -483,7 +488,7 @@ def build_design_matrix_symm(frac_coords, canon_hkls, proper_ops,
         c[:, ~valid_mk[:, ki]] = 0.0
         for alpha in range(3):
             for beta in range(3):
-                r = R[beta, alpha]                      # (R^T)[alpha,beta]
+                r = R_inv[alpha, beta]                  # R_k^{-1}[alpha, beta]
                 if r == 0.0:
                     continue
                 X[alpha::3, beta::6]   += r * s
@@ -577,10 +582,11 @@ def expand_ab_canon(params, active_canon, canon_hkls, hkls,
         B_j = np.zeros(3)
         for k, flip in hkl_all_ops[j]:
             R, t = proper_ops[k]
+            R_inv = np.linalg.inv(R)                # R^{-1} (= R^T only for orthogonal R)
             phi  = TWO_PI * float(np.dot(Hc, t))
             cph, sph = np.cos(phi), np.sin(phi)
-            dA = R.T @ (Ac * cph - Bc * sph)
-            dB = R.T @ (Ac * sph + Bc * cph)
+            dA = R_inv @ (Ac * cph - Bc * sph)
+            dB = R_inv @ (Ac * sph + Bc * cph)
             A_j += -dA if flip else dA
             B_j += dB
         AB[:, j, 0] = A_j
@@ -904,14 +910,16 @@ def interpolate_map(data, hdr, probe_frac):
 
     probe_frac : (N, 3) fractional coords to sample.
     Returns (N,) float32 density values.
-    Pads the array with 5 voxels of periodic (symmetry-mate) copies before
-    computing b-spline coefficients.  The IIR prefilter boundary influence
-    decays as 0.268^k, so 5 voxels of padding gives < 0.15% contamination
-    at query points, eliminating the mode='wrap' overshoot artifact.
+    Pads the array with 5 voxels of reflected copies before computing
+    b-spline coefficients.  'reflect' gives a smooth continuation at ASU
+    boundaries (where 'wrap' would create a discontinuity between x≈0.5 and
+    x=0, causing artefacts in the difference map).  The IIR prefilter boundary
+    influence decays as 0.268^k, so 5 voxels of padding gives < 0.15%
+    contamination at any interior query point.
     """
     idx = _frac_to_grid_indices(probe_frac, hdr)   # (3, N)
     pad = 5
-    padded = np.pad(data, pad, mode='wrap')
+    padded = np.pad(data, pad, mode='reflect')
     return map_coordinates(padded, idx + pad, order=3, mode='nearest').astype(np.float32)
 
 
