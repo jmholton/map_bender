@@ -320,8 +320,9 @@ def main():
     ref_d, ref_h, ref_ccp4_path = _load_map(REF_MAP, SCAN_DIR, 'ref',
                                               args.fcol, args.phicol, args.sample_rate,
                                               fullcell=False)
+    pad_mode = 'wrap' if args.fullcell_mov else 'reflect'
     if args.fullcell_mov:
-        print('  moving map read as full unit cell', flush=True)
+        print('  moving map read as full unit cell (pad_mode=wrap)', flush=True)
 
     # ── build reference grid fractional coordinates ────────────────────────────
     nc, nr, ns = ref_h['nc'], ref_h['nr'], ref_h['ns']
@@ -390,7 +391,7 @@ def main():
     outdir0 = os.path.join(SCAN_DIR, 'hkl00')
     os.makedirs(outdir0, exist_ok=True)
     t0   = time.time()
-    bent0 = interpolate_map(mov_d, mov_h, ref_pts).reshape(ns, nr, nc)
+    bent0 = interpolate_map(mov_d, mov_h, ref_pts, pad_mode=pad_mode).reshape(ns, nr, nc)
     with open(os.devnull, 'w') as _dev, contextlib.redirect_stdout(_dev):
         _a1, _cell1, _ = expand_to_p1(MOV_PDB)
         _a2, _cell2, _ = expand_to_p1(REF_PDB)
@@ -411,7 +412,7 @@ def main():
         odir  = os.path.join(SCAN_DIR, label)
         os.makedirs(odir, exist_ok=True)
         delta = _eval_chunked(ref_pts, hkls_now, AB_now, CHUNK)
-        bent  = interpolate_map(mov_d, mov_h, ref_pts - delta).reshape(ns, nr, nc)
+        bent  = interpolate_map(mov_d, mov_h, ref_pts - delta, pad_mode=pad_mode).reshape(ns, nr, nc)
         save_scan_point(label, odir, bent, raw_rmsd, rmsd,
                         int(active.sum()), time.time() - t0,
                         hkls=hkls_now, AB=AB_now)
@@ -443,7 +444,7 @@ def main():
         )
         t_fit = time.time() - t0
         delta = _eval_chunked(ref_pts, result.hkls, result.AB, CHUNK)
-        bent  = interpolate_map(mov_d, mov_h, ref_pts - delta).reshape(ns, nr, nc)
+        bent  = interpolate_map(mov_d, mov_h, ref_pts - delta, pad_mode=pad_mode).reshape(ns, nr, nc)
         save_scan_point(f'fr{fitreso}', odir, bent, raw_rmsd, result.rmsd,
                         int(result.active.sum()), t_fit,
                         hkls=result.hkls, AB=result.AB)
