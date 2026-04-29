@@ -37,6 +37,9 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
     raddam_fitreso_scan.py      takes target (5kxl|5kxm|5kxn) as argv[1]
     fitreso_scan_5kxl/, fitreso_scan_5kxm/, fitreso_scan_5kxn/
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
+  magdoff/                      Magdoff synthetic deformation validation tests
+    test_magdoff.py             test script (7rsa, P2₁, 248 CA)
+    7rsa.pdb                    reference structure (ribonuclease A, 1.26 Å)
 ```
 
 ## Algorithm (Python version)
@@ -144,6 +147,36 @@ The unconstrained fit also gives a SG-symmetric field in this controlled test be
 ### Centering translations (I, F, C, R)
 
 `get_proper_symops` accepts all operators with det(R) = +1, including centering translations (R = I, t = centering vector). For I 2 (SG 5, I-centered monoclinic) this correctly adds operators with t = (½,½,½), imposing Δr(x + ½,½,½) = Δr(x) — which in Fourier space restricts to h+k+l even (the I-centering systematic absence). Tested explicitly: I 1 2 1 passes at 4.6 × 10⁻¹⁵ Å.
+
+## Magdoff synthetic deformation tests (`magdoff/test_magdoff.py`)
+
+Controlled validation on ribonuclease A (7rsa, P2₁, a=30.18 b=38.40 c=53.32 Å β=105.85°, 124 residues, 248 CA in P1). Each test imposes a known deformation and measures how well bendfinder recovers it. Riso is computed at 1.5 Å using gemmi `DensityCalculatorX` → `transform_map_to_f_phi`.
+
+**Important distinction:** Riso is evaluated at **1.5 Å data resolution**; the PSDVF is fitted to **7 Å spatial resolution**. These are separate concepts. Residual Riso after bending reflects high-frequency content (1.5–7 Å band) that lies beyond the PSDVF bandwidth — not a failure of the shift field within its design range.
+
+### Test 1 — Isomorphous cell change (true Magdoff)
+
+Scale a, b, c in CRYST1 by 1.005; leave atom Cartesian coordinates unchanged. Simulates a 0.5% crystal expansion: same protein structure, slightly different unit cell. The fractional coordinates shift by ~0.5% because the same Cartesian positions map to different fractions under the new metric.
+
+**Critical:** SCALE and ORIGX records must be stripped from the modified PDB. If left, gemmi reads the stale fractional matrix from those cards rather than deriving it from the modified CRYST1, so the fractional coordinates are unchanged and no deformation is seen.
+
+| | RMSD(CA) | Riso (1.5 Å) |
+|---|---|---|
+| Before bending | 0.197 Å | 15.0% |
+| Constrained (P2₁, 301 HKLs) | 0.018 Å (91.1% recovery) | 2.7% |
+| Unconstrained (201 HKLs) | 0.015 Å (92.5% recovery) | 2.7% |
+
+### Test 2 — Rigid-body rotation 0.5°
+
+Rotate all atom Cartesian coordinates by 0.5° about a fixed random axis (seed 42 → axis [0.231, −0.789, 0.569]). Not SG-consistent for a general axis.
+
+| | RMSD(CA) | Riso (1.5 Å) |
+|---|---|---|
+| Before bending | 0.335 Å | 24.0% |
+| Constrained (P2₁, 301 HKLs) | 0.028 Å (91.8% recovery) | 4.3% |
+| Unconstrained (201 HKLs) | 0.026 Å (92.2% recovery) | 4.3% |
+
+Both tests fit 3 progressive iterations (20→7 Å), completing in ~25 s per fit on a single CPU. Constrained and unconstrained give nearly identical recovery for P2₁ (order 2), though constrained reaches 50% more HKLs before hitting the overdetermination limit.
 
 ## Empirical results (fitreso scans)
 

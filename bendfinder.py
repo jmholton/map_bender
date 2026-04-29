@@ -905,21 +905,20 @@ def _frac_to_grid_indices(frac_xyz, hdr):
     return np.array([gxyz[maps], gxyz[mapr], gxyz[mapc]])
 
 
-def interpolate_map(data, hdr, probe_frac):
+def interpolate_map(data, hdr, probe_frac, pad_mode='reflect'):
     """Tricubic interpolation of map data at fractional positions.
 
     probe_frac : (N, 3) fractional coords to sample.
+    pad_mode   : 'reflect' (default, for ASU maps — boundaries are not periodic)
+                 'wrap'    (for full-cell maps — x=0 and x=1 are the same point)
     Returns (N,) float32 density values.
-    Pads the array with 5 voxels of reflected copies before computing
-    b-spline coefficients.  'reflect' gives a smooth continuation at ASU
-    boundaries (where 'wrap' would create a discontinuity between x≈0.5 and
-    x=0, causing artefacts in the difference map).  The IIR prefilter boundary
-    influence decays as 0.268^k, so 5 voxels of padding gives < 0.15%
-    contamination at any interior query point.
+    Pads the array with 5 voxels before computing b-spline coefficients.
+    The IIR prefilter boundary influence decays as 0.268^k, so 5 voxels
+    gives < 0.15% contamination at any interior query point.
     """
     idx = _frac_to_grid_indices(probe_frac, hdr)   # (3, N)
     pad = 5
-    padded = np.pad(data, pad, mode='reflect')
+    padded = np.pad(data, pad, mode=pad_mode)
     return map_coordinates(padded, idx + pad, order=3, mode='nearest').astype(np.float32)
 
 

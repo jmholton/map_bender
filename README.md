@@ -6,7 +6,7 @@ Primary author: James Holton
 
 ## What it does
 
-Given two PDB files of the same protein (same or different crystal forms), `bendfinder.py` computes a smooth 3D vector field **Δr(x,y,z)** such that applying that field to the coordinates of `bendme.pdb` minimises the all-atom RMSD to `reference.pdb`. Optionally, any CCP4 map in the frame of `bendme.pdb` can be spline-interpolated into the reference frame.
+Given two PDB files of the same protein — same crystal form at different conditions (humidity, temperature, ligand), or genuinely different crystal forms — `bendfinder.py` computes a smooth 3D vector field **Δr(x,y,z)** such that applying that field to the coordinates of `bendme.pdb` minimises the all-atom RMSD to `reference.pdb`. Optionally, any CCP4 map in the frame of `bendme.pdb` can be spline-interpolated into the reference frame.
 
 The shift field is parameterised as:
 
@@ -68,9 +68,9 @@ All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlie
 
 ### Python version (`bendfinder.py`)
 
-| System | Crystal forms | Space group | CA pairs | CA RMSD | Riso (fr5) | Time |
-|--------|--------------|-------------|----------|---------|-----------|------|
-| Lysozyme | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.034 Å** | 33.2% | 335 s |
+| System | Datasets | Space group | CA pairs | CA RMSD | Riso (fr5) | Time |
+|--------|----------|-------------|----------|---------|-----------|------|
+| Lysozyme (same crystal, ~2.5% humidity-driven cell change) | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.034 Å** | 33.2% | 335 s |
 | DHFR | 1rx1 → 1rx2 | P2₁2₁2₁ | 636 | **0.071 Å** | 41.9% | 287 s |
 | Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.063 Å** | — | 150 s |
 | Lysozyme raddam | 5kxk → 5kxl | P4₃2₁2 | 976 | **0.082 Å** | 20.6% | 112 s |
@@ -104,6 +104,18 @@ The myoglobin prototype used nhkls=100; the Python version naturally fits more H
 | 20          | 0.245 Å  | 580 s | Order 3 (37 HKLs)             |
 | 26          | 0.215 Å  | 1070 s| Order 4 (61 HKLs)             |
 | 30          | 0.211 Å  | 1503 s| Order 5 (91 HKLs, 2938 s)    |
+
+## Synthetic validation (Magdoff tests)
+
+`magdoff/test_magdoff.py` imposes two controlled deformations on ribonuclease A (7rsa, P2₁, 248 CA in P1) and measures how well bendfinder recovers them. Riso is computed at 1.5 Å (full crystallographic resolution) using gemmi Fcalc; PSDVF coefficients are fitted to 7 Å spatial resolution — these are distinct.
+
+**Test 1 — Isomorphous cell change (Magdoff):** Scale a, b, c in CRYST1 by 1.005; leave atom Cartesian coordinates unchanged. This is the classic Magdoff scenario: same protein, slightly different unit cell. Riso 15.0% → 2.7%; RMSD(CA) 0.197 → 0.018 Å (91% recovery).
+
+**Test 2 — Rigid-body rotation 0.5°:** Rotate all atom Cartesian coordinates by 0.5° about a random axis. Riso 24.0% → 4.3%; RMSD(CA) 0.335 → 0.028 Å (92% recovery).
+
+The residual Riso after bending (~2.7% and ~4.3%) is set by the 7 Å PSDVF bandwidth: structure factor content at 1.5–7 Å that the shift field cannot represent.
+
+> **Implementation note:** When modifying only the CRYST1 record in a PDB file (cell dimensions), the SCALE and ORIGX records must also be stripped. If left, gemmi reads the fractional coordinate matrix from those stale cards rather than deriving it from the modified CRYST1, so the fractional coordinates are unchanged and no deformation is seen.
 
 ## Output
 
