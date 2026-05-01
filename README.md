@@ -70,7 +70,7 @@ All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlie
 
 | System | Datasets | Space group | CA pairs | CA RMSD | Riso (fr5) | Time |
 |--------|----------|-------------|----------|---------|-----------|------|
-| Lysozyme (same crystal, ~2.5% humidity-driven cell change) | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.034 Å** | 33.2% | 335 s |
+| Lysozyme (same crystal, ~2.5% humidity-driven cell change) | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.047 Å** | 29.0% | 218 s |
 | DHFR | 1rx1 → 1rx2 | P2₁2₁2₁ | 636 | **0.071 Å** | 41.9% | 287 s |
 | Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.063 Å** | — | 150 s |
 | Lysozyme raddam | 5kxk → 5kxl | P4₃2₁2 | 976 | **0.082 Å** | 20.6% | 112 s |
@@ -176,6 +176,12 @@ The scan scripts (`lyso/lyso_fitreso_scan.py`, `dhfr/dhfr_fitreso_scan.py`, `myo
 2. **hkl01..hkl10** — add canonical HKLs one at a time using a single `bend_fit_progressive` call with `batch_hkls=1, max_canon=11` and an `iter_callback` that snapshots the bent map at each n_non_DC checkpoint.
 3. **fr20..fr5** — separate `bend_fit_progressive` calls with `fitreso_end` stepped from 20 to 5 Å.
 
-For each scan point the script writes `bent.map`, `diff_norm.map` (z-scored difference), and `fitparams.mtz`, then computes Riso via `diff.com` and reports the strongest positive and negative difference-map peaks with their nearest atoms.
+For each scan point the script writes:
 
-Map→MTZ conversion uses `gemmi.transform_map_to_f_phi` (no sfall required).
+- `bent.map` — bent moving-crystal 2Fo-Fc map resampled on the reference grid (CCP4 format)
+- `diff_norm.map` — z-scored real-space difference map (ref − bent) / σ, for peak finding and quick inspection
+- `bent.mtz` — `Fbent`/`PHIbent` (bent 2Fo-Fc as structure factors) plus `DELFWT`/`PHDELWT` (the difference map). **Load in Coot** via *File → Open MTZ*, then display `DELFWT`/`PHDELWT` as a difference map contoured at ±3σ.
+- `bent.pdb`, `ref.pdb` — bent and reference coordinates for atom context in the viewer
+- `PSDVF.mtz` (fr\* points only) — fitted shift-field (h,k,l) coefficients
+
+Riso is computed from the Fourier transform of the 2Fo-Fc density maps (not experimental F_obs), using `gemmi.transform_map_to_f_phi` — no sfall or CCP4 programs required for the map→MTZ step. Because both maps include model bias and water molecules that shift between crystal forms, reported Riso values (~28–55% for lysozyme 3aw6→3aw7) should not be compared directly to crystallographic Riso from experimental data. The dominant negative peaks at high resolution (fr7 and finer) are typically displaced water molecules, not protein atoms.
