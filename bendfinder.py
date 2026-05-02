@@ -1941,10 +1941,14 @@ def fitreso_scan(
                 time.time() - t0, hkls=_h0, AB_xyz=_AB0)
 
     # ── Section 2: hkl01..hklNN — progressive, one canon HKL at a time ───────
+    _last_hkl_n = [0]   # track last n_non_dc saved; list so closure can mutate
+
     def _hkl_callback(iter_i, nhkls, n_canon, rmsd, hkls_now, AB_xyz, active, snr):
         n_non_dc = n_canon - 1
         if n_non_dc < 1 or n_non_dc > max_hkl_scan:
             return
+        if n_non_dc == _last_hkl_n[0]:
+            return   # same canonical count as last save — skip duplicate
         t0_cb = time.time()
         label  = f'hkl{n_non_dc:02d}'
         outdir = os.path.join(scan_dir, label)
@@ -1958,6 +1962,7 @@ def fitreso_scan(
         save_fitparams(os.path.join(outdir, 'PSDVF.mtz'),
                        hkls_now, AB_xyz, active, snr,
                        ref_h['cell'], ref_h['cell'], 'xyz', rmsd)
+        _last_hkl_n[0] = n_non_dc
 
     bend_fit_progressive(
         mov_pdb, ref_pdb,
@@ -2002,12 +2007,20 @@ def fitreso_scan(
         print('\nDone.', flush=True)
 
 
-def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col):
-    """Wilson-scale test to ref; return (riso, scale_kF, B_iso) or (None, None, None).
+def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
+                 n_cycles=4, sigma_cut=3.0, use_median=False):
+    """Scale test to ref; return (riso, scale_k, 0.0) or (None, None, None).
 
-    Model: F_test_scaled = kF * exp(-B/(4d²)) * F_test
-    Fit:   log(F_ref/F_test) = log(kF) - (B/4) * (1/d²)  by OLS.
-    Riso = Σ|F_ref - F_test_scaled| / Σ|F_ref|.
+    Karle-Hauptman isomorphous scaling (same algorithm as CCP4 scaleit):
+        k = Σ(F_ref · F_test) / Σ(F_test²)
+    iterated n_cycles times with sigma_cut·σ outlier rejection between cycles.
+    No B-factor term — appropriate for comparing nearly-identical maps where the
+    relative B difference is negligible.
+
+    If use_median=True, fall back to median(F_ref/F_test) on reflections where
+    both amplitudes exceed 1% of the maximum (faster, useful for quick checks).
+
+    Riso = Σ|F_ref − k·F_test| / Σ|F_ref| over all non-zero matched reflections.
     """
     try:
         def _load(path, col):
@@ -2016,32 +2029,35 @@ def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col):
             labels = mtz.column_labels()
             hkl    = d[:, :3].astype(int)
             F      = d[:, labels.index(col)]
-            return mtz, hkl, F
+            return hkl, F
 
-        ref_mtz, ref_hkl, ref_F = _load(ref_mtz_path, ref_col)
-        _,        tst_hkl, tst_F = _load(test_mtz_path, test_col)
+        ref_hkl, ref_F = _load(ref_mtz_path, ref_col)
+        tst_hkl, tst_F = _load(test_mtz_path, test_col)
 
-        tdict  = {(int(h[0]), int(h[1]), int(h[2])): f for h, f in zip(tst_hkl, tst_F)}
-        mask   = np.array([tuple(map(int, h)) in tdict for h in ref_hkl])
-        ref_hkl = ref_hkl[mask]; ref_F = ref_F[mask]
-        tst_F  = np.array([tdict[tuple(map(int, h))] for h in ref_hkl])
+        tdict = {(int(h[0]), int(h[1]), int(h[2])): f for h, f in zip(tst_hkl, tst_F)}
+        mask  = np.array([tuple(map(int, h)) in tdict for h in ref_hkl])
+        ref_F = ref_F[mask]
+        tst_F = np.array([tdict[tuple(map(int, h))] for h in ref_hkl[mask]])
 
-        cell   = ref_mtz.cell
-        inv_d2 = np.array([cell.calculate_1_d2(int(h[0]), int(h[1]), int(h[2]))
-                            for h in ref_hkl])
+        ok = (ref_F > 0) & (tst_F > 0) & np.isfinite(ref_F) & np.isfinite(tst_F)
+        r  = ref_F[ok]
+        t  = tst_F[ok]
 
-        ok  = (ref_F > 0) & (tst_F > 0) & np.isfinite(ref_F) & np.isfinite(tst_F)
-        y   = np.log(ref_F[ok] / tst_F[ok])
-        A   = np.column_stack([np.ones(ok.sum()), inv_d2[ok]])
-        p, _, _, _ = sp_lstsq(A, y)
-        log_kF, slope = p
-        kF    = float(np.exp(log_kF))
-        B_iso = float(-4.0 * slope)
+        if use_median:
+            thresh = 0.01 * max(float(r.max()), float(t.max()))
+            well   = (r > thresh) & (t > thresh)
+            kF     = float(np.median(r[well] / t[well]))
+        else:
+            # Karle-Hauptman: iterate k with sigma-clipping
+            use = np.ones(len(r), dtype=bool)
+            for _ in range(n_cycles):
+                kF  = float(np.dot(r[use], t[use]) / np.dot(t[use], t[use]))
+                res = np.abs(r - kF * t)
+                use = res < sigma_cut * res[use].std()
+            kF = float(np.dot(r[use], t[use]) / np.dot(t[use], t[use]))
 
-        scale  = kF * np.exp(-B_iso / 4.0 * inv_d2)
-        tst_sc = scale * tst_F
-        riso   = float(np.sum(np.abs(ref_F - tst_sc)) / np.sum(np.abs(ref_F)))
-        return riso, kF, B_iso
+        riso = float(np.sum(np.abs(r - kF * t)) / np.sum(np.abs(r)))
+        return riso, kF, 0.0
     except Exception:
         return None, None, None
 

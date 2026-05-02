@@ -172,7 +172,17 @@ The shift field must respect the crystallographic symmetry of the space group:
 
 ## Fitreso scan workflow
 
-`fitreso_scan()` in `bendfinder.py` evaluates bend quality as a function of resolution. The per-system scripts (`lyso/lyso_fitreso_scan.py` etc.) are thin wrappers that set paths and call it. Three sections:
+`fitreso_scan()` in `bendfinder.py` evaluates bend quality as a function of resolution. Call it directly:
+
+```python
+import sys; sys.path.insert(0, '/path/to/map_bender')
+from bendfinder import fitreso_scan
+fitreso_scan(mov_pdb='5kxk.pdb', ref_pdb='5kxl.pdb',
+             mov_map='5kxk_fc.map', ref_map='5kxl_fc.map',
+             scan_dir='fitreso_scan_5kxl')
+```
+
+Three sections:
 
 1. **hkl00** — no bending; resample moving map onto reference grid with zero shift. Gives the unregistered baseline Rfac.
 2. **hkl01..hkl10** — add canonical HKLs one at a time using a single `bend_fit_progressive` call with `batch_hkls=1, max_canon=11` and an `iter_callback` that snapshots the bent map at each n_non_DC checkpoint.

@@ -14,7 +14,6 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
 ../                             working area, not in git
   bendfinder.py                 current development copy (keep in sync with map_bender/)
   bendfinder.com                prototype tcsh script (historical reference)
-  diff.com                      Riso calculation: scaleit-based isomorphous R-factor (obsolete)
   map_bender/                   git repository
     bendfinder.py
     CLAUDE.md                   this file
@@ -23,24 +22,32 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
     LICENSE
     examples/3aw6_3aw7/         canonical lysozyme example data (checked into git)
   lyso/                         lysozyme 3aw6→3aw7 (P4₃2₁2, 1008 CA pairs)
-    lyso_fitreso_scan.py
     3aw6.pdb, 3aw7.pdb
     3aw6_2fofc.map, 3aw7_2fofc.map
     fitreso_scan/               hkl00..hkl10, fr5..fr20 output subdirs
   dhfr/                         DHFR 1rx1→1rx2 (P2₁2₁2₁, 636 CA pairs)
-    dhfr_fitreso_scan.py
     fitreso_scan/
   myoglobin/                    myoglobin 1mbo→1a6m (P2₁, 294 CA pairs)
-    myoglobin_fitreso_scan.py
     fitreso_scan/
   raddam/                       radiation damage 5kxk→5kxl/m/n (P4₃2₁2, ~980 CA pairs)
-    raddam_fitreso_scan.py      takes target (5kxl|5kxm|5kxn) as argv[1]
     fitreso_scan_5kxl/, fitreso_scan_5kxm/, fitreso_scan_5kxn/
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
   magdoff/                      Magdoff synthetic deformation validation tests
     test_magdoff.py             test script (7rsa, P2₁, 248 CA)
     7rsa.pdb                    reference structure (ribonuclease A, 1.26 Å)
 ```
+
+To run a scan, call `fitreso_scan()` directly from `bendfinder.py`, e.g.:
+```python
+cd raddam && ccp4-python -c "
+import sys; sys.path.insert(0, '..')
+from bendfinder import fitreso_scan
+fitreso_scan(mov_pdb='5kxk.pdb', ref_pdb='5kxl.pdb',
+             mov_map='5kxk_fc.map', ref_map='5kxl_fc.map',
+             scan_dir='fitreso_scan_5kxl')
+"
+```
+Per-system `*_fitreso_scan.py` wrapper scripts have been removed.
 
 ## Algorithm (Python version)
 
