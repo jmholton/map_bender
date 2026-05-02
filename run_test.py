@@ -10,8 +10,35 @@ Output: bent<N>.pdb, 1rx1_2fofc.map, 1rx2_2fofc.map, bent<N>.map, psdvf.mtz
 """
 
 import sys, os, subprocess, numpy as np
+import gemmi
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'map_bender'))
-from bendfinder import bend_fit, read_ccp4, write_ccp4, save_fitparams, eval_shift_field, interpolate_map
+from bendfinder import bend_fit, bend_apply_pdb, read_ccp4, write_ccp4, save_fitparams, eval_shift_field, interpolate_map
+
+DMIN_RISO = 3.0   # Å — data resolution for Riso evaluation
+RATE_RISO = 1.5   # oversampling for DensityCalculatorX
+
+
+def pdb_to_f(pdb_path, dmin=DMIN_RISO, rate=RATE_RISO):
+    """Fcalc structure factors from PDB → dict {(h,k,l): |F|}."""
+    st = gemmi.read_structure(str(pdb_path))
+    st.setup_entities()
+    dc = gemmi.DensityCalculatorX()
+    dc.d_min = dmin
+    dc.rate  = rate
+    dc.set_grid_cell_and_spacegroup(st)
+    dc.put_model_density_on_grid(st[0])
+    sf   = gemmi.transform_map_to_f_phi(dc.grid, half_l=True)
+    data = sf.prepare_asu_data(dmin=dmin)
+    hkl  = data.miller_array;  fabs = np.abs(data.value_array)
+    return {tuple(hkl[i].tolist()): fabs[i] for i in range(len(fabs))}
+
+
+def riso(f_ref, f_other):
+    """Isomorphous R-factor (%) over common HKLs."""
+    common = set(f_ref.keys()) & set(f_other.keys())
+    num = sum(abs(f_ref[h] - f_other[h]) for h in common)
+    den = sum(f_ref[h] for h in common)
+    return 100. * num / den, len(common)
 
 PHENIX   = '/programs/phenix-2.0-5936/bin/phenix.refine'
 CCP4_FFT = '/programs/ccp4-8.0/bin/fft'
@@ -210,3 +237,22 @@ print(f"  CC({stem1},      {stem2}) = {cc_mov:.6f}   [baseline: no transform]")
 print(f"\n  Diff sigma / ref sigma:  {diff.std()/sig*100:.2f}%")
 print(f"  ref sigma = {sig:.5f}")
 print(f"\nDone.  RMSD(CA)={result.rmsd:.3f} Å  CC gain = {cc_bent - cc_mov:+.6f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step 6: PDB-level Riso before and after bending
+# ══════════════════════════════════════════════════════════════════════════════
+print(f'\n── Step 6: Riso at {DMIN_RISO} Å (Fcalc from PDB) ──────────────────────')
+
+bent_pdb = f'bent{n_active}.pdb'
+bend_apply_pdb(pdb1, pdb2, result, outpath=bent_pdb)
+print(f"  bent PDB → {bent_pdb}")
+
+f_ref  = pdb_to_f(pdb2)
+f_mov  = pdb_to_f(pdb1)
+f_bent = pdb_to_f(bent_pdb)
+
+r_before, n_hkl = riso(f_ref, f_mov)
+r_after,  _     = riso(f_ref, f_bent)
+print(f"  Riso before bending : {r_before:.2f}%  ({n_hkl} HKLs)")
+print(f"  Riso after  bending : {r_after:.2f}%  ({n_hkl} HKLs)")

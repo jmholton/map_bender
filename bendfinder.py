@@ -1660,6 +1660,50 @@ def _parse_args(argv):
     return pdb1, pdb2, mapfile, params
 
 
+def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col):
+    """Wilson-scale test to ref; return (riso, scale_kF, B_iso) or (None, None, None).
+
+    Model: F_test_scaled = kF * exp(-B/(4d²)) * F_test
+    Fit:   log(F_ref/F_test) = log(kF) - (B/4) * (1/d²)  by OLS.
+    Riso = Σ|F_ref - F_test_scaled| / Σ|F_ref|.
+    """
+    try:
+        def _load(path, col):
+            mtz    = gemmi.read_mtz_file(path)
+            d      = mtz.array
+            labels = mtz.column_labels()
+            hkl    = d[:, :3].astype(int)
+            F      = d[:, labels.index(col)]
+            return mtz, hkl, F
+
+        ref_mtz, ref_hkl, ref_F = _load(ref_mtz_path, ref_col)
+        _,        tst_hkl, tst_F = _load(test_mtz_path, test_col)
+
+        tdict  = {(int(h[0]), int(h[1]), int(h[2])): f for h, f in zip(tst_hkl, tst_F)}
+        mask   = np.array([tuple(map(int, h)) in tdict for h in ref_hkl])
+        ref_hkl = ref_hkl[mask]; ref_F = ref_F[mask]
+        tst_F  = np.array([tdict[tuple(map(int, h))] for h in ref_hkl])
+
+        cell   = ref_mtz.cell
+        inv_d2 = np.array([cell.calculate_1_d2(int(h[0]), int(h[1]), int(h[2]))
+                            for h in ref_hkl])
+
+        ok  = (ref_F > 0) & (tst_F > 0) & np.isfinite(ref_F) & np.isfinite(tst_F)
+        y   = np.log(ref_F[ok] / tst_F[ok])
+        A   = np.column_stack([np.ones(ok.sum()), inv_d2[ok]])
+        p, _, _, _ = sp_lstsq(A, y)
+        log_kF, slope = p
+        kF    = float(np.exp(log_kF))
+        B_iso = float(-4.0 * slope)
+
+        scale  = kF * np.exp(-B_iso / 4.0 * inv_d2)
+        tst_sc = scale * tst_F
+        riso   = float(np.sum(np.abs(ref_F - tst_sc)) / np.sum(np.abs(ref_F)))
+        return riso, kF, B_iso
+    except Exception:
+        return None, None, None
+
+
 def main():
     argv = sys.argv[1:]
     if not argv or argv[0] in ('-h', '--help'):

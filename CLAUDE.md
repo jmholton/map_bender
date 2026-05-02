@@ -14,7 +14,7 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
 ../                             working area, not in git
   bendfinder.py                 current development copy (keep in sync with map_bender/)
   bendfinder.com                prototype tcsh script (historical reference)
-  diff.com                      Riso calculation: scaleit-based isomorphous R-factor
+  diff.com                      Riso calculation: scaleit-based isomorphous R-factor (obsolete)
   map_bender/                   git repository
     bendfinder.py
     CLAUDE.md                   this file
@@ -69,9 +69,11 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
 | `iter_callback` | None | Called after each progressive iteration (see above) |
 | `max_canon` | None | Stop after first iteration where n_canon ≥ this value |
 
-## Fitreso scan scripts
+## Fitreso scan
 
-Each system has a `*_fitreso_scan.py` script that runs three sections and reports per-point: label, RMSD(CA), active HKLs, Rfac (Riso vs reference map), strongest positive and negative difference map peaks with nearest atom.
+The scan logic is implemented as `fitreso_scan()` directly in `bendfinder.py`. Each system's `*_fitreso_scan.py` script is a thin wrapper that sets paths and calls `fitreso_scan()`.
+
+`fitreso_scan(mov_pdb, ref_pdb, mov_map, ref_map, scan_dir, ...)` runs three sections and reports per-point: label, RMSD(CA) before/after, active HKLs, Rfac (Riso vs reference map), strongest positive and negative difference map peaks with nearest atom.
 
 **Section 1 — hkl00**: zero shift; just resample the moving map onto the reference grid via `interpolate_map`. Establishes the unregistered baseline.
 
@@ -79,9 +81,19 @@ Each system has a `*_fitreso_scan.py` script that runs three sections and report
 
 **Section 3 — fr20..fr5**: separate `bend_fit_progressive` calls with `fitreso_end` in [20,15,12,10,8,7,6,5] Å.
 
-**Riso calculation**: `diff.com` (tcsh, uses CCP4 scaleit). Map→MTZ conversion is done with `gemmi.transform_map_to_f_phi` — no sfall required, works for any space group including P2₁.
+**Riso calculation**: `compute_riso(ref_mtz, ref_col, test_mtz, test_col)` in `bendfinder.py`. Uses Wilson isotropic B scaling: fit `log(F_ref/F_test) = log(kF) − (B/4)·(1/d²)` by OLS, then Riso = Σ|F_ref − kF·exp(−B/4d²)·F_test| / Σ|F_ref|. Returns (riso, kF, B_iso). No CCP4 programs needed; replaces the old `diff.com` subprocess.
 
-**Large-map memory**: `eval_shift_field` allocates an (N_voxels × N_hkls) phase matrix. For large maps (raddam: 3.7M voxels × 900+ HKLs ≈ 26 GB) this must be chunked. The raddam scan script uses `eval_shift_field_chunked` in 50k-voxel batches.
+**Output files per scan point**:
+- `cootme.mtz` — columns `FDM`/`PHIDM` (bent map) + `DELFWT`/`PHDELWT` (diff map). Load in Coot; FDM/PHIDM are recognised by default.
+- `diff_norm.map` — z-scored real-space difference map (ref − bent) / σ; positive peaks = more density in reference.
+- `bent.map` — bent moving-crystal map resampled on the reference grid.
+- `PSDVF.mtz` (fr\* points only) — fitted shift-field (h,k,l) coefficients.
+
+**Diff map sign convention**: `diff = ref_normalised − bent_normalised`. Positive peaks = more density in reference. For the raddam series where the damaged structure is the reference, positive peaks indicate features appearing with radiation dose.
+
+**Raddam sign convention**: 5kxk (undamaged, lowest dose) is the **moving** model; 5kxl/5kxm/5kxn (increasingly damaged) are the **references**. Dose ordering is alphabetical: 5kxk < 5kxl < 5kxm < 5kxn. With this convention, positive diff peaks = features appearing with dose, negative peaks = features disappearing.
+
+**Large-map memory**: `eval_shift_field` allocates an (N_voxels × N_hkls) phase matrix. For large maps (raddam: 3.7M voxels × 900+ HKLs ≈ 26 GB) this must be chunked. `fitreso_scan` uses an internal `_eval_chunked` helper in 50k-voxel batches (configurable via `chunk_size` parameter).
 
 ## Cubic b-spline boundary fix (interpolate_map)
 

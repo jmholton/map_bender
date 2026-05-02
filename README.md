@@ -30,7 +30,7 @@ print(f"CA RMSD: {result.rmsd:.3f} Å")
 
 - Python 3.8+ with numpy, scipy, gemmi
 - CCP4 Python environment (`ccp4-python`) recommended for map I/O
-- CCP4 programs (scaleit, cad) required only for Riso computation via `diff.com`; map→MTZ conversion uses gemmi directly
+- No CCP4 programs required; Riso computation and map→MTZ conversion are pure Python via gemmi
 
 ## Options (`bendfinder.py`)
 
@@ -143,6 +143,8 @@ Key functions:
 | `interpolate_map(map_data, header, frac_pts)` | Tricubic spline interpolation into a CCP4 map; 5-voxel periodic padding prevents b-spline overshoot at cell boundaries |
 | `read_ccp4(path)` / `write_ccp4(path, data, header)` | CCP4 map I/O |
 | `read_ccp4_fullcell(path)` | Read CCP4 map and expand to full P1 unit cell via gemmi symmetry |
+| `compute_riso(ref_mtz, ref_col, test_mtz, test_col)` | Wilson isotropic B scaling + Riso; returns (riso, kF, B_iso); pure Python, no CCP4 |
+| `fitreso_scan(mov_pdb, ref_pdb, mov_map, ref_map, scan_dir, ...)` | Run full hkl00..hkl10 + fr20..fr5 scan; write bent maps, diff maps, cootme.mtz per point |
 
 ## Space-group generality
 
@@ -170,18 +172,20 @@ The shift field must respect the crystallographic symmetry of the space group:
 
 ## Fitreso scan workflow
 
-The scan scripts (`lyso/lyso_fitreso_scan.py`, `dhfr/dhfr_fitreso_scan.py`, `myoglobin/myoglobin_fitreso_scan.py`, `raddam/raddam_fitreso_scan.py`) evaluate bend quality as a function of resolution. Each script runs three sections:
+`fitreso_scan()` in `bendfinder.py` evaluates bend quality as a function of resolution. The per-system scripts (`lyso/lyso_fitreso_scan.py` etc.) are thin wrappers that set paths and call it. Three sections:
 
 1. **hkl00** — no bending; resample moving map onto reference grid with zero shift. Gives the unregistered baseline Rfac.
 2. **hkl01..hkl10** — add canonical HKLs one at a time using a single `bend_fit_progressive` call with `batch_hkls=1, max_canon=11` and an `iter_callback` that snapshots the bent map at each n_non_DC checkpoint.
 3. **fr20..fr5** — separate `bend_fit_progressive` calls with `fitreso_end` stepped from 20 to 5 Å.
 
-For each scan point the script writes:
+For each scan point the function writes:
 
-- `bent.map` — bent moving-crystal 2Fo-Fc map resampled on the reference grid (CCP4 format)
-- `diff_norm.map` — z-scored real-space difference map (ref − bent) / σ, for peak finding and quick inspection
-- `bent.mtz` — `Fbent`/`PHIbent` (bent 2Fo-Fc as structure factors) plus `DELFWT`/`PHDELWT` (the difference map). **Load in Coot** via *File → Open MTZ*, then display `DELFWT`/`PHDELWT` as a difference map contoured at ±3σ.
-- `bent.pdb`, `ref.pdb` — bent and reference coordinates for atom context in the viewer
+- `cootme.mtz` — `FDM`/`PHIDM` (bent 2Fo-Fc as structure factors) plus `DELFWT`/`PHDELWT` (the difference map). **Load in Coot** via *File → Open MTZ*; `FDM`/`PHIDM` are recognised by default. Display `DELFWT`/`PHDELWT` as a difference map contoured at ±3σ.
+- `diff_norm.map` — z-scored real-space difference map (ref − bent) / σ, positive = more density in reference
+- `bent.map` — bent moving-crystal map resampled on the reference grid (CCP4 format)
+- `bent.pdb`, `ref.pdb`, `unbent.pdb` — coordinates for atom context in the viewer
 - `PSDVF.mtz` (fr\* points only) — fitted shift-field (h,k,l) coefficients
 
-Riso is computed from the Fourier transform of the 2Fo-Fc density maps (not experimental F_obs), using `gemmi.transform_map_to_f_phi` — no sfall or CCP4 programs required for the map→MTZ step. Because both maps include model bias and water molecules that shift between crystal forms, reported Riso values (~28–55% for lysozyme 3aw6→3aw7) should not be compared directly to crystallographic Riso from experimental data. The dominant negative peaks at high resolution (fr7 and finer) are typically displaced water molecules, not protein atoms.
+Riso is computed by `compute_riso()`: Wilson isotropic B scaling of `F_test` to match `F_ref`, then Riso = Σ|F_ref − F_scaled| / Σ|F_ref|. No CCP4 programs needed. Because both maps include model bias and water molecules, reported Riso values should not be compared directly to crystallographic Riso from experimental data. The dominant peaks at high resolution (fr7 and finer) are typically displaced water molecules.
+
+**Raddam sign convention**: 5kxk (undamaged) is the moving model; 5kxl/5kxm/5kxn (increasing dose) are references. Positive diff peaks = features appearing with radiation dose; negative peaks = features disappearing.
