@@ -1828,6 +1828,7 @@ def fitreso_scan(
     max_hkl_scan=10,
     outlier_sigma=2.5, b_sigma=3.0, drop_snr=0.0, od_margin=1.5,
     batch_hkls=100, chunk_size=50000,
+    riso_n_cycles=4, riso_sigma_cut=float('inf'),
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -1917,7 +1918,9 @@ def fitreso_scan(
         write_ccp4(f'{outdir}/diff_norm.map', diff_norm, ref_h)
         _write_scan_mtz(bent_map, diff, ref_h, f'{outdir}/cootme.mtz')
         riso, kF, B = compute_riso(ref_mtz_path, 'F',
-                                   f'{outdir}/cootme.mtz', 'FDM')
+                                   f'{outdir}/cootme.mtz', 'FDM',
+                                   n_cycles=riso_n_cycles,
+                                   sigma_cut=riso_sigma_cut)
         peaks = _scan_find_peaks(diff_norm, ref_h, atoms, M)
         p_pos = peaks['pos']
         p_neg = peaks['neg']
@@ -2008,12 +2011,13 @@ def fitreso_scan(
 
 
 def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
-                 n_cycles=4, sigma_cut=3.0, use_median=False):
+                 n_cycles=4, sigma_cut=float('inf'), use_median=False):
     """Scale test to ref; return (riso, scale_k, 0.0) or (None, None, None).
 
     Karle-Hauptman isomorphous scaling (same algorithm as CCP4 scaleit):
         k = Σ(F_ref · F_test) / Σ(F_test²)
     iterated n_cycles times with sigma_cut·σ outlier rejection between cycles.
+    Default sigma_cut=inf disables rejection (no reliable σ for map-derived F).
     No B-factor term — appropriate for comparing nearly-identical maps where the
     relative B difference is negligible.
 
