@@ -1660,6 +1660,348 @@ def _parse_args(argv):
     return pdb1, pdb2, mapfile, params
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# fitreso_scan — consolidated scan: hkl00..hkl10 + fr20..fr5
+# ══════════════════════════════════════════════════════════════════════════════
+
+import math as _math
+import contextlib as _contextlib
+import shutil as _shutil
+import tempfile as _tempfile
+from scipy import ndimage as _ndimage
+
+
+def _scan_cell_matrix(hdr):
+    a, b, c, al, be, ga = hdr['cell']
+    al, be, ga = _math.radians(al), _math.radians(be), _math.radians(ga)
+    cg, sg_ = _math.cos(ga), _math.sin(ga)
+    ca, cb  = _math.cos(al), _math.cos(be)
+    v = _math.sqrt(1 - ca**2 - cb**2 - cg**2 + 2*ca*cb*cg)
+    return np.array([
+        [a,  b*cg,  c*cb],
+        [0,  b*sg_, c*(ca - cb*cg)/sg_],
+        [0,  0,     c*v/sg_],
+    ])
+
+
+def _scan_read_pdb_atoms_p1(pdb_path):
+    st  = gemmi.read_pdb(pdb_path)
+    sg  = st.find_spacegroup()
+    ops = sg.operations() if sg else gemmi.SpaceGroup('P1').operations()
+    out = []
+    for model in st:
+        for chain in model:
+            for res in chain:
+                for atom in res:
+                    if atom.has_altloc() and atom.altloc != 'A':
+                        continue
+                    f0 = st.cell.fractionalize(atom.pos)
+                    f0 = np.array([f0.x, f0.y, f0.z])
+                    for op in ops:
+                        R = np.array([[op.rot[i][j] for j in range(3)]
+                                      for i in range(3)], dtype=float) / 24.
+                        t = np.array([op.tran[i] for i in range(3)],
+                                     dtype=float) / 24.
+                        out.append({'chain': chain.name,
+                                    'resseq': res.seqid.num,
+                                    'resname': res.name,
+                                    'atomname': atom.name,
+                                    'frac': (R @ f0 + t) % 1.0})
+    return out
+
+
+def _scan_voxel_to_frac(idx_3d, hdr):
+    nx, ny, nz = hdr['nx'], hdr['ny'], hdr['nz']
+    ss, sr, sc = hdr['nsstart'], hdr['nrstart'], hdr['ncstart']
+    ms, mr, mc = hdr['maps'], hdr['mapr'], hdr['mapc']
+    is_, ir, ic = idx_3d
+    grid  = {mc: ic,  mr: ir,  ms: is_}
+    start = {mc: sc,  mr: sr,  ms: ss}
+    N     = {1: nx, 2: ny, 3: nz}
+    return np.array([(grid[ax] + start[ax]) / N[ax] for ax in [1, 2, 3]])
+
+
+def _scan_nearest_atom(frac, atoms, M):
+    arr  = np.array([a['frac'] for a in atoms])
+    d    = arr - frac[np.newaxis, :]
+    d   -= np.round(d)
+    i    = np.argmin(np.linalg.norm(d @ M.T, axis=1))
+    return atoms[i], np.linalg.norm((d @ M.T)[i])
+
+
+def _scan_find_peaks(data, hdr, atoms, M, fp=5):
+    sigma = data.std()
+    fp3   = np.ones((fp,)*3)
+    out   = {}
+    _dummy = {'chain': '?', 'resseq': 0, 'resname': '?', 'atomname': '?'}
+    for sign, lbl in [(1, 'pos'), (-1, 'neg')]:
+        d     = sign * data
+        lmax  = d == _ndimage.maximum_filter(d, footprint=fp3)
+        labeled, nf = _ndimage.label(lmax & (d > 3 * sigma))
+        peaks = []
+        for k in range(1, nf + 1):
+            mask = labeled == k
+            idx  = np.unravel_index(np.argmax(d * mask), d.shape)
+            peaks.append((sign * d[idx] / sigma, np.array(idx)))
+        peaks.sort(key=lambda x: -abs(x[0]))
+        if peaks:
+            val, idx = peaks[0]
+            a, dist  = _scan_nearest_atom(_scan_voxel_to_frac(idx, hdr), atoms, M)
+            out[lbl] = (val, a, dist)
+        else:
+            out[lbl] = (0., _dummy, 0.)
+    return out
+
+
+def _atom_label(a):
+    return f"{a['chain']}/{a['resseq']}{a['resname']}/{a['atomname']}"
+
+
+def _map2mtz(mapfile, mtzfile):
+    ccp4 = gemmi.read_ccp4_map(mapfile)
+    ccp4.setup(float('nan'))
+    grid = ccp4.grid
+    sf   = gemmi.transform_map_to_f_phi(grid, half_l=True)
+    data = sf.prepare_asu_data(dmin=0.0)
+    mtz  = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = grid.spacegroup
+    mtz.cell       = grid.unit_cell
+    mtz.add_dataset('dataset')
+    mtz.add_column('F',   'F')
+    mtz.add_column('PHI', 'P')
+    n   = len(data)
+    arr = np.zeros((n, 5), dtype=np.float32)
+    arr[:, :3] = data.miller_array
+    arr[:,  3] = np.abs(data.value_array)
+    arr[:,  4] = np.degrees(np.angle(data.value_array))
+    mtz.set_data(arr)
+    mtz.write_to_file(mtzfile)
+
+
+def _write_scan_mtz(bent_arr, diff_arr, ref_h, mtzfile):
+    """Write cootme.mtz with FDM/PHIDM (bent map) + DELFWT/PHDELWT (diff map)."""
+    tmp_b = _tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
+    tmp_d = _tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
+    try:
+        write_ccp4(tmp_b, bent_arr, ref_h)
+        write_ccp4(tmp_d, diff_arr,  ref_h)
+        ccp4_b = gemmi.read_ccp4_map(tmp_b); ccp4_b.setup(float('nan'))
+        ccp4_d = gemmi.read_ccp4_map(tmp_d); ccp4_d.setup(float('nan'))
+        sf_b   = gemmi.transform_map_to_f_phi(ccp4_b.grid, half_l=True)
+        sf_d   = gemmi.transform_map_to_f_phi(ccp4_d.grid, half_l=True)
+        data_b = sf_b.prepare_asu_data(dmin=0.0)
+        data_d = sf_d.prepare_asu_data(dmin=0.0)
+        mtz = gemmi.Mtz(with_base=True)
+        mtz.spacegroup = ccp4_b.grid.spacegroup
+        mtz.cell       = ccp4_b.grid.unit_cell
+        mtz.add_dataset('dataset')
+        mtz.add_column('FDM',     'F')
+        mtz.add_column('PHIDM',   'P')
+        mtz.add_column('DELFWT',  'F')
+        mtz.add_column('PHDELWT', 'P')
+        n   = len(data_b)
+        arr = np.zeros((n, 7), dtype=np.float32)
+        arr[:, :3] = data_b.miller_array
+        arr[:,  3] = np.abs(data_b.value_array)
+        arr[:,  4] = np.degrees(np.angle(data_b.value_array))
+        arr[:,  5] = np.abs(data_d.value_array)
+        arr[:,  6] = np.degrees(np.angle(data_d.value_array))
+        mtz.set_data(arr)
+        mtz.write_to_file(mtzfile)
+    finally:
+        for p in (tmp_b, tmp_d):
+            try: os.unlink(p)
+            except OSError: pass
+
+
+def _eval_chunked(ref_pts, hkls, AB_xyz, chunk=50000):
+    delta = np.zeros_like(ref_pts)
+    for i in range(0, len(ref_pts), chunk):
+        delta[i:i+chunk] = eval_shift_field(ref_pts[i:i+chunk], hkls, AB_xyz)
+    return delta
+
+
+def fitreso_scan(
+    mov_pdb, ref_pdb, mov_map, ref_map, scan_dir,
+    mov_fullcell=False,
+    fitreso_list=(20, 15, 12, 10, 8, 7, 6, 5),
+    max_hkl_scan=10,
+    outlier_sigma=2.5, b_sigma=3.0, drop_snr=0.0, od_margin=1.5,
+    batch_hkls=100, chunk_size=50000,
+    verbose=True,
+):
+    """Run the standard fitreso scan and write outputs to scan_dir.
+
+    Section 1  — hkl00: zero shift (unregistered baseline)
+    Section 2  — hkl01..hklNN: single progressive call, one canonical HKL at a time
+    Section 3  — fr<N>: separate progressive calls at each resolution in fitreso_list
+
+    Parameters
+    ----------
+    mov_pdb, ref_pdb : str   Moving and reference PDB paths (relative to cwd or absolute)
+    mov_map, ref_map : str   Moving and reference CCP4 map paths
+    scan_dir         : str   Output directory (created if needed)
+    mov_fullcell     : bool  If True, load mov_map with read_ccp4_fullcell (lyso)
+    fitreso_list     : seq   Resolution endpoints for section 3 (Å)
+    max_hkl_scan     : int   Number of non-DC canonical HKLs in section 2 (default 10)
+    chunk_size       : int   Voxel batch size for eval_shift_field (default 50000)
+    """
+    import time
+
+    os.makedirs(scan_dir, exist_ok=True)
+
+    # ── load maps ────────────────────────────────────────────────────────────
+    if mov_fullcell:
+        mov_d, mov_h = read_ccp4_fullcell(mov_map)
+    else:
+        mov_d, mov_h = read_ccp4(mov_map)
+    ref_d, ref_h = read_ccp4(ref_map)
+
+    ns2, nr2, nc2 = ref_h['ns'], ref_h['nr'], ref_h['nc']
+    nx2, ny2, nz2 = ref_h['nx'], ref_h['ny'], ref_h['nz']
+    mc, mr, ms    = ref_h['mapc'], ref_h['mapr'], ref_h['maps']
+
+    g_s, g_r, g_c = np.meshgrid(np.arange(ns2), np.arange(nr2), np.arange(nc2),
+                                 indexing='ij')
+    amap  = {mc: g_c, mr: g_r, ms: g_s}
+    start = {mc: ref_h['ncstart'], mr: ref_h['nrstart'], ms: ref_h['nsstart']}
+    Nxyz  = {1: nx2, 2: ny2, 3: nz2}
+    frac_x = (amap[1].ravel() + start[1]) / Nxyz[1]
+    frac_y = (amap[2].ravel() + start[2]) / Nxyz[2]
+    frac_z = (amap[3].ravel() + start[3]) / Nxyz[3]
+    ref_pts = np.stack([frac_x, frac_y, frac_z], axis=1)
+
+    M     = _scan_cell_matrix(ref_h)
+    atoms = _scan_read_pdb_atoms_p1(ref_pdb)
+
+    # ── ref MTZ ──────────────────────────────────────────────────────────────
+    ref_mtz_path = os.path.join(scan_dir, 'ref.mtz')
+    if not os.path.exists(ref_mtz_path):
+        if verbose:
+            print('Converting ref map to MTZ...', flush=True)
+        _map2mtz(ref_map, ref_mtz_path)
+
+    _shutil.copy(ref_pdb, os.path.join(scan_dir, 'ref.pdb'))
+
+    _h0  = np.zeros((0, 3), dtype=int)
+    _AB0 = np.zeros((3, 0, 2))
+    write_bent_pdb(mov_pdb, ref_pdb, _h0, _AB0, os.path.join(scan_dir, 'unbent.pdb'))
+
+    # ── compute raw RMSD once ────────────────────────────────────────────────
+    with open(os.devnull, 'w') as _dev, _contextlib.redirect_stdout(_dev):
+        _a1, _cell1, _ = expand_to_p1(mov_pdb)
+        _a2, _cell2, _ = expand_to_p1(ref_pdb)
+        _fm, _ca, _uid, _bf = match_atoms(_a1, _a2)
+        _fm, _ca, _, _, _ = reject_outliers(_fm, _ca, _uid, _cell1,
+                                            mad_sigma=outlier_sigma,
+                                            b_sigma=b_sigma, bfacs=_bf)
+    raw_rmsd = rmsd_ca(_fm, _ca, _h0, _AB0, _cell2)
+
+    # ── print header ─────────────────────────────────────────────────────────
+    if verbose:
+        print(f"\n{'label':>7}  {'RMSD0':>6}  {'RMSD':>6}  {'active':>6}  {'RFAC':>6}  "
+              f"{'peak+':>7}  {'atom+':>20}  {'peak-':>7}  {'atom-':>20}", flush=True)
+        print('-' * 122, flush=True)
+
+    def _save_point(label, outdir, bent_map, rmsd_before, rmsd_after,
+                    n_active, t_elapsed, hkls=None, AB_xyz=None):
+        write_ccp4(f'{outdir}/bent.map', bent_map, ref_h)
+        if hkls is not None and AB_xyz is not None:
+            write_bent_pdb(mov_pdb, ref_pdb, hkls, AB_xyz, f'{outdir}/bent.pdb')
+        _shutil.copy(ref_pdb, f'{outdir}/ref.pdb')
+        _shutil.copy(os.path.join(scan_dir, 'unbent.pdb'), f'{outdir}/unbent.pdb')
+        ref_n     = (ref_d    - ref_d.mean())    / ref_d.std()
+        bent_n    = (bent_map - bent_map.mean()) / bent_map.std()
+        diff      = ref_n - bent_n
+        diff_norm = diff / diff.std()
+        write_ccp4(f'{outdir}/diff_norm.map', diff_norm, ref_h)
+        _write_scan_mtz(bent_map, diff, ref_h, f'{outdir}/cootme.mtz')
+        riso, kF, B = compute_riso(ref_mtz_path, 'F',
+                                   f'{outdir}/cootme.mtz', 'FDM')
+        peaks = _scan_find_peaks(diff_norm, ref_h, atoms, M)
+        p_pos = peaks['pos']
+        p_neg = peaks['neg']
+        rfac_str   = f'{riso*100:.1f}%' if riso is not None else '  N/A'
+        before_str = f'{rmsd_before:.3f}' if rmsd_before is not None else '  ---'
+        after_str  = f'{rmsd_after:.3f}'  if rmsd_after  is not None else '  ---'
+        if verbose:
+            print(f"{label:>7}  {before_str:>6}  {after_str:>6}  {n_active:>6d}  "
+                  f"{rfac_str:>6}  "
+                  f"{p_pos[0]:>+7.2f}σ  {_atom_label(p_pos[1]):>20} {p_pos[2]:.2f}Å  "
+                  f"{p_neg[0]:>+7.2f}σ  {_atom_label(p_neg[1]):>20} {p_neg[2]:.2f}Å  "
+                  f"[{t_elapsed:.0f}s]", flush=True)
+
+    # ── Section 1: hkl00 — zero shift ────────────────────────────────────────
+    outdir0 = os.path.join(scan_dir, 'hkl00')
+    os.makedirs(outdir0, exist_ok=True)
+    t0 = time.time()
+    bent_vals = interpolate_map(mov_d, mov_h, ref_pts)
+    bent_map0 = bent_vals.reshape(ns2, nr2, nc2)
+    _save_point('hkl00', outdir0, bent_map0, raw_rmsd, raw_rmsd, 0,
+                time.time() - t0, hkls=_h0, AB_xyz=_AB0)
+
+    # ── Section 2: hkl01..hklNN — progressive, one canon HKL at a time ───────
+    def _hkl_callback(iter_i, nhkls, n_canon, rmsd, hkls_now, AB_xyz, active, snr):
+        n_non_dc = n_canon - 1
+        if n_non_dc < 1 or n_non_dc > max_hkl_scan:
+            return
+        t0_cb = time.time()
+        label  = f'hkl{n_non_dc:02d}'
+        outdir = os.path.join(scan_dir, label)
+        os.makedirs(outdir, exist_ok=True)
+        delta     = _eval_chunked(ref_pts, hkls_now, AB_xyz, chunk_size)
+        bent_vals = interpolate_map(mov_d, mov_h, ref_pts - delta)
+        bent_map  = bent_vals.reshape(ns2, nr2, nc2)
+        _save_point(label, outdir, bent_map, raw_rmsd, rmsd,
+                    int(active.sum()), time.time() - t0_cb,
+                    hkls=hkls_now, AB_xyz=AB_xyz)
+        save_fitparams(os.path.join(outdir, 'PSDVF.mtz'),
+                       hkls_now, AB_xyz, active, snr,
+                       ref_h['cell'], ref_h['cell'], 'xyz', rmsd)
+
+    bend_fit_progressive(
+        mov_pdb, ref_pdb,
+        fitreso_start=100.0, fitreso_end=2.0,
+        max_canon=max_hkl_scan + 1, batch_hkls=1, od_margin=od_margin,
+        drop_snr=drop_snr, outlier_sigma=outlier_sigma, b_sigma=b_sigma,
+        verbose=False,
+        iter_callback=_hkl_callback,
+    )
+
+    # ── Section 3: fr<N> — resolution scans ──────────────────────────────────
+    if verbose:
+        print('-' * 122, flush=True)
+    for fitreso in fitreso_list:
+        outdir = os.path.join(scan_dir, f'fr{fitreso}')
+        os.makedirs(outdir, exist_ok=True)
+        t0 = time.time()
+        result = bend_fit_progressive(
+            mov_pdb, ref_pdb,
+            fitreso_start=20.0, fitreso_end=float(fitreso),
+            drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
+            outlier_sigma=outlier_sigma, b_sigma=b_sigma,
+            verbose=False,
+        )
+        t_fit = time.time() - t0
+        dim_list = list(result.dimensions)
+        xyz_dims = [dim_list.index(d) for d in 'xyz' if d in dim_list]
+        AB_xyz   = np.zeros((3, len(result.hkls), 2))
+        for new_i, old_i in enumerate(xyz_dims):
+            AB_xyz[new_i] = result.AB[old_i]
+        delta     = _eval_chunked(ref_pts, result.hkls, AB_xyz, chunk_size)
+        bent_vals = interpolate_map(mov_d, mov_h, ref_pts - delta)
+        bent_map  = bent_vals.reshape(ns2, nr2, nc2)
+        _save_point(f'fr{fitreso}', outdir, bent_map, raw_rmsd, result.rmsd,
+                    int(result.active.sum()), t_fit,
+                    hkls=result.hkls, AB_xyz=AB_xyz)
+        save_fitparams(f'{outdir}/PSDVF.mtz',
+                       result.hkls, result.AB, result.active, result.snr,
+                       result.cell1, result.cell2, result.dimensions, result.rmsd)
+
+    if verbose:
+        print('\nDone.', flush=True)
+
+
 def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col):
     """Wilson-scale test to ref; return (riso, scale_kF, B_iso) or (None, None, None).
 
