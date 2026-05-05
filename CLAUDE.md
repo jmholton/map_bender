@@ -31,6 +31,8 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
     fitreso_scan/
   raddam/                       radiation damage 5kxk→5kxl/m/n (P4₃2₁2, ~980 CA pairs)
     fitreso_scan_5kxl/, fitreso_scan_5kxm/, fitreso_scan_5kxn/
+  insulin/                      insulin hexamer 4fg3→4e7u (H3, T→R transition)
+    4fg3.pdb, 4e7u.pdb
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
   magdoff/                      Magdoff synthetic deformation validation tests
     test_magdoff.py             test script (7rsa, P2₁, 248 CA)
@@ -101,6 +103,32 @@ The scan logic is implemented as `fitreso_scan()` directly in `bendfinder.py`. E
 **Raddam sign convention**: 5kxk (undamaged, lowest dose) is the **moving** model; 5kxl/5kxm/5kxn (increasingly damaged) are the **references**. Dose ordering is alphabetical: 5kxk < 5kxl < 5kxm < 5kxn. With this convention, positive diff peaks = features appearing with dose, negative peaks = features disappearing.
 
 **Large-map memory**: `eval_shift_field` allocates an (N_voxels × N_hkls) phase matrix. For large maps (raddam: 3.7M voxels × 900+ HKLs ≈ 26 GB) this must be chunked. `fitreso_scan` uses an internal `_eval_chunked` helper in 50k-voxel batches (configurable via `chunk_size` parameter).
+
+## Origin alignment (`_find_best_origin`)
+
+`_find_best_origin(atoms1_op0, atoms2, sg_name, n_polar=12)` returns a 4-tuple `(shift, symop_k, R_alt, improved)`.
+
+**Standard search**: For each space-group symop k and each polar-axis candidate shift (an `n_polar`-interval grid along each allowed origin-shift direction from `_ORIGINS_TABLE`), compute the median fractional CA shift between the op0 atoms of structure 1 and the op-k atoms of structure 2 after applying the trial shift. Take the minimum-median (shift, k) pair; call it `improved` if it reduces the unshifted score by >10%.
+
+**Altindex fallback**: Only triggered when the standard search fails to improve (score ≥ 0.9 × ref_score). Tries proper rotation matrices from the Laue-group holohedry that are NOT in the space group's point group (defined in `_ALTINDEX_CANDIDATES` per crystal system). For each candidate R_alt, applies it to the fractional coordinates of atoms2 and reruns the standard search. If any altindex+shift combination yields a better score, that R_alt is applied permanently to atoms2 before fitting.
+
+```python
+_ALTINDEX_CANDIDATES = {
+    'trigonal':    [2-folds about [100]/[010]/[110] in hex fractional],
+    'hexagonal':   [same],
+    'tetragonal':  [[0,1,0],[1,0,0],[0,0,-1]],
+    'orthorhombic': [axis permutations],
+    'cubic':       [3-fold permutations],
+    'monoclinic':  [],
+    'triclinic':   [],
+}
+```
+
+Callers (`bend_fit`, `bend_fit_progressive`) unpack all 4 values and print: `origin shift: (x, y, z) for SG  +altindex  +symop_idx=k`.
+
+**CA shift sanity checks** (both in `bend_fit` and `bend_fit_progressive`): After outlier rejection, two checks run:
+1. **CA RMSD > 5 Å** — RMS orthogonal shift over all remaining CA pairs. Printed as `CA RMSD after origin fix: X.XXX Å`. Raises error if > 5 Å; a correctly aligned pair should always be below this even for large conformational changes. (Insulin T→R: 2.417 Å.)
+2. **Largest fractional CA shift > 0.35 cells** (~16 Å for a 47 Å cell). Raised from the old 0.1 threshold to accommodate genuine large differences (e.g. insulin LEU B6, 0.165 fractional ≈ 8 Å). Values >0.35 indicate gross misalignment.
 
 ## Cubic b-spline boundary fix (interpolate_map)
 
@@ -209,9 +237,11 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.082 Å | 20.6% | 13.4% |
 | Raddam 5kxk→5kxm | P4₃2₁2 | 984 | — | — | 11.0% |
 | Raddam 5kxk→5kxn | P4₃2₁2 | ~992 | — | — | — |
+| Insulin 4fg3→4e7u | H3 | 534 | 1.063 Å | 68.7% | 83.7% |
 
 Notes:
 - Lyso Rfac plateaus at ~33% by fr20 and barely changes with higher resolution — real structural differences remain in the diff map (A/74ASN/O is the persistent −10σ peak).
 - DHFR Rfac barely improves (44% → 42%) — these crystal forms are more dissimilar; the FOL ligand and Mn ion dominate the diff map at all resolutions.
 - Raddam Rfac *starts* low (13–11%) because the fc maps are nearly identical; huge water peaks (±30–65σ) reflect water molecules appearing/disappearing with radiation dose.
 - Myoglobin Rfac pending (gemmi map2mtz re-run in progress); heme iron dominates diff map throughout (±35σ at A/154HEM/FE).
+- Insulin: high Rfac (68.7%) and high residual RMSD (1.063 Å) reflect genuine T→R conformational change — LEU B6 shifts ~8 Å between T-state (4fg3) and R-state (4e7u), which is outside the smooth shift-field model. RMSD best at fr10 (0.988 Å, 401 HKLs); OD limit hit at 501 HKLs for fr8–fr5. Dominant diff peaks: +34σ at D/101ZN/ZN (zinc position differs), −10σ at waters/SCN.

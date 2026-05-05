@@ -1,22 +1,35 @@
 #!/programs/ccp4-8.0/bin/ccp4-python
 """bendfinder.py — fit a Fourier shift field between two crystal forms.
 
-Usage:
-    bendfinder.py moving.pdb reference.pdb [map.ccp4] [key=value ...]
+Usage (single fit):
+    bendfinder.py moving.pdb reference.pdb moving.mtz reference.mtz [key=value ...]
+    bendfinder.py moving.pdb reference.pdb [map.ccp4] [key=value ...]   # CCP4 map fallback
+
+Usage (fitreso scan):
+    bendfinder.py moving.pdb reference.pdb moving.mtz reference.mtz scan_dir=DIR [key=value ...]
+
+MTZ inputs are expected to be refinement outputs with likelihood-weighted 2Fo-Fc
+coefficients (FWT/PHWT from refmac or 2FOFCWT/PH2FOFCWT from phenix).
 
 Parameters:
-    nhkls=30        max Fourier terms (default 30); reports effective fitreso
-    fitreso=X       use all HKLs with d ≥ X Å (e.g. fitreso=12); overrides nhkls
-    drop_snr=1      post-fit SNR threshold (default 1; 0 = disable)
-    frac=1          scale factor for applied shifts (default 1)
-    geotest=false   run refmac5 geometry check (default false)
-    use_symm=true   enforce space-group symmetry constraint (default true)
-    dimensions=xyz  which shifts to fit (subset of xyzoBà; default xyz)
-    fitparams=file  load pre-computed psdvf.mtz (or other fitparams) and skip fitting
-    deltamaps       write delta-x/y/z/r maps in addition to bent map
+    nhkls=30          max Fourier terms (default 30); reports effective fitreso
+    fitreso=X         use all HKLs with d ≥ X Å (e.g. fitreso=12); overrides nhkls
+    drop_snr=1        post-fit SNR threshold (default 1; 0 = disable)
+    frac=1            scale factor for applied shifts (default 1)
+    geotest=false     run refmac5 geometry check (default false)
+    use_symm=true     enforce space-group symmetry constraint (default true)
+    dimensions=xyz    which shifts to fit (subset of xyz; default xyz)
+    fitparams=file    load pre-computed psdvf.mtz and skip fitting
+    deltamaps         write delta-x/y/z/r maps in addition to bent map
+    labels=F,PHI      override 2Fo-Fc column detection (e.g. labels=FC,PHIC)
+    run_refinement    run refmac5/phenix.refine to generate FWT/PHWT first
+    refine_cycles=5   number of refinement cycles (default 5)
+    sample_rate=3.0   FFT oversampling for MTZ → map conversion (default 3.0)
+    scan_dir=DIR      run full fitreso scan and write outputs to DIR
 
 Public API:
     from bendfinder import bend_fit, bend_apply_pdb, bend_apply_map
+    from bendfinder import fitreso_scan, detect_2fofc_cols, mtz_to_map_data
     result = bend_fit("moving.pdb", "reference.pdb", nhkls=30)
     print(result.rmsd)
 """
@@ -167,7 +180,7 @@ def reject_outliers(fitme, ca_mask, uids, cell, mad_sigma=3.0,
             keep)
 
 
-def expand_to_p1(pdb_path, altloc_filter=False, altloc_fallback=1.0):
+def expand_to_p1(pdb_path, altloc_filter=False, altloc_fallback=1.0, origin_shift=None):
     """Read PDB and expand ASU to P1 with all crystallographic symmetry ops.
 
     Parameters
@@ -197,7 +210,7 @@ def expand_to_p1(pdb_path, altloc_filter=False, altloc_fallback=1.0):
     sg_obj = st.find_spacegroup()
     if sg_obj is None:
         sg_obj = gemmi.find_spacegroup_by_name('P 1')
-    sg_name = sg_obj.hm
+    sg_name = sg_obj.short_name()   # 'H32' not 'R 3 2' for hexagonal setting
 
     ops = list(sg_obj.operations())   # identity is ops[0]
 
@@ -259,6 +272,8 @@ def expand_to_p1(pdb_path, altloc_filter=False, altloc_fallback=1.0):
 
                     for aname, orth, bfac, occ in atom_iter:
                         frac = M_inv @ orth
+                        if origin_shift is not None:
+                            frac = frac + origin_shift   # shift ASU before applying op
                         nf = op.apply_to_xyz(frac.tolist())
                         nf = [f % 1.0 for f in nf]
                         uid = f"{cname}_{rnum}{icode}_{rname}_{aname}_op{oi}"
@@ -864,8 +879,29 @@ def write_ccp4(path, data, hdr_template, cell_override=None):
     Overwrites DMIN/DMAX/DMEAN (words 20-22) and RMS (word 54) with
     actual stats.  ISPG (word 23, byte 88) is preserved from the template.
     cell_override: optional (a,b,c,al,be,ga) to replace cell in header.
+
+    If hdr_template lacks 'raw_header' (e.g. MTZ-derived header), synthesises
+    a minimal valid 1024-byte CCP4 header from the dict fields.
     """
-    raw = bytearray(hdr_template['raw_header'])
+    if 'raw_header' in hdr_template:
+        raw = bytearray(hdr_template['raw_header'])
+    else:
+        raw = bytearray(1024)
+        struct.pack_into('<i', raw, 12, 2)       # MODE = float32
+        nx = hdr_template.get('nx', hdr_template['nc'])
+        ny = hdr_template.get('ny', hdr_template['nr'])
+        nz = hdr_template.get('nz', hdr_template['ns'])
+        for off, v in ((28, nx), (32, ny), (36, nz)):
+            struct.pack_into('<i', raw, off, int(v))
+        cell = hdr_template['cell']
+        for i, v in enumerate(cell):
+            struct.pack_into('<f', raw, 40 + i*4, float(v))
+        struct.pack_into('<i', raw, 64, hdr_template.get('mapc', 1))
+        struct.pack_into('<i', raw, 68, hdr_template.get('mapr', 2))
+        struct.pack_into('<i', raw, 72, hdr_template.get('maps', 3))
+        struct.pack_into('<i', raw, 88, hdr_template.get('spacegroup', 1))
+        raw[208:212] = b'MAP '
+        raw[212:216] = b'\x44\x44\x00\x00'   # little-endian machine stamp
 
     mn, mx = float(data.min()), float(data.max())
     mean   = float(data.mean())
@@ -926,6 +962,41 @@ def interpolate_map(data, hdr, probe_frac, pad_mode='reflect'):
 # Bent map (replace mapman + floatgen pipeline)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _make_bent_map_data(data, hdr, hkls, AB_xyz, outpath, cell2=None,
+                        use_jacobian=False):
+    """Resample in-memory map (data, hdr) through the shift field; write outpath."""
+    nc, nr, ns = hdr['nc'], hdr['nr'], hdr['ns']
+    nx, ny, nz = hdr['nx'], hdr['ny'], hdr['nz']
+    ncstart, nrstart, nsstart = hdr['ncstart'], hdr['nrstart'], hdr['nsstart']
+    mapc, mapr, maps = hdr['mapc'], hdr['mapr'], hdr['maps']
+
+    sec_idx = np.arange(ns)
+    row_idx = np.arange(nr)
+    col_idx = np.arange(nc)
+    sec_g, row_g, col_g = np.meshgrid(sec_idx, row_idx, col_idx, indexing='ij')
+
+    axis_to_frac = {mapc: col_g, mapr: row_g, maps: sec_g}
+    start  = {mapc: ncstart, mapr: nrstart, maps: nsstart}
+    Nxyz   = {1: nx, 2: ny, 3: nz}
+
+    frac_x = (axis_to_frac[1].ravel() + start[1]) / Nxyz[1]
+    frac_y = (axis_to_frac[2].ravel() + start[2]) / Nxyz[2]
+    frac_z = (axis_to_frac[3].ravel() + start[3]) / Nxyz[3]
+    frac_pts = np.stack([frac_x, frac_y, frac_z], axis=1)
+
+    delta    = eval_shift_field(frac_pts, hkls, AB_xyz)
+    new_vals = interpolate_map(data, hdr, frac_pts - delta)
+
+    if use_jacobian:
+        div = eval_divergence(frac_pts, hkls, AB_xyz)
+        new_vals = new_vals * (1.0 - div)
+
+    new_data = new_vals.reshape(ns, nr, nc)
+    write_ccp4(outpath, new_data, hdr, cell_override=cell2)
+    print(f"bent map written to {outpath}")
+    return outpath
+
+
 def make_bent_map(map_path, hkls, AB_xyz, outpath, cell2=None, use_jacobian=False):
     """Resample map_path through the shift field and write outpath.
 
@@ -940,46 +1011,8 @@ def make_bent_map(map_path, hkls, AB_xyz, outpath, cell2=None, use_jacobian=Fals
     for the change in voxel volume under the coordinate transformation.
     """
     data, hdr = read_ccp4(map_path)
-    nc, nr, ns = hdr['nc'], hdr['nr'], hdr['ns']
-    nx, ny, nz = hdr['nx'], hdr['ny'], hdr['nz']
-    ncstart, nrstart, nsstart = hdr['ncstart'], hdr['nrstart'], hdr['nsstart']
-    mapc, mapr, maps = hdr['mapc'], hdr['mapr'], hdr['maps']
-
-    # Build fractional coordinates of every grid point
-    sec_idx = np.arange(ns)
-    row_idx = np.arange(nr)
-    col_idx = np.arange(nc)
-    sec_g, row_g, col_g = np.meshgrid(sec_idx, row_idx, col_idx, indexing='ij')
-
-    # Map column/row/section axes to x/y/z based on MAPC/MAPR/MAPS.
-    # axis_to_frac[ax] = grid-index array for crystallographic axis ax (1=X,2=Y,3=Z)
-    # start[ax]        = ASU origin along ax (belongs to MAPC/MAPR/MAPS, not X/Y/Z)
-    axis_to_frac = {mapc: col_g, mapr: row_g, maps: sec_g}
-    start  = {mapc: ncstart, mapr: nrstart, maps: nsstart}
-    Nxyz   = {1: nx, 2: ny, 3: nz}   # full unit-cell grid sizes per axis
-
-    frac_x = (axis_to_frac[1].ravel() + start[1]) / Nxyz[1]
-    frac_y = (axis_to_frac[2].ravel() + start[2]) / Nxyz[2]
-    frac_z = (axis_to_frac[3].ravel() + start[3]) / Nxyz[3]
-    frac_pts = np.stack([frac_x, frac_y, frac_z], axis=1)   # (N, 3)
-
-    # Shift field at each grid point (fractional)
-    delta = eval_shift_field(frac_pts, hkls, AB_xyz)   # (N, 3)
-
-    # Sample the map at (grid_point - shift): negative because we invert
-    source_frac = frac_pts - delta                      # (N, 3)
-    new_vals = interpolate_map(data, hdr, source_frac)  # (N,)
-
-    if use_jacobian:
-        # Scale each voxel by (1 - div(δ)) to conserve density under the
-        # coordinate transformation (first-order Jacobian correction).
-        div = eval_divergence(frac_pts, hkls, AB_xyz)  # (N,)
-        new_vals = new_vals * (1.0 - div)
-
-    new_data = new_vals.reshape(ns, nr, nc)
-    write_ccp4(outpath, new_data, hdr, cell_override=cell2)
-    print(f"bent map written to {outpath}")
-    return outpath
+    return _make_bent_map_data(data, hdr, hkls, AB_xyz, outpath,
+                               cell2=cell2, use_jacobian=use_jacobian)
 
 
 def make_delta_maps(map_path, hkls, AB_xyz, nhkls):
@@ -1015,6 +1048,33 @@ def make_delta_maps(map_path, hkls, AB_xyz, nhkls):
         d = delta_orth[:, i].reshape(ns_full, nr_full, nc_full).astype(np.float32)
         write_ccp4(f"delta_{label}{nhkls}.map", d, hdr_p1)
     dr = np.sqrt(np.sum(delta_orth**2, axis=1)).reshape(ns_full, nr_full, nc_full).astype(np.float32)
+    write_ccp4(f"delta_r{nhkls}.map", dr, hdr_p1)
+    print(f"delta maps written: delta_x/y/z/r{nhkls}.map")
+
+
+def _make_delta_maps_hdr(hdr, hkls, AB_xyz, nhkls):
+    """Write delta maps using a header dict (no density data needed)."""
+    mapc, mapr, maps = hdr['mapc'], hdr['mapr'], hdr['maps']
+    Nxyz = {1: hdr['nx'], 2: hdr['ny'], 3: hdr['nz']}
+    nc_full = Nxyz[mapc]
+    nr_full = Nxyz[mapr]
+    ns_full = Nxyz[maps]
+    sec_g, row_g, col_g = np.meshgrid(np.arange(ns_full), np.arange(nr_full),
+                                       np.arange(nc_full), indexing='ij')
+    axis_to_grid = {mapc: col_g, mapr: row_g, maps: sec_g}
+    frac_pts = np.stack([axis_to_grid[1].ravel() / Nxyz[1],
+                         axis_to_grid[2].ravel() / Nxyz[2],
+                         axis_to_grid[3].ravel() / Nxyz[3]], axis=1)
+    delta      = eval_shift_field(frac_pts, hkls, AB_xyz)
+    delta_orth = frac_to_orth(delta, hdr['cell'])
+    hdr_p1 = dict(hdr)
+    hdr_p1.update(nc=nc_full, nr=nr_full, ns=ns_full,
+                  ncstart=0, nrstart=0, nsstart=0)
+    for i, label in enumerate('xyz'):
+        d = delta_orth[:, i].reshape(ns_full, nr_full, nc_full).astype(np.float32)
+        write_ccp4(f"delta_{label}{nhkls}.map", d, hdr_p1)
+    dr = np.sqrt(np.sum(delta_orth**2, axis=1)).reshape(
+        ns_full, nr_full, nc_full).astype(np.float32)
     write_ccp4(f"delta_r{nhkls}.map", dr, hdr_p1)
     print(f"delta maps written: delta_x/y/z/r{nhkls}.map")
 
@@ -1145,6 +1205,256 @@ def load_fitparams(path):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Origin search (handles symmetry-equivalent origins in polar/centred SGs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Allowed fractional origin shifts per space group (from CCP4 convention).
+# 'x','y','z' = polar axis (continuous free parameter).
+# 'x=y=z'     = R3 special (all three equal).
+_ORIGINS_TABLE = {
+    # P1 — fully free
+    'P1': [('x', 'y', 'z')],
+    # Monoclinic — polar y
+    **{sg: [(0, 'y', 0), (0, 'y', .5), (.5, 'y', 0), (.5, 'y', .5)]
+       for sg in ('P2', 'P21', 'C2', 'B2', 'A2', 'I2')},
+    # Orthorhombic / some cubic — all discrete
+    **{sg: [(0,0,0),(0,0,.5),(0,.5,0),(0,.5,.5),(.5,0,0),(.5,0,.5),(.5,.5,0),(.5,.5,.5)]
+       for sg in ('P222','P2221','P2212','P2122','P21212','P21221','P22121','P212121',
+                  'C2221','C222','I222','I212121','F432','F4132')},
+    # F-centred — 16 origins
+    **{sg: [(0,0,0),(0,0,.5),(0,.5,0),(0,.5,.5),(.5,0,0),(.5,0,.5),(.5,.5,0),(.5,.5,.5),
+            (.25,.25,.25),(.25,.25,.75),(.25,.75,.25),(.25,.75,.75),
+            (.75,.25,.25),(.75,.25,.75),(.75,.75,.25),(.75,.75,.75)]
+       for sg in ('F222', 'F23')},
+    # Tetragonal — polar z (2 xy positions)
+    **{sg: [(0, 0, 'z'), (.5, .5, 'z')]
+       for sg in ('P4','P41','P42','P43','I4','I41')},
+    # Tetragonal 422 — 4 discrete origins
+    **{sg: [(0,0,0),(0,0,.5),(.5,.5,0),(.5,.5,.5)]
+       for sg in ('P422','P4212','P4122','P41212','P4222','P42212','P4322','P43212',
+                  'I422','I4122')},
+    # Trigonal P — polar z (3 xy positions)
+    **{sg: [(0, 0, 'z'), (1/3, 2/3, 'z'), (2/3, 1/3, 'z')]
+       for sg in ('P3', 'P31', 'P32')},
+    # R3 — special: (t, t, t) diagonal
+    'R3': [('x=y=z',)],
+    # H3 — polar z (3 xy positions)
+    **{sg: [(0, 0, 'z'), (1/3, 2/3, 'z'), (2/3, 1/3, 'z')]
+       for sg in ('H3',)},
+    # P312 family
+    **{sg: [(0,0,0),(0,0,.5),(1/3,2/3,0),(2/3,1/3,0),(1/3,2/3,.5),(2/3,1/3,.5)]
+       for sg in ('P312','P3112','P3212')},
+    # P321 / P622 family
+    **{sg: [(0,0,0),(0,0,.5)]
+       for sg in ('P321','P3121','P3221','P622','P6122','P6522','P6222','P6422','P6322')},
+    # R32 — 2 origins
+    'R32': [(0,0,0), (.5,.5,.5)],
+    # H32 — 6 origins
+    'H32': [(0,0,0),(0,0,.5),(1/3,2/3,2/3),(2/3,1/3,1/3),(1/3,2/3,1/6),(2/3,1/3,5/6)],
+    # Hexagonal polar z
+    **{sg: [(0, 0, 'z')]
+       for sg in ('P6','P61','P65','P62','P64','P63')},
+    # Cubic with 2 origins
+    **{sg: [(0,0,0), (.5,.5,.5)]
+       for sg in ('P23','P213','P432','P4232','I432','P4332','P4132','I4132')},
+}
+
+
+def _sg_origins_key(sg_name):
+    """Map gemmi space group name to _ORIGINS_TABLE key (strip spaces)."""
+    k = sg_name.replace(' ', '').replace('_', '')
+    # Handle H/R notation variants gemmi may produce
+    alt = {'H3': 'H3', 'H32': 'H32', 'R3': 'R3', 'R32': 'R32'}
+    return alt.get(k, k)
+
+
+def _expand_origin_entries(entries, n_polar=12):
+    """Expand polar placeholders to concrete (dx,dy,dz) float tuples."""
+    polar_vals = [i / n_polar for i in range(n_polar)]
+    result = []
+    for entry in entries:
+        if len(entry) == 1 and entry[0] == 'x=y=z':
+            for t in polar_vals:
+                result.append((t, t, t))
+            continue
+        coords = list(entry)
+        def _vals(c):
+            return polar_vals if isinstance(c, str) else [float(c)]
+        for dx in _vals(coords[0]):
+            for dy in _vals(coords[1]):
+                for dz in _vals(coords[2]):
+                    result.append((dx, dy, dz))
+    return result
+
+
+def _op_idx(uid):
+    """Return the integer operator index from a uid ending in _opN."""
+    i = uid.rfind('_op')
+    return int(uid[i + 3:]) if i >= 0 else 0
+
+
+def _base_uid(uid):
+    """Strip _opN suffix from a uid."""
+    i = uid.rfind('_op')
+    return uid[:i] if i >= 0 else uid
+
+
+def _cross_op_ca_shifts(atoms1_op0, atoms2, k):
+    """CA shifts: atoms2 op_k minus atoms1 op_0, matched by base uid.
+
+    Returns ndarray (N_ca, 3) of fractional shifts (minimum-image convention).
+    """
+    op_tag = f'_op{k}'
+    a2_map = {_base_uid(a['uid']): a
+              for a in atoms2 if a['is_ca'] and a['uid'].endswith(op_tag)}
+    shifts = []
+    for a1 in atoms1_op0:
+        if not a1['is_ca']:
+            continue
+        a2 = a2_map.get(_base_uid(a1['uid']))
+        if a2 is None:
+            continue
+        dx = a2['x'] - a1['x'];  dx -= round(dx)
+        dy = a2['y'] - a1['y'];  dy -= round(dy)
+        dz = a2['z'] - a1['z'];  dz -= round(dz)
+        shifts.append([dx, dy, dz])
+    return np.array(shifts, dtype=float) if shifts else np.zeros((0, 3))
+
+
+def _relabel_ops(atoms, k_offset, n_ops):
+    """Permute operator labels: old _opJ → new _op_{(J - k_offset) % n_ops}."""
+    if k_offset == 0:
+        return atoms
+    result = []
+    for a in atoms:
+        uid = a['uid']
+        i = uid.rfind('_op')
+        if i >= 0:
+            j = int(uid[i + 3:])
+            a = {**a, 'uid': uid[:i] + f'_op{(j - k_offset) % n_ops}'}
+        result.append(a)
+    return result
+
+
+# Alternative-indexing candidates by crystal system (fractional coords, det=+1).
+# These are proper rotations in the Laue-group holohedry that may be absent
+# from lower-symmetry space groups.
+_ALTINDEX_CANDIDATES = {
+    # hexagonal 2-folds about [110], [100], [010]-type axes
+    'trigonal':    [np.array([[0, 1, 0],[1, 0, 0],[0, 0,-1]], float),
+                    np.array([[1,-1, 0],[0,-1, 0],[0, 0,-1]], float),
+                    np.array([[0,-1, 0],[-1, 1, 0],[0, 0,-1]], float)],
+    'hexagonal':   [np.array([[0, 1, 0],[1, 0, 0],[0, 0,-1]], float),
+                    np.array([[1,-1, 0],[0,-1, 0],[0, 0,-1]], float),
+                    np.array([[0,-1, 0],[-1, 1, 0],[0, 0,-1]], float)],
+    # tetragonal 2-fold about [110] (swaps a,b, inverts c)
+    'tetragonal':  [np.array([[0, 1, 0],[1, 0, 0],[0, 0,-1]], float)],
+    # orthorhombic axis permutations
+    'orthorhombic':[np.array([[0, 1, 0],[0, 0, 1],[1, 0, 0]], float),
+                    np.array([[0, 0, 1],[1, 0, 0],[0, 1, 0]], float),
+                    np.array([[0, 1, 0],[1, 0, 0],[0, 0,-1]], float),
+                    np.array([[0, 0, 1],[0,-1, 0],[1, 0, 0]], float),
+                    np.array([[-1, 0, 0],[0, 0, 1],[0, 1, 0]], float)],
+    # cubic cyclic axis permutations
+    'cubic':       [np.array([[0, 1, 0],[0, 0, 1],[1, 0, 0]], float),
+                    np.array([[0, 0, 1],[1, 0, 0],[0, 1, 0]], float)],
+    'monoclinic':  [],
+    'triclinic':   [],
+}
+
+
+def _get_altindex_ops(sg_name):
+    """Return list of altindex rotation matrices not already in the SG."""
+    sg = gemmi.find_spacegroup_by_name(sg_name)
+    cs = sg.crystal_system_str()
+    candidates = _ALTINDEX_CANDIDATES.get(cs, [])
+    if not candidates:
+        return []
+    # Collect the SG's proper rotation matrices (integer form ×1 after rounding)
+    sg_rots = set()
+    for op in sg.operations():
+        R = np.array(op.rot, dtype=float) / 24.0
+        if round(np.linalg.det(R)) == 1:
+            sg_rots.add(tuple(np.round(R).astype(int).ravel()))
+    result = []
+    for R in candidates:
+        key = tuple(np.round(R).astype(int).ravel())
+        if key not in sg_rots:
+            result.append(R)
+    return result
+
+
+def _apply_rotation_to_atoms(atoms, R):
+    """Apply 3×3 rotation R (fractional coords) to atom positions; uid unchanged."""
+    result = []
+    for a in atoms:
+        xyz = R @ np.array([a['x'], a['y'], a['z']])
+        result.append({**a, 'x': xyz[0], 'y': xyz[1], 'z': xyz[2]})
+    return result
+
+
+def _find_best_origin(atoms1_op0, atoms2, sg_name, n_polar=12):
+    """Find best (origin_shift, symop_idx, altindex_R, improved).
+
+    Searches (allowed_shift, operator_k) combinations.  If no improvement,
+    tries each altindex rotation (proper ops in the Laue holohedry absent from
+    the SG) on atoms2 and repeats the search.
+
+    Returns
+    -------
+    best_d      : ndarray (3,) fractional shift to apply to atoms1
+    best_k      : int         operator index in atoms2 that matches atoms1 op0
+    best_R_alt  : ndarray (3,3) or None — altindex rotation applied to atoms2
+    improved    : bool
+    """
+    key = _sg_origins_key(sg_name)
+    entries = _ORIGINS_TABLE.get(key)
+    if entries is None:
+        candidates = np.array([(dx, dy, dz)
+                                for dx in (0, .5) for dy in (0, .5) for dz in (0, .5)],
+                               dtype=float)
+    else:
+        candidates = np.array(_expand_origin_entries(entries, n_polar), dtype=float)
+
+    n_ops = 1 + max((_op_idx(a['uid']) for a in atoms2), default=0)
+
+    sh0 = _cross_op_ca_shifts(atoms1_op0, atoms2, 0)
+    if len(sh0) < 3:
+        return np.zeros(3), 0, None, False
+    ref_score = float(np.median(np.sqrt(np.sum(sh0**2, axis=1))))
+
+    def _search(atoms2_try):
+        """Inner search over all (k, candidate) pairs; returns (score, d, k)."""
+        best_s = ref_score
+        best_d = np.zeros(3)
+        best_k = 0
+        for k in range(n_ops):
+            ca_sh = _cross_op_ca_shifts(atoms1_op0, atoms2_try, k)
+            if len(ca_sh) < 3:
+                continue
+            new_sh  = ca_sh[None, :, :] - candidates[:, None, :]
+            new_sh -= np.round(new_sh)
+            medians = np.median(np.sqrt(np.sum(new_sh**2, axis=2)), axis=1)
+            i = int(np.argmin(medians))
+            if medians[i] < best_s:
+                best_s = medians[i]; best_d = candidates[i]; best_k = k
+        return best_s, best_d, best_k
+
+    best_score, best_d, best_k = _search(atoms2)
+    best_R_alt = None
+
+    if not (best_score < ref_score * 0.9):
+        for R_alt in _get_altindex_ops(sg_name):
+            atoms2_alt = _apply_rotation_to_atoms(atoms2, R_alt)
+            s, d, k = _search(atoms2_alt)
+            if s < best_score:
+                best_score = s; best_d = d; best_k = k; best_R_alt = R_alt
+
+    improved = bool(best_score < ref_score * 0.9)
+    return best_d, best_k, best_R_alt, improved
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Public API
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1191,6 +1501,29 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, fitreso=None, drop_snr=1.0,
 
     fitme, ca_mask, uids, bfacs = match_atoms(atoms1, atoms2)
 
+    # ── Origin search — only when ASU atoms show large shifts
+    op0_ca_sh = fitme[[u.endswith('_op0') and m
+                        for u, m in zip(uids, ca_mask)], 3:6]
+    if len(op0_ca_sh) and np.max(np.sqrt(np.sum(op0_ca_sh**2, axis=1))) > 0.1:
+        shift, best_k, best_R_alt, improved = _find_best_origin(
+            [a for a in atoms1 if a['uid'].endswith('_op0')], atoms2, sg1)
+        if improved and (np.any(np.abs(shift) > 1e-6) or best_k != 0
+                         or best_R_alt is not None):
+            msg = f"  origin shift: ({shift[0]:.4f}, {shift[1]:.4f}, {shift[2]:.4f}) for {sg1}"
+            if best_R_alt is not None:
+                atoms2 = _apply_rotation_to_atoms(atoms2, best_R_alt)
+                msg += f"  +altindex"
+            if best_k != 0:
+                n_ops = 1 + max(_op_idx(a['uid']) for a in atoms2)
+                atoms2 = _relabel_ops(atoms2, best_k, n_ops)
+                msg += f"  +symop_idx={best_k}"
+            print(msg, flush=True)
+            atoms1, cell1, sg1 = expand_to_p1(pdb1_path,
+                                               altloc_filter=altloc_filter,
+                                               altloc_fallback=altloc_fallback,
+                                               origin_shift=shift)
+            fitme, ca_mask, uids, bfacs = match_atoms(atoms1, atoms2)
+
     # ── Atom selection ────────────────────────────────────────────────────────
     # 'auto'     : all atoms, MAD outlier rejection applied
     # 'all'      : all atoms, no filtering
@@ -1215,14 +1548,20 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, fitreso=None, drop_snr=1.0,
     ca_mask_fit = ca_mask[fit_mask]
     uids_fit    = [u for u, k in zip(uids, fit_mask) if k]
 
-    # Report largest CA fractional shift
+    # Report largest CA fractional shift and RMS CA shift in Å after origin fix
     ca_shifts = fitme[ca_mask, 3:6]
     ca_mags   = np.sqrt(np.sum(ca_shifts**2, axis=1))
     ca_ids    = [u for u, m in zip(uids, ca_mask) if m]
     max_i     = int(np.argmax(ca_mags))
+    ca_orth   = frac_to_orth(ca_shifts, cell1)
+    ca_rmsd   = float(np.sqrt(np.mean(np.sum(ca_orth**2, axis=1))))
     print(f"largest fractional CA shift: {ca_mags[max_i]:.7f} for {ca_ids[max_i]}")
-    if ca_mags[max_i] > 0.1:
-        raise ValueError(f"Largest fractional CA shift {ca_mags[max_i]:.4f} > 0.1 cells. "
+    print(f"CA RMSD after origin fix: {ca_rmsd:.3f} Å  ({ca_mask.sum()} CA pairs)")
+    if ca_rmsd > 5.0:
+        raise ValueError(f"CA RMSD after origin fix {ca_rmsd:.3f} Å > 5.0 Å. "
+                         "Check structure alignment.")
+    if ca_mags[max_i] > 0.35:
+        raise ValueError(f"Largest fractional CA shift {ca_mags[max_i]:.4f} > 0.35 cells. "
                          "Check structure alignment.")
 
     _FINE_RESO = 1.0   # internal pool limit for nhkls mode
@@ -1256,7 +1595,6 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, fitreso=None, drop_snr=1.0,
     frac_coords = fitme_fit[:, :3]
 
     # Use symmetry-constrained fitting when all xyz dims are present and sg > P1
-    proper_ops = get_proper_symops(sg1)
     do_symm = (use_symm and len(proper_ops) > 1
                and all(d in dim_list for d in 'xyz'))
 
@@ -1384,6 +1722,31 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
     if verbose:
         print(f"{ca_mask.sum()} CA pairs", flush=True)
 
+    # ── Origin search — only when ASU atoms show large shifts
+    op0_ca_sh = fitme[[u.endswith('_op0') and m
+                        for u, m in zip(uids, ca_mask)], 3:6]
+    if len(op0_ca_sh) and np.max(np.sqrt(np.sum(op0_ca_sh**2, axis=1))) > 0.1:
+        shift, best_k, best_R_alt, improved = _find_best_origin(
+            [a for a in atoms1 if a['uid'].endswith('_op0')], atoms2, sg1)
+        if improved and (np.any(np.abs(shift) > 1e-6) or best_k != 0
+                         or best_R_alt is not None):
+            msg = f"  origin shift: ({shift[0]:.4f}, {shift[1]:.4f}, {shift[2]:.4f}) for {sg1}"
+            if best_R_alt is not None:
+                atoms2 = _apply_rotation_to_atoms(atoms2, best_R_alt)
+                msg += f"  +altindex"
+            if best_k != 0:
+                n_ops = 1 + max(_op_idx(a['uid']) for a in atoms2)
+                atoms2 = _relabel_ops(atoms2, best_k, n_ops)
+                msg += f"  +symop_idx={best_k}"
+            print(msg, flush=True)
+            atoms1, cell1, sg1 = expand_to_p1(pdb1_path,
+                                               altloc_filter=altloc_filter,
+                                               altloc_fallback=altloc_fallback,
+                                               origin_shift=shift)
+            fitme, ca_mask, uids, bfacs = match_atoms(atoms1, atoms2)
+            if verbose:
+                print(f"  after origin fix: {ca_mask.sum()} CA pairs", flush=True)
+
     # Permanent initial outlier rejection (B-factor + shift MAD)
     if verbose:
         print("rejecting outliers...", end=' ', flush=True)
@@ -1397,9 +1760,15 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
     ca_mags   = np.sqrt(np.sum(ca_shifts**2, axis=1))
     ca_ids    = [u for u, m in zip(uids, ca_mask) if m]
     max_i     = int(np.argmax(ca_mags))
+    ca_orth = frac_to_orth(ca_shifts, cell1)
+    ca_rmsd = float(np.sqrt(np.mean(np.sum(ca_orth**2, axis=1))))
     print(f"largest fractional CA shift: {ca_mags[max_i]:.7f} for {ca_ids[max_i]}", flush=True)
-    if ca_mags[max_i] > 0.1:
-        raise ValueError(f"Largest fractional CA shift {ca_mags[max_i]:.4f} > 0.1 cells. "
+    print(f"CA RMSD after origin fix: {ca_rmsd:.3f} Å  ({ca_mask.sum()} CA pairs)", flush=True)
+    if ca_rmsd > 5.0:
+        raise ValueError(f"CA RMSD after origin fix {ca_rmsd:.3f} Å > 5.0 Å. "
+                         "Check structure alignment.")
+    if ca_mags[max_i] > 0.35:
+        raise ValueError(f"Largest fractional CA shift {ca_mags[max_i]:.4f} > 0.35 cells. "
                          "Check structure alignment.")
 
     # Dimension and symmetry setup
@@ -1610,27 +1979,38 @@ def bend_apply_map(map_path, result, frac=1.0, outpath=None, delta=False):
 
 def _parse_args(argv):
     """Parse bendfinder.com-style key=value arguments."""
-    pdb1 = pdb2 = mapfile = None
+    pdb1 = pdb2 = mapfile = mtz1 = mtz2 = None
     params = {
-        'nhkls':      30,
-        'fitreso':    None,
-        'drop_snr':   1.0,
-        'frac':       1.0,
-        'geotest':    False,
-        'use_symm':   True,
-        'dimensions': 'xyz',
-        'fitparams':  None,
-        'deltamaps':  False,
+        'nhkls':          30,
+        'fitreso':        None,
+        'drop_snr':       1.0,
+        'frac':           1.0,
+        'geotest':        False,
+        'use_symm':       True,
+        'dimensions':     'xyz',
+        'fitparams':      None,
+        'deltamaps':      False,
+        'f_col':          None,
+        'phi_col':        None,
+        'run_refinement': False,
+        'refine_cycles':  5,
+        'sample_rate':    3.0,
+        'scan_dir':       None,
     }
     for arg in argv:
-        if arg.endswith('.pdb') or arg.endswith('.PDB'):
+        if arg.lower().endswith('.pdb'):
             if pdb1 is None:
                 pdb1 = arg
             elif pdb2 is None:
                 pdb2 = arg
-        elif arg.endswith('.map') or arg.endswith('.ccp4') or arg.endswith('.mrc'):
+        elif arg.lower().endswith(('.map', '.ccp4', '.mrc')):
             if mapfile is None:
                 mapfile = arg
+        elif arg.lower().endswith('.mtz'):
+            if mtz1 is None:
+                mtz1 = arg
+            elif mtz2 is None:
+                mtz2 = arg
         elif '=' in arg:
             key, _, val = arg.partition('=')
             key = key.strip()
@@ -1653,11 +2033,26 @@ def _parse_args(argv):
                 params['fitparams'] = val
             elif key in ('deltamaps', 'delta'):
                 params['deltamaps'] = True
-        elif arg in ('deltamaps', 'delta', 'nofit'):
+            elif key == 'labels':
+                parts = val.split(',')
+                if len(parts) == 2:
+                    params['f_col']   = parts[0].strip()
+                    params['phi_col'] = parts[1].strip()
+            elif key in ('run_refinement', 'refine'):
+                params['run_refinement'] = val.lower() not in ('false', '0', 'no')
+            elif key == 'refine_cycles':
+                params['refine_cycles'] = int(val)
+            elif key == 'sample_rate':
+                params['sample_rate'] = float(val)
+            elif key == 'scan_dir':
+                params['scan_dir'] = val
+        elif arg in ('deltamaps', 'delta', 'nofit', 'run_refinement', 'refine'):
             if arg in ('deltamaps', 'delta'):
                 params['deltamaps'] = True
+            elif arg in ('run_refinement', 'refine'):
+                params['run_refinement'] = True
             # nofit: ignored — lstsq always fits
-    return pdb1, pdb2, mapfile, params
+    return pdb1, pdb2, mapfile, mtz1, mtz2, params
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1822,7 +2217,10 @@ def _eval_chunked(ref_pts, hkls, AB_xyz, chunk=50000):
 
 
 def fitreso_scan(
-    mov_pdb, ref_pdb, mov_map, ref_map, scan_dir,
+    mov_pdb, ref_pdb, mov_mtz, ref_mtz, scan_dir,
+    f_col=None, phi_col=None,
+    run_refinement_flag=False, refine_cycles=5,
+    sample_rate=3.0,
     mov_fullcell=False,
     fitreso_list=(20, 15, 12, 10, 8, 7, 6, 5),
     max_hkl_scan=10,
@@ -1839,24 +2237,58 @@ def fitreso_scan(
 
     Parameters
     ----------
-    mov_pdb, ref_pdb : str   Moving and reference PDB paths (relative to cwd or absolute)
-    mov_map, ref_map : str   Moving and reference CCP4 map paths
+    mov_pdb, ref_pdb : str   Moving and reference PDB paths
+    mov_mtz, ref_mtz : str   Moving and reference MTZ paths (or CCP4 .map for compat)
     scan_dir         : str   Output directory (created if needed)
-    mov_fullcell     : bool  If True, load mov_map with read_ccp4_fullcell (lyso)
+    f_col, phi_col   : str   MTZ column overrides (default: auto-detect FWT/2FOFCWT)
+    run_refinement_flag : bool  Run refmac/phenix to generate FWT/PHWT first
+    refine_cycles    : int   Refinement cycles when run_refinement_flag=True
+    sample_rate      : float FFT oversampling for MTZ → map (default 3.0)
+    mov_fullcell     : bool  CCP4 legacy: load mov map as full unit cell
     fitreso_list     : seq   Resolution endpoints for section 3 (Å)
     max_hkl_scan     : int   Number of non-DC canonical HKLs in section 2 (default 10)
     chunk_size       : int   Voxel batch size for eval_shift_field (default 50000)
     """
     import time
 
+    _CANONICAL_F = {'FWT', '2FOFCWT'}
+
     os.makedirs(scan_dir, exist_ok=True)
 
-    # ── load maps ────────────────────────────────────────────────────────────
-    if mov_fullcell:
-        mov_d, mov_h = read_ccp4_fullcell(mov_map)
-    else:
-        mov_d, mov_h = read_ccp4(mov_map)
-    ref_d, ref_h = read_ccp4(ref_map)
+    # ── optional refinement ───────────────────────────────────────────────────
+    if run_refinement_flag:
+        if mov_mtz.lower().endswith('.mtz'):
+            mov_mtz = run_refinement(mov_pdb, mov_mtz,
+                                     outdir=os.path.join(scan_dir, 'refine_mov'),
+                                     n_cycles=refine_cycles)
+        if ref_mtz.lower().endswith('.mtz'):
+            ref_mtz = run_refinement(ref_pdb, ref_mtz,
+                                     outdir=os.path.join(scan_dir, 'refine_ref'),
+                                     n_cycles=refine_cycles)
+
+    # ── load maps ─────────────────────────────────────────────────────────────
+    def _load(path, tag, fullcell=False):
+        ext = os.path.splitext(path)[1].lower()
+        if ext == '.mtz':
+            fc, ph = detect_2fofc_cols(path, f_col, phi_col)
+            if verbose:
+                print(f'  {tag}: {os.path.basename(path)}  columns {fc}/{ph}',
+                      flush=True)
+            data, hdr = mtz_to_map_data(path, fc, ph, sample_rate=sample_rate)
+            return data, hdr, path, fc
+        if fullcell:
+            data, hdr = read_ccp4_fullcell(path)
+        else:
+            data, hdr = read_ccp4(path)
+        return data, hdr, None, None
+
+    mov_d, mov_h, mov_mtz_resolved, mov_f_col = _load(mov_mtz, 'mov',
+                                                        fullcell=mov_fullcell)
+    ref_d, ref_h, ref_mtz_resolved, ref_f_col = _load(ref_mtz, 'ref')
+
+    col_suffix = ('' if (mov_f_col is None or mov_f_col in _CANONICAL_F)
+                  else f'_{mov_f_col}')
+    pad_mode   = 'wrap' if (mov_mtz_resolved is not None or mov_fullcell) else 'reflect'
 
     ns2, nr2, nc2 = ref_h['ns'], ref_h['nr'], ref_h['nc']
     nx2, ny2, nz2 = ref_h['nx'], ref_h['ny'], ref_h['nz']
@@ -1875,18 +2307,28 @@ def fitreso_scan(
     M     = _scan_cell_matrix(ref_h)
     atoms = _scan_read_pdb_atoms_p1(ref_pdb)
 
-    # ── ref MTZ ──────────────────────────────────────────────────────────────
-    ref_mtz_path = os.path.join(scan_dir, 'ref.mtz')
-    if not os.path.exists(ref_mtz_path):
-        if verbose:
-            print('Converting ref map to MTZ...', flush=True)
-        _map2mtz(ref_map, ref_mtz_path)
+    # ── ref MTZ for Riso (FT of reference density map) ────────────────────────
+    if ref_mtz_resolved is not None:
+        # ref input is already an MTZ — use it directly for Riso
+        riso_ref_mtz = ref_mtz_resolved
+        riso_ref_col = ref_f_col
+    else:
+        riso_ref_mtz = os.path.join(scan_dir, 'ref_riso.mtz')
+        riso_ref_col = 'F'
+        if not os.path.exists(riso_ref_mtz):
+            if verbose:
+                print('Converting ref map to MTZ for Riso...', flush=True)
+            _map2mtz(ref_mtz, riso_ref_mtz)
 
     _shutil.copy(ref_pdb, os.path.join(scan_dir, 'ref.pdb'))
+    if ref_mtz_resolved:
+        _shutil.copy(ref_mtz_resolved, os.path.join(scan_dir, 'ref.mtz'))
 
     _h0  = np.zeros((0, 3), dtype=int)
     _AB0 = np.zeros((3, 0, 2))
     write_bent_pdb(mov_pdb, ref_pdb, _h0, _AB0, os.path.join(scan_dir, 'unbent.pdb'))
+    if mov_mtz_resolved:
+        _shutil.copy(mov_mtz_resolved, os.path.join(scan_dir, 'unbent.mtz'))
 
     # ── compute raw RMSD once ────────────────────────────────────────────────
     with open(os.devnull, 'w') as _dev, _contextlib.redirect_stdout(_dev):
@@ -1906,19 +2348,26 @@ def fitreso_scan(
 
     def _save_point(label, outdir, bent_map, rmsd_before, rmsd_after,
                     n_active, t_elapsed, hkls=None, AB_xyz=None):
-        write_ccp4(f'{outdir}/bent.map', bent_map, ref_h)
+        bent_map_name    = f'bent{col_suffix}.map'
+        diffnorm_name    = f'diff_norm{col_suffix}.map'
+        cootme_name      = f'cootme{col_suffix}.mtz'
+        write_ccp4(f'{outdir}/{bent_map_name}', bent_map, ref_h)
         if hkls is not None and AB_xyz is not None:
             write_bent_pdb(mov_pdb, ref_pdb, hkls, AB_xyz, f'{outdir}/bent.pdb')
         _shutil.copy(ref_pdb, f'{outdir}/ref.pdb')
         _shutil.copy(os.path.join(scan_dir, 'unbent.pdb'), f'{outdir}/unbent.pdb')
+        if ref_mtz_resolved:
+            _shutil.copy(ref_mtz_resolved, f'{outdir}/ref.mtz')
+        if mov_mtz_resolved:
+            _shutil.copy(mov_mtz_resolved, f'{outdir}/unbent.mtz')
         ref_n     = (ref_d    - ref_d.mean())    / ref_d.std()
         bent_n    = (bent_map - bent_map.mean()) / bent_map.std()
         diff      = ref_n - bent_n
         diff_norm = diff / diff.std()
-        write_ccp4(f'{outdir}/diff_norm.map', diff_norm, ref_h)
-        _write_scan_mtz(bent_map, diff, ref_h, f'{outdir}/cootme.mtz')
-        riso, kF, B = compute_riso(ref_mtz_path, 'F',
-                                   f'{outdir}/cootme.mtz', 'FDM',
+        write_ccp4(f'{outdir}/{diffnorm_name}', diff_norm, ref_h)
+        _write_scan_mtz(bent_map, diff, ref_h, f'{outdir}/{cootme_name}')
+        riso, kF, B = compute_riso(riso_ref_mtz, riso_ref_col,
+                                   f'{outdir}/{cootme_name}', 'FDM',
                                    n_cycles=riso_n_cycles,
                                    sigma_cut=riso_sigma_cut)
         peaks = _scan_find_peaks(diff_norm, ref_h, atoms, M)
@@ -1938,7 +2387,7 @@ def fitreso_scan(
     outdir0 = os.path.join(scan_dir, 'hkl00')
     os.makedirs(outdir0, exist_ok=True)
     t0 = time.time()
-    bent_vals = interpolate_map(mov_d, mov_h, ref_pts)
+    bent_vals = interpolate_map(mov_d, mov_h, ref_pts, pad_mode=pad_mode)
     bent_map0 = bent_vals.reshape(ns2, nr2, nc2)
     _save_point('hkl00', outdir0, bent_map0, raw_rmsd, raw_rmsd, 0,
                 time.time() - t0, hkls=_h0, AB_xyz=_AB0)
@@ -1957,7 +2406,7 @@ def fitreso_scan(
         outdir = os.path.join(scan_dir, label)
         os.makedirs(outdir, exist_ok=True)
         delta     = _eval_chunked(ref_pts, hkls_now, AB_xyz, chunk_size)
-        bent_vals = interpolate_map(mov_d, mov_h, ref_pts - delta)
+        bent_vals = interpolate_map(mov_d, mov_h, ref_pts - delta, pad_mode=pad_mode)
         bent_map  = bent_vals.reshape(ns2, nr2, nc2)
         _save_point(label, outdir, bent_map, raw_rmsd, rmsd,
                     int(active.sum()), time.time() - t0_cb,
@@ -1997,7 +2446,7 @@ def fitreso_scan(
         for new_i, old_i in enumerate(xyz_dims):
             AB_xyz[new_i] = result.AB[old_i]
         delta     = _eval_chunked(ref_pts, result.hkls, AB_xyz, chunk_size)
-        bent_vals = interpolate_map(mov_d, mov_h, ref_pts - delta)
+        bent_vals = interpolate_map(mov_d, mov_h, ref_pts - delta, pad_mode=pad_mode)
         bent_map  = bent_vals.reshape(ns2, nr2, nc2)
         _save_point(f'fr{fitreso}', outdir, bent_map, raw_rmsd, result.rmsd,
                     int(result.active.sum()), t_fit,
@@ -2043,7 +2492,8 @@ def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
         ref_F = ref_F[mask]
         tst_F = np.array([tdict[tuple(map(int, h))] for h in ref_hkl[mask]])
 
-        ok = (ref_F > 0) & (tst_F > 0) & np.isfinite(ref_F) & np.isfinite(tst_F)
+        with np.errstate(invalid='ignore'):
+            ok = (ref_F > 0) & (tst_F > 0) & np.isfinite(ref_F) & np.isfinite(tst_F)
         r  = ref_F[ok]
         t  = tst_F[ok]
 
@@ -2066,19 +2516,167 @@ def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
         return None, None, None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MTZ helpers — column detection, inverse FFT, and optional refinement
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CANONICAL_2FOFC_PAIRS = [('FWT', 'PHWT'), ('2FOFCWT', 'PH2FOFCWT')]
+
+
+def detect_2fofc_cols(mtz_path, f_col=None, phi_col=None):
+    """Return (f_col, phi_col) suitable for a likelihood-weighted 2Fo-Fc map.
+
+    If both f_col and phi_col are supplied, validate they exist and return them.
+    Otherwise auto-detect from canonical pairs (FWT/PHWT, then 2FOFCWT/PH2FOFCWT).
+    Raises ValueError with a helpful message if no acceptable columns are found.
+    """
+    mtz    = gemmi.read_mtz_file(mtz_path)
+    labels = {c.label for c in mtz.columns}
+
+    if f_col is not None and phi_col is not None:
+        for c in (f_col, phi_col):
+            if c not in labels:
+                raise ValueError(
+                    f"Column '{c}' not found in {mtz_path}; "
+                    f"available: {sorted(labels)}")
+        return f_col, phi_col
+
+    for f, ph in _CANONICAL_2FOFC_PAIRS:
+        if f in labels and ph in labels:
+            return f, ph
+
+    raise ValueError(
+        f"No likelihood-weighted 2Fo-Fc columns in {mtz_path}.\n"
+        f"Tried: {_CANONICAL_2FOFC_PAIRS}\n"
+        f"Available: {sorted(labels)}\n"
+        f"Use labels=F,PHI (CLI) to specify columns, "
+        f"or use run_refinement to generate FWT/PHWT first.")
+
+
+def mtz_to_map_data(mtz_path, f_col, phi_col, sample_rate=3.0):
+    """Inverse-FFT an MTZ F/PHI column pair; return (ndarray, header_dict).
+
+    The returned header matches the read_ccp4 format: full unit cell
+    (starts=0, mapc=1/mapr=2/maps=3).  No mov_fullcell workaround needed.
+    """
+    mtz  = gemmi.read_mtz_file(mtz_path)
+    grid = mtz.transform_f_phi_to_map(f_col, phi_col, sample_rate=sample_rate)
+    # gemmi gives (nu, nv, nw) = (na, nb, nc); CCP4 with MAPC=1/MAPR=2/MAPS=3
+    # stores data as (sections=c, rows=b, cols=a) = (nw, nv, nu)
+    arr  = np.array(grid, copy=False)
+    nu, nv, nw = arr.shape
+    data = arr.transpose(2, 1, 0).copy()   # → (nw, nv, nu) = (ns, nr, nc)
+    cell = grid.unit_cell
+    hdr  = dict(
+        nc=nu, nr=nv, ns=nw,
+        nx=nu, ny=nv, nz=nw,
+        ncstart=0, nrstart=0, nsstart=0,
+        mapc=1, mapr=2, maps=3,
+        cell=(cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma),
+        spacegroup=grid.spacegroup.number if grid.spacegroup else 1,
+    )
+    return data, hdr
+
+
+def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
+    """Run refmac5 or phenix.refine on pdb_path+mtz_path; return refined MTZ path.
+
+    Tries refmac5 first ($CCP4/bin or PATH), then phenix.refine.
+    Calls sys.exit(1) if both fail.
+    """
+    import shutil as _sh2
+    os.makedirs(outdir, exist_ok=True)
+    stem    = os.path.splitext(os.path.basename(pdb_path))[0]
+    out_pdb = os.path.join(outdir, f'{stem}_refined.pdb')
+    out_mtz = os.path.join(outdir, f'{stem}_refined.mtz')
+
+    # ── refmac5 ──────────────────────────────────────────────────────────────
+    refmac = (_sh2.which('refmac5')
+              or os.path.join(os.environ.get('CCP4', ''), 'bin', 'refmac5'))
+    if refmac and os.path.exists(refmac):
+        mtz_in = gemmi.read_mtz_file(mtz_path)
+        cols   = {c.label for c in mtz_in.columns}
+        fp     = next((l for l in ('FP', 'F', 'FOBS')              if l in cols), None)
+        sigfp  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS')     if l in cols), None)
+        free   = next((l for l in ('FREE', 'RFREE', 'FreeR_flag')   if l in cols), None)
+        if fp and sigfp:
+            labin  = f'FP={fp} SIGFP={sigfp}' + (f' FREE={free}' if free else '')
+            script = f'NCYC {n_cycles}\nLABIN {labin}\nEND\n'
+            cmd    = [refmac, 'xyzin', pdb_path, 'xyzout', out_pdb,
+                      'hklin', mtz_path, 'hklout', out_mtz]
+            print(f'  run_refinement: {os.path.basename(refmac)} ({n_cycles} cycles)...',
+                  flush=True)
+            r = subprocess.run(cmd, input=script, capture_output=True, text=True)
+            if r.returncode == 0 and os.path.exists(out_mtz):
+                print(f'  refmac5 done → {out_mtz}', flush=True)
+                return out_mtz
+            print(f'  refmac5 failed (rc={r.returncode}):\n{r.stderr[-1000:]}',
+                  file=sys.stderr)
+
+    # ── phenix.refine ─────────────────────────────────────────────────────────
+    phenix = _sh2.which('phenix.refine')
+    if phenix:
+        cmd = [phenix, pdb_path, mtz_path,
+               f'refinement.main.cycles={n_cycles}',
+               f'output.prefix={os.path.join(outdir, stem)}']
+        print(f'  run_refinement: phenix.refine ({n_cycles} cycles)...', flush=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=outdir)
+        candidate = os.path.join(outdir, f'{stem}_refine_001.mtz')
+        if r.returncode == 0 and os.path.exists(candidate):
+            print(f'  phenix.refine done → {candidate}', flush=True)
+            return candidate
+        print(f'  phenix.refine failed (rc={r.returncode}):\n{r.stderr[-1000:]}',
+              file=sys.stderr)
+
+    print('ERROR: neither refmac5 nor phenix.refine succeeded.\n'
+          'Provide a refined MTZ with FWT/PHWT or 2FOFCWT/PH2FOFCWT.',
+          file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
     argv = sys.argv[1:]
     if not argv or argv[0] in ('-h', '--help'):
         print(__doc__)
         sys.exit(0)
 
-    pdb1, pdb2, mapfile, p = _parse_args(argv)
+    pdb1, pdb2, mapfile, mtz1, mtz2, p = _parse_args(argv)
 
     if pdb1 is None or pdb2 is None:
         print("ERROR: provide two PDB files on the command line.", file=sys.stderr)
         sys.exit(1)
 
-    # Optionally load pre-computed fitparams
+    # ── MTZ handling: optional refinement, column detection ──────────────────
+    mov_mtz = mtz1
+    ref_mtz = mtz2
+
+    if mov_mtz and p['run_refinement']:
+        mov_mtz = run_refinement(pdb1, mov_mtz, outdir='refine_mov',
+                                 n_cycles=p['refine_cycles'])
+    if ref_mtz and p['run_refinement']:
+        ref_mtz = run_refinement(pdb2, ref_mtz, outdir='refine_ref',
+                                 n_cycles=p['refine_cycles'])
+
+    col_suffix = ''
+    if mov_mtz:
+        f_col, phi_col = detect_2fofc_cols(mov_mtz, p['f_col'], p['phi_col'])
+        print(f"moving MTZ: {os.path.basename(mov_mtz)}  columns {f_col}/{phi_col}",
+              flush=True)
+        _CANONICAL_F = {'FWT', '2FOFCWT'}
+        col_suffix = '' if f_col in _CANONICAL_F else f'_{f_col}'
+
+    # ── fitreso_scan mode ────────────────────────────────────────────────────
+    if p['scan_dir']:
+        mov_src = mov_mtz or mapfile
+        ref_src = ref_mtz or mapfile
+        if mov_src is None or ref_src is None:
+            print("ERROR: scan_dir requires two map/MTZ inputs.", file=sys.stderr)
+            sys.exit(1)
+        fitreso_scan(pdb1, pdb2, mov_src, ref_src, p['scan_dir'],
+                     f_col=p['f_col'], phi_col=p['phi_col'])
+        sys.exit(0)
+
+    # ── single fit ───────────────────────────────────────────────────────────
     if p['fitparams'] and os.path.exists(p['fitparams']):
         print(f"loading fitparams from {p['fitparams']}")
         hkls, AB, active, snr, cell1, cell2, dims, rmsd0 = load_fitparams(p['fitparams'])
@@ -2093,7 +2691,6 @@ def main():
         )
         nhkls = int(result.active.sum())
 
-        # Save fitparams
         fp_path = save_fitparams(
             'psdvf', result.hkls, result.AB, result.active, result.snr,
             result.cell1, result.cell2, result.dimensions, result.rmsd)
@@ -2129,13 +2726,20 @@ def main():
         except FileNotFoundError:
             print("refmac5 not found — skipping geotest")
 
-    # Bent map
-    if mapfile:
+    # Bent map — from MTZ or CCP4 map
+    if mov_mtz:
+        mov_d, mov_h = mtz_to_map_data(mov_mtz, f_col, phi_col,
+                                        sample_rate=p['sample_rate'])
+        bent_map_out = f"bent{nhkls}{col_suffix}.map"
+        _make_bent_map_data(mov_d, mov_h, hkls, AB_xyz, bent_map_out, cell2=cell2)
+        if p['deltamaps']:
+            _make_delta_maps_hdr(mov_h, hkls, AB_xyz, nhkls)
+    elif mapfile:
         if not os.path.exists(mapfile):
             print(f"WARNING: map file not found: {mapfile}", file=sys.stderr)
         else:
-            bent_map = f"bent{nhkls}.map"
-            make_bent_map(mapfile, hkls, AB_xyz, bent_map, cell2=cell2)
+            bent_map_out = f"bent{nhkls}.map"
+            make_bent_map(mapfile, hkls, AB_xyz, bent_map_out, cell2=cell2)
             if p['deltamaps']:
                 make_delta_maps(mapfile, hkls, AB_xyz, nhkls)
 
