@@ -130,6 +130,8 @@ Callers (`bend_fit`, `bend_fit_progressive`) unpack all 4 values and print: `ori
 1. **CA RMSD > 5 Å** — RMS orthogonal shift over all remaining CA pairs. Printed as `CA RMSD after origin fix: X.XXX Å`. Raises error if > 5 Å; a correctly aligned pair should always be below this even for large conformational changes. (Insulin T→R: 2.417 Å.)
 2. **Largest fractional CA shift > 0.35 cells** (~16 Å for a 47 Å cell). Raised from the old 0.1 threshold to accommodate genuine large differences (e.g. insulin LEU B6, 0.165 fractional ≈ 8 Å). Values >0.35 indicate gross misalignment.
 
+**Large cell-change failure mode**: `_find_best_origin` scores candidate alignments by median *fractional* shift magnitude. This breaks when the two crystal forms have significantly different cell dimensions, because the same fractional shift corresponds to different Cartesian distances in the two cells — a 10.9% difference in a/b (porin 3poq a=77.31 Å → 3pou a=85.71 Å) makes the fractional comparison unreliable. `origins.com` has the same limitation and also fails for this pair (best RMSD 32–42 Å depending on whether all atoms or CA-only are used). The correct approach for large cell changes is to compare in **Cartesian space**: expand the subject structure to all N symop copies in Cartesian (using the subject cell), Kabsch-align each copy to the reference Cartesian coordinates, and pick the minimum RMSD copy. For porin, this gives 0.526 Å CA RMSD using symop `x-y+2/3,-y+1/3,-z+1/3`. **TODO**: `_find_best_origin` needs to be extended to fall back to Cartesian comparison when the two cells differ by more than ~5% in any axis.
+
 ## Cubic b-spline boundary fix (interpolate_map)
 
 `scipy.ndimage.map_coordinates` with `order=3, mode='wrap'` can produce overshoot at cell boundaries if adjacent grid rows have large density gradients. This creates spikes in difference maps at x=0, y=0, z=0.
@@ -238,6 +240,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxm | P4₃2₁2 | 984 | — | — | 11.0% |
 | Raddam 5kxk→5kxn | P4₃2₁2 | ~992 | — | — | — |
 | Insulin 4fg3→4e7u | H3 | 534 | 1.063 Å | 68.7% | 83.7% |
+| Porin 3poq→3pou | H32 | 340 | pending | pending | pending |
 
 Notes:
 - Lyso Rfac plateaus at ~33% by fr20 and barely changes with higher resolution — real structural differences remain in the diff map (A/74ASN/O is the persistent −10σ peak).
@@ -245,3 +248,4 @@ Notes:
 - Raddam Rfac *starts* low (13–11%) because the fc maps are nearly identical; huge water peaks (±30–65σ) reflect water molecules appearing/disappearing with radiation dose.
 - Myoglobin Rfac pending (gemmi map2mtz re-run in progress); heme iron dominates diff map throughout (±35σ at A/154HEM/FE).
 - Insulin: high Rfac (68.7%) and high residual RMSD (1.063 Å) reflect genuine T→R conformational change — LEU B6 shifts ~8 Å between T-state (4fg3) and R-state (4e7u), which is outside the smooth shift-field model. RMSD best at fr10 (0.988 Å, 401 HKLs); OD limit hit at 501 HKLs for fr8–fr5. Dominant diff peaks: +34σ at D/101ZN/ZN (zinc position differs), −10σ at waters/SCN.
+- Porin: `_find_best_origin` fails (CA RMSD 53.7 Å after best fractional-space origin fix) because the 10.9% a/b cell difference (3poq a=77.31, 3pou a=85.71 Å) makes fractional comparison unreliable. Cartesian Kabsch alignment over all 6 H32 symop copies finds 0.526 Å CA RMSD using symop `x-y+2/3,-y+1/3,-z+1/3`. Scan pending fix to `_find_best_origin` (Cartesian comparison fallback for large cell changes).
