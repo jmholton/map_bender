@@ -2342,9 +2342,13 @@ def fitreso_scan(
 
     # ── print header ─────────────────────────────────────────────────────────
     if verbose:
-        print(f"\n{'label':>7}  {'RMSD0':>6}  {'RMSD':>6}  {'active':>6}  {'RFAC':>6}  "
+        print(f"\n{'label':>7}  {'RMSD0':>6}  {'RMSD':>6}  {'active':>6}  "
+              f"{'Rbent':>6}  {'Rbend':>6}  "
               f"{'peak+':>7}  {'atom+':>20}  {'peak-':>7}  {'atom-':>20}", flush=True)
-        print('-' * 122, flush=True)
+        print('-' * 130, flush=True)
+
+    # Path to the hkl00 (unbent-resampled) cootme MTZ — set after first _save_point
+    _unbent_cootme = [None]
 
     def _save_point(label, outdir, bent_map, rmsd_before, rmsd_after,
                     n_active, t_elapsed, hkls=None, AB_xyz=None):
@@ -2370,15 +2374,25 @@ def fitreso_scan(
                                    f'{outdir}/{cootme_name}', 'FDM',
                                    n_cycles=riso_n_cycles,
                                    sigma_cut=riso_sigma_cut)
+        # Rbend = R-factor of bent map vs unbent-resampled map (how much bending changed it)
+        if _unbent_cootme[0] is None:
+            rbend = 0.0  # hkl00 row: bent IS unbent
+            _unbent_cootme[0] = f'{outdir}/{cootme_name}'
+        else:
+            rbend, _, _ = compute_riso(_unbent_cootme[0], 'FDM',
+                                        f'{outdir}/{cootme_name}', 'FDM',
+                                        n_cycles=riso_n_cycles,
+                                        sigma_cut=riso_sigma_cut)
         peaks = _scan_find_peaks(diff_norm, ref_h, atoms, M)
         p_pos = peaks['pos']
         p_neg = peaks['neg']
-        rfac_str   = f'{riso*100:.1f}%' if riso is not None else '  N/A'
+        rbent_str  = f'{riso*100:.1f}%'  if riso  is not None else '  N/A'
+        rbend_str  = f'{rbend*100:.1f}%' if rbend is not None else '  N/A'
         before_str = f'{rmsd_before:.3f}' if rmsd_before is not None else '  ---'
         after_str  = f'{rmsd_after:.3f}'  if rmsd_after  is not None else '  ---'
         if verbose:
             print(f"{label:>7}  {before_str:>6}  {after_str:>6}  {n_active:>6d}  "
-                  f"{rfac_str:>6}  "
+                  f"{rbent_str:>6}  {rbend_str:>6}  "
                   f"{p_pos[0]:>+7.2f}σ  {_atom_label(p_pos[1]):>20} {p_pos[2]:.2f}Å  "
                   f"{p_neg[0]:>+7.2f}σ  {_atom_label(p_neg[1]):>20} {p_neg[2]:.2f}Å  "
                   f"[{t_elapsed:.0f}s]", flush=True)
