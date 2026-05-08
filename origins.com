@@ -26,6 +26,8 @@ set skip_noid = 1
 
 mkdir -p ${CCP4_SCR} >&! /dev/null
 set tempfile = ${CCP4_SCR}/origins_temp$$
+# Use gemmi-based sfall replacement (no CCP4 sfall binary needed)
+set SFALL = "ccp4-python ${0:h}/sfall_gemmi.py"
 if($?debug) set tempfile = ./origins_temp
 ################################################################################
 goto Setup
@@ -220,7 +222,7 @@ cat ${tempfile}.pdb |\
 awk '/^ATOM|^HETAT/{$0="ATOM      1  CA  ALA     1    "substr($0,31,25)" 1.00  5.00"}\
      /^ANIS/{next} {print}' |\
 cat >! ${tempfile}mapme.pdb
-sfall xyzin ${tempfile}mapme.pdb mapout ${tempfile}right.map << EOF-sfall > /dev/null
+$SFALL xyzin ${tempfile}mapme.pdb mapout ${tempfile}right.map << EOF-sfall > /dev/null
 MODE ATMMAP
 CELL $fakeCELL
 SYMM $CCSG
@@ -241,7 +243,7 @@ foreach reindexing ( $reindexings )
     BFACTOR 80
 EOF
 
-    sfall xyzin ${tempfile}reindexed.pdb mapout ${tempfile}test_${n}.map << EOF > /dev/null
+    $SFALL xyzin ${tempfile}reindexed.pdb mapout ${tempfile}test_${n}.map << EOF > /dev/null
     mode atmmap
     resolution 3
     GRID $coarseGRID
@@ -300,7 +302,7 @@ endif
 # first, make a reference mtz file for wrong_pdb expanded to P1
 echo CELL $wrong_cell |\
   pdbset xyzin ${tempfile}reindexme.pdb xyzout ${tempfile}ref.pdb > /dev/null
-sfall xyzin ${tempfile}ref.pdb hklout ${tempfile}sfalled.mtz << EOF > /dev/null
+$SFALL xyzin ${tempfile}ref.pdb hklout ${tempfile}sfalled.mtz << EOF > /dev/null
 mode sfcalc xyzin
 resolution 3
 symm $SG
@@ -568,7 +570,7 @@ INPUT FRAC
 OUTPUT PDB ORTH 1
 END
 EOF-conv
-    sfall xyzin ${tempfile}originmask.pdb hklout ${tempfile}originmask.mtz << EOF-sfall > /dev/null
+    $SFALL xyzin ${tempfile}originmask.pdb hklout ${tempfile}originmask.mtz << EOF-sfall > /dev/null
 MODE sfcalc xyzin
 CELL $CELL
 SYMM 1
@@ -613,7 +615,7 @@ EOF
     egrep "^CRYST1|^ATOM|^HETAT" ${tempfile}.pdb |\
     awk '/^ATOM|^HETAT/{$0="ATOM      1  CA  ALA     1    "substr($0,31,25)" 1.00 80.00"} {print}' |\
     cat >! ${tempfile}mapme.pdb
-    sfall xyzin ${tempfile}mapme.pdb hklout ${tempfile}right.mtz << EOF-sfall >! ${tempfile}.log
+    $SFALL xyzin ${tempfile}mapme.pdb hklout ${tempfile}right.mtz << EOF-sfall >! ${tempfile}.log
     MODE sfcalc xyzin
     CELL $right_cell
     SYMM $SG
@@ -629,7 +631,7 @@ EOF-sfall
     egrep "^CRYST1|^ATOM|^HETAT" ${tempfile}.pdb |\
     awk '/^ATOM|^HETAT/{$0="ATOM      1  CA  ALA     1    "substr($0,31,25)" 1.00 80.00"} {print}' |\
     cat >! ${tempfile}mapme.pdb
-    sfall xyzin ${tempfile}mapme.pdb hklout ${tempfile}wrong.mtz << EOF-sfall >! ${tempfile}.log
+    $SFALL xyzin ${tempfile}mapme.pdb hklout ${tempfile}wrong.mtz << EOF-sfall >! ${tempfile}.log
     MODE sfcalc xyzin
     CELL $CELL
     SYMM $SG
@@ -823,7 +825,7 @@ if($?CORRELATE) then
         cat ${tempfile}.pdb |\
         awk '/^ATOM|^HETAT/{$0="ATOM      1  CA  ALA     1    "substr($0,31,25)" 1.00  5.00"} {print}' |\
         cat >! ${tempfile}mapme.pdb
-        sfall xyzin ${tempfile}mapme.pdb mapout ${tempfile}right.map << EOF-sfall > /dev/null
+        $SFALL xyzin ${tempfile}mapme.pdb mapout ${tempfile}right.map << EOF-sfall > /dev/null
         MODE ATMMAP
         CELL $fakeCELL
         SYMM $CCSG
@@ -844,7 +846,7 @@ EOF-sfall
       print "ATOM      0  CA  SHT     0       0.000   0.000   0.000 -0.01 99.00";}\
          {print}' |\
     cat >! ${tempfile}mapme.pdb
-    sfall xyzin ${tempfile}mapme.pdb mapout ${tempfile}right.map << EOF-sfall > /dev/null
+    $SFALL xyzin ${tempfile}mapme.pdb mapout ${tempfile}right.map << EOF-sfall > /dev/null
     MODE ATMMAP
     CELL $right_cell
     SYMM $CCSG
@@ -1042,7 +1044,7 @@ EOF
              {print}' |\
         cat >! ${tempfile}mapme.pdb
         # create a map of these atoms
-        sfall xyzin ${tempfile}mapme.pdb mapout ${tempfile}moved.map << EOF-sfall > /dev/null
+        $SFALL xyzin ${tempfile}mapme.pdb mapout ${tempfile}moved.map << EOF-sfall > /dev/null
         MODE ATMMAP
         CELL $CELL
         SYMM $CCSG
@@ -1250,7 +1252,7 @@ if($?CORRELATE) then
       print "ATOM      0  CA  SHT     0       0.000   0.000   0.000 -0.01 99.00";}\
          {print}' |\
     cat >> ${tempfile}mapme.pdb
-    sfall xyzin ${tempfile}mapme.pdb mapout ${tempfile}right.map << EOF-sfall > $logfile
+    $SFALL xyzin ${tempfile}mapme.pdb mapout ${tempfile}right.map << EOF-sfall > $logfile
     MODE ATMMAP
 #    CELL $right_cell
     CELL $CELL
@@ -1264,7 +1266,7 @@ EOF-sfall
     set GRID = `echo "GO" | mapdump MAPIN ${tempfile}right.map | awk '/Grid sampling/{print $(NF-2), $(NF-1), $NF; exit}'`
 
     # calculate the "label" map so we can assign atom-specific correlations
-    sfall xyzin ${tempfile}mapme.pdb mapout ${tempfile}label.map << EOF-sfall >> $logfile
+    $SFALL xyzin ${tempfile}mapme.pdb mapout ${tempfile}label.map << EOF-sfall >> $logfile
     MODE ATMMAP RESMOD
     CELL $CELL
     SYMM $SG
@@ -1285,7 +1287,7 @@ EOF-sfall
     cat $outfile |\
     awk '/^ATOM|^HETAT/{++n;printf "code %04d %s\n",n,$0}' |\
     cat >! ${tempfile}wrong_atomcodes.txt
-    sfall xyzin ${tempfile}mapme.pdb mapout ${tempfile}moved.map << EOF-sfall > $logfile
+    $SFALL xyzin ${tempfile}mapme.pdb mapout ${tempfile}moved.map << EOF-sfall > $logfile
     MODE ATMMAP
     CELL $CELL
     SYMM $SG
@@ -1293,7 +1295,7 @@ EOF-sfall
 EOF-sfall
 # why do they make me do these things... sfall map can sometimes be too small
 #dd if=/dev/zero bs=1024 count=10000 >>& ${tempfile}moved.map
-#    sfall xyzin ${tempfile}mapme.pdb HKLOUT ${tempfile}moved.mtz << EOF-sfall > $logfile
+#    $SFALL xyzin ${tempfile}mapme.pdb HKLOUT ${tempfile}moved.mtz << EOF-sfall > $logfile
 #    MODE SFCALC XYZIN
 #    CELL $CELL
 #    SYMM $CCSG

@@ -2342,10 +2342,10 @@ def fitreso_scan(
 
     # ── print header ─────────────────────────────────────────────────────────
     if verbose:
-        print(f"\n{'label':>7}  {'RMSD0':>6}  {'RMSD':>6}  {'active':>6}  "
+        print(f"\n{'label':>7}  {'RMSD':>6}  {'active':>6}  "
               f"{'Rbent':>6}  {'Rbend':>6}  "
-              f"{'peak+':>7}  {'atom+':>20}  {'peak-':>7}  {'atom-':>20}", flush=True)
-        print('-' * 130, flush=True)
+              f"{'peak':>7}  {'atom':>20}", flush=True)
+        print('-' * 80, flush=True)
 
     # Path to the hkl00 (unbent-resampled) cootme MTZ — set after first _save_point
     _unbent_cootme = [None]
@@ -2384,17 +2384,15 @@ def fitreso_scan(
                                         n_cycles=riso_n_cycles,
                                         sigma_cut=riso_sigma_cut)
         peaks = _scan_find_peaks(diff_norm, ref_h, atoms, M)
-        p_pos = peaks['pos']
-        p_neg = peaks['neg']
+        # largest peak by absolute σ (sign preserved)
+        p_top = peaks['pos'] if abs(peaks['pos'][0]) >= abs(peaks['neg'][0]) else peaks['neg']
         rbent_str  = f'{riso*100:.1f}%'  if riso  is not None else '  N/A'
         rbend_str  = f'{rbend*100:.1f}%' if rbend is not None else '  N/A'
-        before_str = f'{rmsd_before:.3f}' if rmsd_before is not None else '  ---'
         after_str  = f'{rmsd_after:.3f}'  if rmsd_after  is not None else '  ---'
         if verbose:
-            print(f"{label:>7}  {before_str:>6}  {after_str:>6}  {n_active:>6d}  "
+            print(f"{label:>7}  {after_str:>6}  {n_active:>6d}  "
                   f"{rbent_str:>6}  {rbend_str:>6}  "
-                  f"{p_pos[0]:>+7.2f}σ  {_atom_label(p_pos[1]):>20} {p_pos[2]:.2f}Å  "
-                  f"{p_neg[0]:>+7.2f}σ  {_atom_label(p_neg[1]):>20} {p_neg[2]:.2f}Å  "
+                  f"{p_top[0]:>+7.2f}σ  {_atom_label(p_top[1]):>20} {p_top[2]:.2f}Å  "
                   f"[{t_elapsed:.0f}s]", flush=True)
 
     # ── Section 1: hkl00 — zero shift ────────────────────────────────────────
