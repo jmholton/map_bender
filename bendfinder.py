@@ -2220,7 +2220,7 @@ def fitreso_scan(
     mov_pdb, ref_pdb, mov_mtz, ref_mtz, scan_dir,
     f_col=None, phi_col=None,
     run_refinement_flag=False, refine_cycles=5,
-    sample_rate=3.0,
+    sample_rate=5.0,
     mov_fullcell=False,
     fitreso_list=(20, 15, 12, 10, 8, 7, 6, 5),
     max_hkl_scan=10,
@@ -2243,7 +2243,7 @@ def fitreso_scan(
     f_col, phi_col   : str   MTZ column overrides (default: auto-detect FWT/2FOFCWT)
     run_refinement_flag : bool  Run refmac/phenix to generate FWT/PHWT first
     refine_cycles    : int   Refinement cycles when run_refinement_flag=True
-    sample_rate      : float FFT oversampling for MTZ → map (default 3.0)
+    sample_rate      : float FFT oversampling for MTZ → map (default 5.0)
     mov_fullcell     : bool  CCP4 legacy: load mov map as full unit cell
     fitreso_list     : seq   Resolution endpoints for section 3 (Å)
     max_hkl_scan     : int   Number of non-DC canonical HKLs in section 2 (default 10)
