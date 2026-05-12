@@ -2320,15 +2320,21 @@ def fitreso_scan(
                 print('Converting ref map to MTZ for Riso...', flush=True)
             _map2mtz(ref_mtz, riso_ref_mtz)
 
-    _shutil.copy(ref_pdb, os.path.join(scan_dir, 'ref.pdb'))
+    def _relsymlink_dir(src, dst):
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        os.symlink(os.path.relpath(src, os.path.dirname(dst)), dst)
+    _relsymlink_dir(os.path.abspath(ref_pdb), os.path.join(scan_dir, 'ref.pdb'))
     if ref_mtz_resolved:
-        _shutil.copy(ref_mtz_resolved, os.path.join(scan_dir, 'ref.mtz'))
+        _relsymlink_dir(os.path.abspath(ref_mtz_resolved),
+                         os.path.join(scan_dir, 'ref.mtz'))
 
     _h0  = np.zeros((0, 3), dtype=int)
     _AB0 = np.zeros((3, 0, 2))
     write_bent_pdb(mov_pdb, ref_pdb, _h0, _AB0, os.path.join(scan_dir, 'unbent.pdb'))
     if mov_mtz_resolved:
-        _shutil.copy(mov_mtz_resolved, os.path.join(scan_dir, 'unbent.mtz'))
+        _relsymlink_dir(os.path.abspath(mov_mtz_resolved),
+                         os.path.join(scan_dir, 'unbent.mtz'))
 
     # ── compute raw RMSD once ────────────────────────────────────────────────
     with open(os.devnull, 'w') as _dev, _contextlib.redirect_stdout(_dev):
@@ -2358,12 +2364,17 @@ def fitreso_scan(
         write_ccp4(f'{outdir}/{bent_map_name}', bent_map, ref_h)
         if hkls is not None and AB_xyz is not None:
             write_bent_pdb(mov_pdb, ref_pdb, hkls, AB_xyz, f'{outdir}/bent.pdb')
-        _shutil.copy(ref_pdb, f'{outdir}/ref.pdb')
-        _shutil.copy(os.path.join(scan_dir, 'unbent.pdb'), f'{outdir}/unbent.pdb')
+        def _relsymlink(src, dst):
+            if os.path.lexists(dst):
+                os.unlink(dst)
+            os.symlink(os.path.relpath(src, os.path.dirname(dst)), dst)
+        _relsymlink(os.path.abspath(ref_pdb), f'{outdir}/ref.pdb')
+        _relsymlink(os.path.abspath(os.path.join(scan_dir, 'unbent.pdb')),
+                    f'{outdir}/unbent.pdb')
         if ref_mtz_resolved:
-            _shutil.copy(ref_mtz_resolved, f'{outdir}/ref.mtz')
+            _relsymlink(os.path.abspath(ref_mtz_resolved), f'{outdir}/ref.mtz')
         if mov_mtz_resolved:
-            _shutil.copy(mov_mtz_resolved, f'{outdir}/unbent.mtz')
+            _relsymlink(os.path.abspath(mov_mtz_resolved), f'{outdir}/unbent.mtz')
         ref_n     = (ref_d    - ref_d.mean())    / ref_d.std()
         bent_n    = (bent_map - bent_map.mean()) / bent_map.std()
         diff      = ref_n - bent_n
