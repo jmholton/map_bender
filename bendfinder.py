@@ -2430,9 +2430,10 @@ def fitreso_scan(
             os.unlink(dst)
         os.symlink(os.path.relpath(src, os.path.dirname(dst)), dst)
     _relsymlink_dir(os.path.abspath(ref_pdb), os.path.join(scan_dir, 'ref.pdb'))
-    if ref_mtz_resolved:
-        _relsymlink_dir(os.path.abspath(ref_mtz_resolved),
-                         os.path.join(scan_dir, 'ref.mtz'))
+    # ref.mtz: always a symlink — riso_ref_mtz is either the user-supplied ref MTZ
+    # or the FFT'd-from-CCP4-map fallback we constructed above.
+    _relsymlink_dir(os.path.abspath(riso_ref_mtz),
+                     os.path.join(scan_dir, 'ref.mtz'))
 
     _h0  = np.zeros((0, 3), dtype=int)
     _AB0 = np.zeros((3, 0, 2))
@@ -2500,8 +2501,7 @@ def fitreso_scan(
         _relsymlink(os.path.abspath(ref_pdb), f'{outdir}/ref.pdb')
         _relsymlink(os.path.abspath(os.path.join(scan_dir, 'unbent.pdb')),
                     f'{outdir}/unbent.pdb')
-        if ref_mtz_resolved:
-            _relsymlink(os.path.abspath(ref_mtz_resolved), f'{outdir}/ref.mtz')
+        _relsymlink(os.path.abspath(riso_ref_mtz), f'{outdir}/ref.mtz')
         # unbent.mtz: chain through scan_dir/unbent.mtz → hkl00/cootme.mtz so
         # that "unbent" (mov density resampled in ref frame) lines up with
         # unbent.pdb (mov atoms with origin shift) inside Coot.
@@ -2548,14 +2548,19 @@ def fitreso_scan(
     _save_point('hkl00', outdir0, bent_map0, hkl00_rmsd, hkl00_rmsd, 0,
                 time.time() - t0, hkls=_h0, AB_xyz=_AB0)
     # unbent.mtz: the (post-resolve) moving MTZ — already in the ref crystal
-    # frame.  No reciprocal-space transform needed; symlink directly.
+    # frame.  For MTZ input, symlink to the post-resolve mov MTZ.  For CCP4
+    # input, FFT the input map directly so unbent.mtz is the FT of the moving
+    # density in the moving's own cell/SG (no reciprocal-space cross-frame
+    # transform; the cootme.mtz FDM column carries the ref-frame view).
     if mov_mtz_resolved is not None:
         _relsymlink_dir(os.path.abspath(mov_mtz_resolved),
                          os.path.join(scan_dir, 'unbent.mtz'))
     else:
-        _hkl00_cootme = f'cootme{col_suffix}.mtz'
-        _relsymlink_dir(os.path.abspath(os.path.join(outdir0, _hkl00_cootme)),
-                         os.path.join(scan_dir, 'unbent.mtz'))
+        unbent_mtz_path = os.path.join(scan_dir, 'unbent.mtz')
+        if not os.path.exists(unbent_mtz_path):
+            if verbose:
+                print(f'  Converting mov map → MTZ for unbent.mtz...', flush=True)
+            _map2mtz(mov_mtz, unbent_mtz_path)
 
     # ── Section 2: hkl01..hklNN — progressive, one canon HKL at a time ───────
     _last_hkl_n = [0]   # track last n_non_dc saved; list so closure can mutate
