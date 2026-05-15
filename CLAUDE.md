@@ -126,11 +126,7 @@ _ALTINDEX_CANDIDATES = {
 
 Callers (`bend_fit`, `bend_fit_progressive`) unpack all 4 values and print: `origin shift: (x, y, z) for SG  +altindex  +symop_idx=k`.
 
-**CA shift sanity checks** (both in `bend_fit` and `bend_fit_progressive`): After outlier rejection, two checks run:
-1. **CA RMSD > 5 Å** — RMS orthogonal shift over all remaining CA pairs. Printed as `CA RMSD after origin fix: X.XXX Å`. Raises error if > 5 Å; a correctly aligned pair should always be below this even for large conformational changes. (Insulin T→R: 2.417 Å.)
-2. **Largest fractional CA shift > 0.35 cells** (~16 Å for a 47 Å cell). Raised from the old 0.1 threshold to accommodate genuine large differences (e.g. insulin LEU B6, 0.165 fractional ≈ 8 Å). Values >0.35 indicate gross misalignment.
-
-**Large cell-change failure mode**: `_find_best_origin` scores candidate alignments by median *fractional* shift magnitude. This breaks when the two crystal forms have significantly different cell dimensions, because the same fractional shift corresponds to different Cartesian distances in the two cells — a 10.9% difference in a/b (porin 3poq a=77.31 Å → 3pou a=85.71 Å) makes the fractional comparison unreliable. `origins.com` has the same limitation and also fails for this pair (best RMSD 32–42 Å depending on whether all atoms or CA-only are used). The correct approach for large cell changes is to compare in **Cartesian space**: expand the subject structure to all N symop copies in Cartesian (using the subject cell), Kabsch-align each copy to the reference Cartesian coordinates, and pick the minimum RMSD copy. For porin, this gives 0.526 Å CA RMSD using symop `x-y+2/3,-y+1/3,-z+1/3`. **TODO**: `_find_best_origin` needs to be extended to fall back to Cartesian comparison when the two cells differ by more than ~5% in any axis.
+**CA shift sanity check**: After outlier rejection, if the largest fractional CA shift among remaining atoms exceeds **0.35 cells** (~16 Å for a 47 Å cell), an error is raised. This threshold was raised from 0.1 to accommodate genuine large conformational differences (e.g. insulin T→R, LEU B6 shifts ~8 Å ≈ 0.165 fractional). Values >0.35 indicate gross misalignment or a wrong origin.
 
 ## Cubic b-spline boundary fix (interpolate_map)
 
@@ -139,6 +135,8 @@ Callers (`bend_fit`, `bend_fit_progressive`) unpack all 4 values and print: `ori
 All test-system maps are ASU maps (not full-cell): lysozyme covers ~½ cell in each axis; DHFR covers full X and Z but ¼ of Y; myoglobin is full-cell. For ASU maps, `mode='wrap'` wraps the boundary (e.g. x≈0.5) to x=0, which is a physically unrelated density — creating a flat artefact in the difference map near the ASU boundary.
 
 **Fix**: `interpolate_map` pads by 5 voxels on each side with `np.pad(data, 5, mode='reflect')` before calling `map_coordinates` with `mode='nearest'`. Reflection gives a smooth continuation at any boundary (ASU edge or unit-cell edge), so the IIR prefilter sees no discontinuity. The prefilter decays as 0.268^k, so 5-voxel padding gives <0.15% boundary error at any interior query point. Do not use `pad=2` (insufficient) or `order=1` (eliminates overshoot at the cost of cubic quality everywhere).
+
+**Additional fix for fitreso_scan with CCP4 ASU map input:** reflect-padding the *unmoved* hkl00 boundary is fine, but once the shift field is active (fr20 onwards), `delta(ref_pt)` can push the sample point past the ASU edge. The reflected value is then physically unrelated to the actual reference density at that boundary, producing a concentrated noise plane at y=0.5 / z=0.5 in `diff_norm.map` (lyso fr20 baseline: 176 voxels > 5σ, max |peak| = 14σ). The fix is to expand the moving CCP4 ASU map to the full unit cell via `read_ccp4_fullcell` and use `pad_mode='wrap'`. `fitreso_scan` now defaults `mov_fullcell=None` which auto-enables this for `.map`/`.ccp4`/`.mrc` inputs (MTZ inputs are full-cell by construction via `mtz_to_map_data`). After fix, lyso fr20 boundary peaks drop from 176 → 3 voxels > 5σ. Do not pass `mov_fullcell=False` unless you specifically want ASU-only voxels (almost always wrong for scanning).
 
 ## gemmi map→MTZ conversion
 
@@ -240,7 +238,6 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxm | P4₃2₁2 | 984 | — | — | 11.0% |
 | Raddam 5kxk→5kxn | P4₃2₁2 | ~992 | — | — | — |
 | Insulin 4fg3→4e7u | H3 | 534 | 1.063 Å | 68.7% | 83.7% |
-| Porin 3poq→3pou | H32 | 340 | pending | pending | pending |
 
 Notes:
 - Lyso Rfac plateaus at ~33% by fr20 and barely changes with higher resolution — real structural differences remain in the diff map (A/74ASN/O is the persistent −10σ peak).
@@ -248,4 +245,3 @@ Notes:
 - Raddam Rfac *starts* low (13–11%) because the fc maps are nearly identical; huge water peaks (±30–65σ) reflect water molecules appearing/disappearing with radiation dose.
 - Myoglobin Rfac pending (gemmi map2mtz re-run in progress); heme iron dominates diff map throughout (±35σ at A/154HEM/FE).
 - Insulin: high Rfac (68.7%) and high residual RMSD (1.063 Å) reflect genuine T→R conformational change — LEU B6 shifts ~8 Å between T-state (4fg3) and R-state (4e7u), which is outside the smooth shift-field model. RMSD best at fr10 (0.988 Å, 401 HKLs); OD limit hit at 501 HKLs for fr8–fr5. Dominant diff peaks: +34σ at D/101ZN/ZN (zinc position differs), −10σ at waters/SCN.
-- Porin: `_find_best_origin` fails (CA RMSD 53.7 Å after best fractional-space origin fix) because the 10.9% a/b cell difference (3poq a=77.31, 3pou a=85.71 Å) makes fractional comparison unreliable. Cartesian Kabsch alignment over all 6 H32 symop copies finds 0.526 Å CA RMSD using symop `x-y+2/3,-y+1/3,-z+1/3`. Scan pending fix to `_find_best_origin` (Cartesian comparison fallback for large cell changes).

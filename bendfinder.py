@@ -2314,7 +2314,7 @@ def fitreso_scan(
     f_col=None, phi_col=None,
     run_refinement_flag=False, refine_cycles=5,
     sample_rate=0.0,
-    mov_fullcell=False,
+    mov_fullcell=None,
     fitreso_list=(20, 15, 12, 10, 8, 7, 6, 5),
     max_hkl_scan=10,
     outlier_sigma=2.5, b_sigma=3.0, drop_snr=0.0, od_margin=1.5,
@@ -2337,7 +2337,9 @@ def fitreso_scan(
     run_refinement_flag : bool  Run refmac/phenix to generate FWT/PHWT first
     refine_cycles    : int   Refinement cycles when run_refinement_flag=True
     sample_rate      : float FFT oversampling for MTZ → map (default 0.0 = gemmi auto)
-    mov_fullcell     : bool  CCP4 legacy: load mov map as full unit cell
+    mov_fullcell     : bool  CCP4 only: expand mov to full unit cell so wrap-mode
+                              interpolation avoids ASU-boundary noise (default
+                              None = auto-enable for CCP4 input)
     fitreso_list     : seq   Resolution endpoints for section 3 (Å)
     max_hkl_scan     : int   Number of non-DC canonical HKLs in section 2 (default 10)
     chunk_size       : int   Voxel batch size for eval_shift_field (default 50000)
@@ -2372,6 +2374,13 @@ def fitreso_scan(
         mov_mtz = _res['mov_mtz_out']
 
     # ── load maps ─────────────────────────────────────────────────────────────
+    # For CCP4 ASU map inputs, expand mov to the full unit cell so interpolation
+    # has correct periodic boundary conditions (pad_mode='wrap').  Without this,
+    # the bent map's boundary samples (y≈0.5 etc. for half-cell ASU maps) reflect
+    # interior density unrelated to ref — producing a noise plane at the ASU
+    # boundary in diff_norm.map.  This was historically controlled by the
+    # `--fullcell-mov` flag in the standalone fitreso_scan.py; now always on
+    # for CCP4 mov input.  MTZ inputs come out full-cell by construction.
     def _load(path, tag, fullcell=False):
         ext = os.path.splitext(path)[1].lower()
         if ext == '.mtz':
@@ -2387,6 +2396,10 @@ def fitreso_scan(
             data, hdr = read_ccp4(path)
         return data, hdr, None, None
 
+    # Default mov_fullcell to True for CCP4 input (avoids ASU-boundary noise);
+    # MTZ input ignores the flag (already full-cell).
+    if mov_fullcell is None:
+        mov_fullcell = mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc'))
     mov_d, mov_h, mov_mtz_resolved, mov_f_col = _load(mov_mtz, 'mov',
                                                         fullcell=mov_fullcell)
     ref_d, ref_h, ref_mtz_resolved, ref_f_col = _load(ref_mtz, 'ref')
