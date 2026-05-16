@@ -3118,11 +3118,18 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
         free   = next((l for l in ('FREE', 'RFREE', 'FreeR_flag')   if l in cols), None)
         if fp and sigfp:
             labin  = f'FP={fp} SIGFP={sigfp}' + (f' FREE={free}' if free else '')
-            script = f'NCYC {n_cycles}\nLABIN {labin}\nEND\n'
+            # REFI TYPE RIGID: fast, no atomic refinement, insensitive to
+            # unknown ligands (no restraints needed).  We only need refmac to
+            # produce clean FWT/PHWT/SIGFP-scaled output; the input PDB is
+            # already at the correct geometry.
+            script = (f'REFI TYPE RIGID\n'
+                      f'NCYC {n_cycles}\n'
+                      f'LABIN {labin}\n'
+                      f'END\n')
             cmd    = [refmac, 'xyzin', pdb_path, 'xyzout', out_pdb,
                       'hklin', mtz_path, 'hklout', out_mtz]
-            print(f'  run_refinement: {os.path.basename(refmac)} ({n_cycles} cycles)...',
-                  flush=True)
+            print(f'  run_refinement: {os.path.basename(refmac)} rigid '
+                  f'({n_cycles} cycles)...', flush=True)
             r = subprocess.run(cmd, input=script, capture_output=True, text=True)
             if r.returncode == 0 and os.path.exists(out_mtz):
                 print(f'  refmac5 done → {out_mtz}', flush=True)
@@ -3500,18 +3507,12 @@ def main():
         print("ERROR: provide two PDB files on the command line.", file=sys.stderr)
         sys.exit(1)
 
-    # ── MTZ handling: optional refinement, column detection ──────────────────
+    # ── MTZ handling: column detection (refinement deferred to fitreso_scan
+    # when scan_dir is set, or to the single-fit path below)
     mov_mtz = mtz1
     ref_mtz = mtz2
 
-    if mov_mtz and p['run_refinement']:
-        mov_mtz = run_refinement(pdb1, mov_mtz, outdir='refine_mov',
-                                 n_cycles=p['refine_cycles'])
-    if ref_mtz and p['run_refinement']:
-        ref_mtz = run_refinement(pdb2, ref_mtz, outdir='refine_ref',
-                                 n_cycles=p['refine_cycles'])
-
-    # ── fitreso_scan mode (do altindex resolution inside fitreso_scan) ───────
+    # ── fitreso_scan mode (refinement + altindex resolution happen inside) ───
     if p['scan_dir']:
         # mapfile may be: None, a single str (one map), or a (mov, ref) tuple
         if isinstance(mapfile, tuple):
@@ -3531,7 +3532,14 @@ def main():
                      subtract=p['subtract'])
         sys.exit(0)
 
-    # ── altindex / origin resolution for single-fit path ─────────────────────
+    # ── Single-fit path: refinement (if requested) then altindex resolution ──
+    if mov_mtz and p['run_refinement']:
+        mov_mtz = run_refinement(pdb1, mov_mtz, outdir='refine_mov',
+                                 n_cycles=p['refine_cycles'])
+    if ref_mtz and p['run_refinement']:
+        ref_mtz = run_refinement(pdb2, ref_mtz, outdir='refine_ref',
+                                 n_cycles=p['refine_cycles'])
+
     if mov_mtz:
         _res = resolve_altindex(pdb1, pdb2, mov_mtz,
                                  outdir='altindex_resolve',
