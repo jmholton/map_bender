@@ -2665,58 +2665,126 @@ def fitreso_scan(
 
 
 def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
-                 n_cycles=4, sigma_cut=float('inf'), use_median=False):
-    """Scale test to ref; return (riso, scale_k, 0.0) or (None, None, None).
+                 n_cycles=4, sigma_cut=float('inf'), anisotropic=False):
+    """Scale F_test to F_ref with k + isotropic (default) or anisotropic B;
+    return (riso, k, B_iso_eq) or (None, None, None).
 
-    Karle-Hauptman isomorphous scaling (same algorithm as CCP4 scaleit):
-        k = Σ(F_ref · F_test) / Σ(F_test²)
-    iterated n_cycles times with sigma_cut·σ outlier rejection between cycles.
-    Default sigma_cut=inf disables rejection (no reliable σ for map-derived F).
-    No B-factor term — appropriate for comparing nearly-identical maps where the
-    relative B difference is negligible.
+    Model (same as CCP4 scaleit):
 
-    If use_median=True, fall back to median(F_ref/F_test) on reflections where
-    both amplitudes exceed 1% of the maximum (faster, useful for quick checks).
+        F_test_scaled = k · exp(-Q(h)) · F_test
+        Q(h) = (B/4) · s²                       (isotropic, s² = 1/d²)
+        Q(h) = h_orth^T · V · h_orth             (anisotropic; V symmetric 3×3,
+                                                  B_iso_eq = (4/3)·trace(V))
 
-    Riso = Σ|F_ref − k·F_test| / Σ|F_ref| over all non-zero matched reflections.
+    NB: the fit objective here is **not** the same as scaleit's.  Scaleit does
+    Fox-Holmes intensity-space LS while refining both SC(1) and SC(2) — and
+    the (SC(1), SC(2)) → (α·SC(1), α·SC(2)) degeneracy is broken only by a
+    rank-revealing solver (EIGSOL with ELIM=3.5e-4), so its reported (k, B)
+    sit somewhere arbitrary along the degenerate ray.
+
+    Here we instead fix SC(1)=1 and refine k (=SC(2)) and B (or V) by F-space
+    nonlinear least squares (scipy least_squares, LM) — well-posed and
+    directly minimizes the F-space (= real-space L2, by Parseval) residual.
+    Iterated n_cycles times with sigma_cut · rms-residual outlier rejection
+    between cycles.  Default sigma_cut=inf keeps all reflections (no reliable
+    σ for map-derived F — diff.com's `EXCLUDE SIG 3` is intentionally skipped).
+
+    The reported B will not match scaleit's exactly; expect F-space-LS to give
+    a *lower* F-Rfac for the same model.
+
+    Riso = Σ|F_ref − F_test_scaled| / Σ|F_ref| over remaining reflections.
     """
     try:
-        def _load(path, col):
-            mtz    = gemmi.read_mtz_file(path)
-            d      = mtz.array
-            labels = mtz.column_labels()
-            hkl    = d[:, :3].astype(int)
-            F      = d[:, labels.index(col)]
-            return hkl, F
+        from scipy.optimize import least_squares
 
-        ref_hkl, ref_F = _load(ref_mtz_path, ref_col)
-        tst_hkl, tst_F = _load(test_mtz_path, test_col)
+        ref_mtz = gemmi.read_mtz_file(ref_mtz_path)
+        tst_mtz = gemmi.read_mtz_file(test_mtz_path)
+        cell    = ref_mtz.cell
 
-        tdict = {(int(h[0]), int(h[1]), int(h[2])): f for h, f in zip(tst_hkl, tst_F)}
-        mask  = np.array([tuple(map(int, h)) in tdict for h in ref_hkl])
-        ref_F = ref_F[mask]
-        tst_F = np.array([tdict[tuple(map(int, h))] for h in ref_hkl[mask]])
+        ref_data = np.array(ref_mtz.array)
+        tst_data = np.array(tst_mtz.array)
+        ref_lbls = ref_mtz.column_labels()
+        tst_lbls = tst_mtz.column_labels()
+        ref_hkl  = ref_data[:, :3].astype(int)
+        tst_hkl  = tst_data[:, :3].astype(int)
+        ref_F    = ref_data[:, ref_lbls.index(ref_col)]
+        tst_F    = tst_data[:, tst_lbls.index(test_col)]
+
+        # Match by HKL
+        tdict = {(int(h[0]), int(h[1]), int(h[2])): i
+                 for i, h in enumerate(tst_hkl)}
+        keep_idx = [tdict.get((int(h[0]), int(h[1]), int(h[2])))
+                    for h in ref_hkl]
+        mask = np.array([k is not None for k in keep_idx])
+        hkl  = ref_hkl[mask].astype(float)
+        r    = ref_F[mask]
+        t    = np.array([tst_F[i] for i in keep_idx if i is not None])
 
         with np.errstate(invalid='ignore'):
-            ok = (ref_F > 0) & (tst_F > 0) & np.isfinite(ref_F) & np.isfinite(tst_F)
-        r  = ref_F[ok]
-        t  = tst_F[ok]
+            ok = (r > 0) & (t > 0) & np.isfinite(r) & np.isfinite(t)
+        hkl, r, t = hkl[ok], r[ok], t[ok]
+        if len(r) < 10:
+            return None, None, None
 
-        if use_median:
-            thresh = 0.01 * max(float(r.max()), float(t.max()))
-            well   = (r > thresh) & (t > thresh)
-            kF     = float(np.median(r[well] / t[well]))
+        # Reciprocal-cartesian h vectors: h_orth_row = hkl_row · M_frac
+        # (cell.fractionalization_matrix takes direct cart→frac; its rows are
+        # the reciprocal cartesian basis vectors a*, b*, c*.)
+        M_frac = np.array(cell.fractionalization_matrix.tolist())
+        h_orth = hkl @ M_frac           # (N, 3)
+        s_sq   = np.sum(h_orth ** 2, axis=1)   # 1/d²
+
+        use = np.ones(len(r), dtype=bool)
+
+        # initial k from Karle-Hauptman; B (or V) = 0
+        k0 = float(np.dot(r, t) / np.dot(t, t))
+
+        if not anisotropic:
+            params = np.array([np.log(max(k0, 1e-10)), 0.0])
+
+            def _scale(p, mask_sub=None):
+                lk, B = p
+                ss = s_sq if mask_sub is None else s_sq[mask_sub]
+                return np.exp(lk) * np.exp(-B / 4.0 * ss)
         else:
-            # Karle-Hauptman: iterate k with sigma-clipping
-            use = np.ones(len(r), dtype=bool)
-            for _ in range(n_cycles):
-                kF  = float(np.dot(r[use], t[use]) / np.dot(t[use], t[use]))
-                res = np.abs(r - kF * t)
-                use = res < sigma_cut * res[use].std()
-            kF = float(np.dot(r[use], t[use]) / np.dot(t[use], t[use]))
+            params = np.array([np.log(max(k0, 1e-10)),
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
-        riso = float(np.sum(np.abs(r - kF * t)) / np.sum(np.abs(r)))
-        return riso, kF, 0.0
+            def _Vmat(p):
+                V11, V22, V33, V12, V13, V23 = p[1:]
+                return np.array([[V11, V12, V13],
+                                 [V12, V22, V23],
+                                 [V13, V23, V33]])
+
+            def _scale(p, mask_sub=None):
+                lk = p[0]
+                V  = _Vmat(p)
+                hh = h_orth if mask_sub is None else h_orth[mask_sub]
+                Q  = np.einsum('ij,ni,nj->n', V, hh, hh)
+                return np.exp(lk) * np.exp(-Q)
+
+        for _ in range(n_cycles):
+            def _resid(p):
+                return r[use] - _scale(p, mask_sub=use) * t[use]
+            try:
+                res = least_squares(_resid, params, method='lm', max_nfev=200)
+                params = res.x
+            except Exception:
+                break
+            if np.isfinite(sigma_cut):
+                resid_all = np.abs(r - _scale(params) * t)
+                rms = float(np.std(resid_all[use])) if use.sum() > 1 else np.inf
+                use = resid_all < sigma_cut * rms
+                if use.sum() < 10:
+                    break
+
+        scaled = _scale(params) * t
+        riso   = float(np.sum(np.abs(r - scaled)) / np.sum(np.abs(r)))
+        k_fit  = float(np.exp(params[0]))
+        if anisotropic:
+            B_iso_eq = float(4.0 * np.trace(_Vmat(params)) / 3.0)
+        else:
+            B_iso_eq = float(params[1])
+        return riso, k_fit, B_iso_eq
     except Exception:
         return None, None, None
 
