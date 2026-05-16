@@ -25,7 +25,13 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
     3aw6.pdb, 3aw7.pdb
     3aw6_2fofc.map, 3aw7_2fofc.map
     fitreso_scan/               hkl00..hkl10, fr5..fr20 output subdirs
-  dhfr/                         DHFR 1rx1→1rx2 (P2₁2₁2₁, 636 CA pairs)
+  dhfr/                         DHFR 1rx2→1rx1 (P2₁2₁2₁, 636 CA pairs).
+                                 Canonical direction: mov=1rx2 (has FOL +
+                                 Mn²⁺ + BME), ref=1rx1 (just NAP + Ca²⁺).
+                                 With subtract=ref this makes FOL appear as
+                                 positive (green) density and Ca²⁺ as
+                                 negative (red).  1rx1→1rx2 also works but
+                                 flips the colours.
     fitreso_scan/
   myoglobin/                    myoglobin 1mbo→1a6m (P2₁, 294 CA pairs)
     fitreso_scan/
@@ -236,7 +242,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | System | Space group | CA pairs | fr5 RMSD | fr5 Rfac | hkl00 Rfac |
 |--------|------------|----------|----------|----------|------------|
 | Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.034 Å | 33.2% | 59.5% |
-| DHFR 1rx1→1rx2 | P2₁2₁2₁ | 636 | 0.071 Å | 41.9% | 44.1% |
+| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 636 | 0.070 Å | 41.5% | 43.0% |
 | Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | — | — |
 | Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.082 Å | 20.6% | 13.4% |
 | Raddam 5kxk→5kxm | P4₃2₁2 | 984 | — | — | 11.0% |
@@ -245,7 +251,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 
 Notes:
 - Lyso Rfac plateaus at ~33% by fr20 and barely changes with higher resolution — real structural differences remain in the diff map (A/74ASN/O is the persistent −10σ peak).
-- DHFR Rfac barely improves (44% → 42%) — these crystal forms are more dissimilar; the FOL ligand and Mn ion dominate the diff map at all resolutions.
+- DHFR Rfac barely improves (43% → 42%) — these crystal forms are more dissimilar; the FOL ligand (in 1rx2 only) and Ca²⁺/Mn²⁺ ions dominate the diff map at all resolutions. With mov=1rx2 ref=1rx1 and the default subtract=ref, FOL atoms show as +4–7σ positive (green) density (top atom O4 at +6.78σ in fr5) while the Ca²⁺ (present only in 1rx1) appears as a −10σ negative (red) peak at A/300CA/CA. FOL is **not** present in 1rx1; the title "complexed with" refers to the NADPH-analog NAP that's in both structures.
 - Raddam Rfac *starts* low (13–11%) because the fc maps are nearly identical; huge water peaks (±30–65σ) reflect water molecules appearing/disappearing with radiation dose.
 - Myoglobin Rfac pending (gemmi map2mtz re-run in progress); heme iron dominates diff map throughout (±35σ at A/154HEM/FE).
 - Insulin: high Rfac (68.7%) and high residual RMSD (1.063 Å) reflect genuine T→R conformational change — LEU B6 shifts ~8 Å between T-state (4fg3) and R-state (4e7u), which is outside the smooth shift-field model. RMSD best at fr10 (0.988 Å, 401 HKLs); OD limit hit at 501 HKLs for fr8–fr5. Dominant diff peaks: +34σ at D/101ZN/ZN (zinc position differs), −10σ at waters/SCN.
