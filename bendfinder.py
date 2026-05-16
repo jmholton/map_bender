@@ -2071,8 +2071,13 @@ def bend_apply_map(map_path, result, frac=1.0, outpath=None, delta=False):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_args(argv):
-    """Parse bendfinder.com-style key=value arguments."""
-    pdb1 = pdb2 = mapfile = mtz1 = mtz2 = None
+    """Parse bendfinder.com-style key=value arguments.
+
+    Returns (pdb1, pdb2, mapfile, mtz1, mtz2, params).  When two CCP4 maps are
+    given, mapfile is a tuple (mov_map, ref_map); when one is given, mapfile is
+    the path string (single-fit fallback)."""
+    pdb1 = pdb2 = mtz1 = mtz2 = None
+    map1 = map2 = None
     params = {
         'nhkls':          30,
         'fitreso':        None,
@@ -2097,8 +2102,10 @@ def _parse_args(argv):
             elif pdb2 is None:
                 pdb2 = arg
         elif arg.lower().endswith(('.map', '.ccp4', '.mrc')):
-            if mapfile is None:
-                mapfile = arg
+            if map1 is None:
+                map1 = arg
+            elif map2 is None:
+                map2 = arg
         elif arg.lower().endswith('.mtz'):
             if mtz1 is None:
                 mtz1 = arg
@@ -2145,6 +2152,13 @@ def _parse_args(argv):
             elif arg in ('run_refinement', 'refine'):
                 params['run_refinement'] = True
             # nofit: ignored — lstsq always fits
+    # mapfile: tuple (mov, ref) if both maps given; bare path if one; None if none
+    if map2 is not None:
+        mapfile = (map1, map2)
+    elif map1 is not None:
+        mapfile = map1
+    else:
+        mapfile = None
     return pdb1, pdb2, mapfile, mtz1, mtz2, params
 
 
@@ -3187,8 +3201,13 @@ def main():
 
     # ── fitreso_scan mode (do altindex resolution inside fitreso_scan) ───────
     if p['scan_dir']:
-        mov_src = mov_mtz or mapfile
-        ref_src = ref_mtz or mapfile
+        # mapfile may be: None, a single str (one map), or a (mov, ref) tuple
+        if isinstance(mapfile, tuple):
+            mov_map, ref_map = mapfile
+        else:
+            mov_map = ref_map = mapfile
+        mov_src = mov_mtz or mov_map
+        ref_src = ref_mtz or ref_map
         if mov_src is None or ref_src is None:
             print("ERROR: scan_dir requires two map/MTZ inputs.", file=sys.stderr)
             sys.exit(1)
@@ -3274,13 +3293,15 @@ def main():
         if p['deltamaps']:
             _make_delta_maps_hdr(mov_h, hkls, AB_xyz, nhkls)
     elif mapfile:
-        if not os.path.exists(mapfile):
-            print(f"WARNING: map file not found: {mapfile}", file=sys.stderr)
+        # Single-fit fallback: use first map only (mov)
+        single_map = mapfile[0] if isinstance(mapfile, tuple) else mapfile
+        if not os.path.exists(single_map):
+            print(f"WARNING: map file not found: {single_map}", file=sys.stderr)
         else:
             bent_map_out = f"bent{nhkls}.map"
-            make_bent_map(mapfile, hkls, AB_xyz, bent_map_out, cell2=cell2)
+            make_bent_map(single_map, hkls, AB_xyz, bent_map_out, cell2=cell2)
             if p['deltamaps']:
-                make_delta_maps(mapfile, hkls, AB_xyz, nhkls)
+                make_delta_maps(single_map, hkls, AB_xyz, nhkls)
 
 
 if __name__ == '__main__':
