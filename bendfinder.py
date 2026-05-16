@@ -2280,6 +2280,163 @@ def _map2mtz(mapfile, mtzfile):
     mtz.write_to_file(mtzfile)
 
 
+def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col,
+                            mtzfile, anisotropic=False, n_cycles=4):
+    """FFT bent_map; F-space fit (k, B) of bent → ref MTZ; compute scaled bent
+    F + F-space DELFWT; write cootme.mtz; return (diff_real, riso, k, B).
+
+    diff_real is the inverse-FFT of (F_ref·exp(iφ_ref) − k·exp(-B·s²/4)·F_bent
+    ·exp(iφ_bent)) on ref's grid — i.e. the residual density after absorbing
+    the resolution-dependent scale.  See compute_riso docstring for the LS
+    target details.
+    """
+    from scipy.optimize import least_squares
+
+    cell = gemmi.UnitCell(*ref_h['cell'])
+    sg   = gemmi.find_spacegroup_by_number(ref_h['spacegroup'])
+
+    # ── FFT bent_map via temp .map → gemmi setup, so ASU↔full-cell handling
+    # matches what's already done in _write_scan_mtz / _map2mtz
+    import tempfile
+    tmp_b = tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
+    try:
+        write_ccp4(tmp_b, bent_map, ref_h)
+        ccp4_b = gemmi.read_ccp4_map(tmp_b)
+        ccp4_b.setup(float('nan'))
+        sf_b   = gemmi.transform_map_to_f_phi(ccp4_b.grid, half_l=True)
+        asu_b  = sf_b.prepare_asu_data(dmin=0.0)
+    finally:
+        try: os.unlink(tmp_b)
+        except OSError: pass
+
+    bent_hkl = asu_b.miller_array.astype(int)
+    bent_c   = asu_b.value_array.astype(np.complex128)
+    bent_F   = np.abs(bent_c)
+    bent_PH  = np.degrees(np.angle(bent_c))
+
+    # ── Load ref MTZ
+    ref_mtz_obj = gemmi.read_mtz_file(ref_mtz_path)
+    ref_data    = np.array(ref_mtz_obj.array)
+    ref_lbls    = ref_mtz_obj.column_labels()
+    ref_hkl     = ref_data[:, :3].astype(int)
+    ref_F_all   = ref_data[:, ref_lbls.index(ref_f_col)]
+    ref_PH_all  = ref_data[:, ref_lbls.index(ref_phi_col)]
+
+    # ── Match HKLs (use ref HKL set as common index)
+    bdict = {(int(h[0]), int(h[1]), int(h[2])): i
+             for i, h in enumerate(bent_hkl)}
+    keep = [bdict.get((int(h[0]), int(h[1]), int(h[2]))) for h in ref_hkl]
+    mask = np.array([k is not None for k in keep])
+    hkl  = ref_hkl[mask]
+    rF   = ref_F_all[mask];   rPH = ref_PH_all[mask]
+    bidx = np.array([i for i in keep if i is not None])
+    bF   = bent_F[bidx];      bPH = bent_PH[bidx]
+
+    ok = (rF > 0) & (bF > 0) & np.isfinite(rF) & np.isfinite(bF)
+    hkl, rF, rPH, bF, bPH = hkl[ok], rF[ok], rPH[ok], bF[ok], bPH[ok]
+    if len(rF) < 10:
+        return None, None, None, None
+
+    # ── Reciprocal-cart h, s² = 1/d²
+    M_frac = np.array(cell.fractionalization_matrix.tolist())
+    h_orth = hkl.astype(float) @ M_frac
+    s_sq   = np.sum(h_orth ** 2, axis=1)
+
+    # ── Fit (k, B) [or (k, V) anisotropic] via F-space LS, iterated
+    use = np.ones(len(rF), dtype=bool)
+    if not anisotropic:
+        params = np.array([np.log(max(np.dot(rF, bF) / np.dot(bF, bF), 1e-10)), 0.0])
+        def _scale_fn(p, m=None):
+            ss = s_sq if m is None else s_sq[m]
+            return np.exp(p[0]) * np.exp(-p[1] / 4.0 * ss)
+    else:
+        params = np.array([np.log(max(np.dot(rF, bF) / np.dot(bF, bF), 1e-10)),
+                           0., 0., 0., 0., 0., 0.])
+        def _Vmat(p):
+            V11, V22, V33, V12, V13, V23 = p[1:]
+            return np.array([[V11, V12, V13],
+                             [V12, V22, V23],
+                             [V13, V23, V33]])
+        def _scale_fn(p, m=None):
+            hh = h_orth if m is None else h_orth[m]
+            return np.exp(p[0]) * np.exp(-np.einsum('ij,ni,nj->n',
+                                                     _Vmat(p), hh, hh))
+
+    for _ in range(n_cycles):
+        try:
+            res = least_squares(lambda p: rF[use] - _scale_fn(p, use) * bF[use],
+                                 params, method='lm', max_nfev=200)
+            params = res.x
+        except Exception:
+            break
+
+    scale = _scale_fn(params)
+    if not anisotropic:
+        k_fit = float(np.exp(params[0])); B_fit = float(params[1])
+    else:
+        k_fit = float(np.exp(params[0]))
+        B_fit = float(4.0 * np.trace(_Vmat(params)) / 3.0)
+
+    bF_scaled = scale * bF
+    riso = float(np.sum(np.abs(rF - bF_scaled)) / np.sum(np.abs(rF)))
+
+    # ── F-space diff
+    ref_c       = rF        * np.exp(1j * np.radians(rPH))
+    bent_c_scl  = bF_scaled * np.exp(1j * np.radians(bPH))
+    diff_c      = ref_c - bent_c_scl
+    diff_F      = np.abs(diff_c).astype(np.float32)
+    diff_PH     = np.degrees(np.angle(diff_c)).astype(np.float32)
+
+    # ── Write cootme.mtz with scaled FDM and F-space DELFWT
+    out = gemmi.Mtz(with_base=True)
+    out.cell, out.spacegroup = cell, sg
+    out.add_dataset('dataset')
+    out.add_column('FDM',     'F')
+    out.add_column('PHIDM',   'P')
+    out.add_column('DELFWT',  'F')
+    out.add_column('PHDELWT', 'P')
+    arr = np.zeros((len(hkl), 7), dtype=np.float32)
+    arr[:, :3] = hkl
+    arr[:,  3] = bF_scaled.astype(np.float32)
+    arr[:,  4] = bPH.astype(np.float32)
+    arr[:,  5] = diff_F
+    arr[:,  6] = diff_PH
+    out.set_data(arr)
+    out.write_to_file(mtzfile)
+
+    # ── Inverse-FFT diff → real-space at ref grid
+    diff_mtz = gemmi.Mtz(with_base=True)
+    diff_mtz.cell, diff_mtz.spacegroup = cell, sg
+    diff_mtz.add_dataset('d')
+    diff_mtz.add_column('F',   'F')
+    diff_mtz.add_column('PHI', 'P')
+    darr = np.zeros((len(hkl), 5), dtype=np.float32)
+    darr[:, :3] = hkl
+    darr[:,  3] = diff_F
+    darr[:,  4] = diff_PH
+    diff_mtz.set_data(darr)
+    # Sample at the same grid as bent_map (ref_h)
+    nu, nv, nw = ref_h['nx'], ref_h['ny'], ref_h['nz']
+    grid = diff_mtz.transform_f_phi_to_map('F', 'PHI', exact_size=(nu, nv, nw))
+    full_diff = np.array(grid, copy=True)
+    # full_diff is (nu, nv, nw) = (NX, NY, NZ); rearrange to ref_h's
+    # (ns, nr, nc) = (maps-axis, mapr-axis, mapc-axis) and slice to ASU
+    mapc, mapr, maps = ref_h['mapc'], ref_h['mapr'], ref_h['maps']
+    diff_full = np.transpose(full_diff, (maps - 1, mapr - 1, mapc - 1))
+    Ng = {1: nu, 2: nv, 3: nw}
+    ncs, nrs, nss = ref_h['ncstart'], ref_h['nrstart'], ref_h['nsstart']
+    nc,  nr,  ns  = ref_h['nc'],      ref_h['nr'],      ref_h['ns']
+    # Slice ASU window (ncstart..ncstart+nc-1 etc, wrapping)
+    def _slc(start, n, N):
+        idx = (np.arange(n) + start) % N
+        return idx
+    iss = _slc(nss, ns, Ng[maps])
+    irr = _slc(nrs, nr, Ng[mapr])
+    icc = _slc(ncs, nc, Ng[mapc])
+    diff_real = diff_full[np.ix_(iss, irr, icc)].astype(np.float32)
+    return diff_real, riso, k_fit, B_fit
+
+
 def _write_scan_mtz(bent_arr, diff_arr, ref_h, mtzfile):
     """Write cootme.mtz with FDM/PHIDM (bent map) + DELFWT/PHDELWT (diff map)."""
     tmp_b = _tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
@@ -2440,13 +2597,16 @@ def fitreso_scan(
     atoms = _scan_read_pdb_atoms_p1(ref_pdb)
 
     # ── ref MTZ for Riso (FT of reference density map) ────────────────────────
+    _PHI_LOOKUP = {'FWT': 'PHWT', '2FOFCWT': 'PH2FOFCWT', 'F': 'PHI'}
     if ref_mtz_resolved is not None:
         # ref input is already an MTZ — use it directly for Riso
         riso_ref_mtz = ref_mtz_resolved
         riso_ref_col = ref_f_col
+        riso_ref_phi = _PHI_LOOKUP.get(ref_f_col, 'PHWT')
     else:
         riso_ref_mtz = os.path.join(scan_dir, 'ref_riso.mtz')
         riso_ref_col = 'F'
+        riso_ref_phi = 'PHI'
         if not os.path.exists(riso_ref_mtz):
             if verbose:
                 print('Converting ref map to MTZ for Riso...', flush=True)
@@ -2534,16 +2694,26 @@ def fitreso_scan(
         # unbent.pdb (mov atoms with origin shift) inside Coot.
         _relsymlink(os.path.abspath(os.path.join(scan_dir, 'unbent.mtz')),
                     f'{outdir}/unbent.mtz')
-        ref_n     = (ref_d    - ref_d.mean())    / ref_d.std()
-        bent_n    = (bent_map - bent_map.mean()) / bent_map.std()
-        diff      = ref_n - bent_n
+        # F-space scale (k, B) bent → ref, then compute diff in F-space and
+        # inverse-FFT to diff.map.  Absorbs resolution-dependent amplitude
+        # mismatch so the diff highlights structural changes, not scaling.
+        cootme_path = f'{outdir}/{cootme_name}'
+        diff, riso, kF, B = _fspace_scale_and_diff(
+            bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
+            cootme_path, n_cycles=riso_n_cycles)
+        if diff is None:
+            # F-space path failed (too few matched reflections) — fall back to
+            # z-scored real-space diff
+            ref_n     = (ref_d    - ref_d.mean())    / ref_d.std()
+            bent_n    = (bent_map - bent_map.mean()) / bent_map.std()
+            diff      = ref_n - bent_n
+            _write_scan_mtz(bent_map, diff, ref_h, cootme_path)
+            riso, kF, B = compute_riso(riso_ref_mtz, riso_ref_col,
+                                       cootme_path, 'FDM',
+                                       n_cycles=riso_n_cycles,
+                                       sigma_cut=riso_sigma_cut)
         diff_norm = diff / diff.std()
         write_ccp4(f'{outdir}/{diffnorm_name}', diff_norm, ref_h)
-        _write_scan_mtz(bent_map, diff, ref_h, f'{outdir}/{cootme_name}')
-        riso, kF, B = compute_riso(riso_ref_mtz, riso_ref_col,
-                                   f'{outdir}/{cootme_name}', 'FDM',
-                                   n_cycles=riso_n_cycles,
-                                   sigma_cut=riso_sigma_cut)
         # Rbend = R-factor of bent map vs unbent-resampled map (how much bending changed it)
         if _unbent_cootme[0] is None:
             rbend = 0.0  # hkl00 row: bent IS unbent
