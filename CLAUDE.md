@@ -93,14 +93,18 @@ The scan logic is implemented as `fitreso_scan()` directly in `bendfinder.py`. E
 **Riso calculation**: `compute_riso(ref_mtz, ref_col, test_mtz, test_col)` in `bendfinder.py`. Uses Wilson isotropic B scaling: fit `log(F_ref/F_test) = log(kF) − (B/4)·(1/d²)` by OLS, then Riso = Σ|F_ref − kF·exp(−B/4d²)·F_test| / Σ|F_ref|. Returns (riso, kF, B_iso). No CCP4 programs needed; replaces the old `diff.com` subprocess.
 
 **Output files per scan point**:
-- `cootme.mtz` — columns `FDM`/`PHIDM` (bent map) + `DELFWT`/`PHDELWT` (diff map). Load in Coot; FDM/PHIDM are recognised by default.
-- `diff_norm.map` — z-scored real-space difference map (ref − bent) / σ; positive peaks = more density in reference.
+- `bent.mtz` — columns `FDM`/`PHIDM` (bent map) + `DELFWT`/`PHDELWT` (diff map). Load in Coot; FDM/PHIDM are recognised by default.
+- `diff_norm.map` — z-scored real-space difference map (sign controlled by `subtract`); default `subtract=ref` → diff = bent − ref, positive peaks = density present in bent but absent (or weaker) in ref.
 - `bent.map` — bent moving-crystal map resampled on the reference grid.
 - `PSDVF.mtz` (fr\* points only) — fitted shift-field (h,k,l) coefficients.
 
-**Diff map sign convention**: `diff = ref_normalised − bent_normalised`. Positive peaks = more density in reference. For the raddam series where the damaged structure is the reference, positive peaks indicate features appearing with radiation dose.
+**Diff map sign convention**: controlled by the `subtract` parameter on `fitreso_scan` (CLI: `subtract=ref|bent`).
+- `subtract='ref'` (default) → diff = bent − ref. Positive peaks = density present in bent (the moving structure resampled into ref's frame) but absent (or weaker) in ref. This is the "what new density does the moving structure bring in?" view.
+- `subtract='bent'` → diff = ref − bent. Positive peaks = density present in ref but absent (or weaker) in bent. (Old default before 2026-05-16; flip with this option if you have prior figures/notes using that convention.)
 
-**Raddam sign convention**: 5kxk (undamaged, lowest dose) is the **moving** model; 5kxl/5kxm/5kxn (increasingly damaged) are the **references**. Dose ordering is alphabetical: 5kxk < 5kxl < 5kxm < 5kxn. With this convention, positive diff peaks = features appearing with dose, negative peaks = features disappearing.
+The diff is computed in F-space after k+B scaling of bent → ref (`_fspace_scale_and_diff`), then inverse-FFT'd to `diff.map`/`diff_norm.map` and stored as DELFWT/PHDELWT in `bent.mtz`. The sign flip is exact (negation of every voxel; DELFWT amplitude unchanged, PHDELWT shifts by 180°).
+
+**Raddam sign convention**: 5kxk (undamaged, lowest dose) is the **moving** model; 5kxl/5kxm/5kxn (increasingly damaged) are the **references**. Dose ordering is alphabetical: 5kxk < 5kxl < 5kxm < 5kxn. With the new default `subtract='ref'`: positive diff peaks = features in the **undamaged** model absent from the damaged reference (features disappearing with dose); negative peaks = features appearing with dose. (Sign flipped from the pre-2026-05-16 default — pass `subtract=bent` to recover the old convention.)
 
 **Large-map memory**: `eval_shift_field` allocates an (N_voxels × N_hkls) phase matrix. For large maps (raddam: 3.7M voxels × 900+ HKLs ≈ 26 GB) this must be chunked. `fitreso_scan` uses an internal `_eval_chunked` helper in 50k-voxel batches (configurable via `chunk_size` parameter).
 

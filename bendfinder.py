@@ -26,6 +26,8 @@ Parameters:
     refine_cycles=5   number of refinement cycles (default 5)
     sample_rate=0.0   FFT oversampling for MTZ → map (default 0.0 = gemmi auto)
     scan_dir=DIR      run full fitreso scan and write outputs to DIR
+    subtract=ref      diff = bent − ref (default; positive peak = density in
+                      bent absent from ref).  subtract=bent flips the sign.
 
 Public API:
     from bendfinder import bend_fit, bend_apply_pdb, bend_apply_map
@@ -2094,6 +2096,7 @@ def _parse_args(argv):
         'refine_cycles':  5,
         'sample_rate':    0.0,
         'scan_dir':       None,
+        'subtract':       'ref',
     }
     for arg in argv:
         if arg.lower().endswith('.pdb'):
@@ -2146,6 +2149,13 @@ def _parse_args(argv):
                 params['sample_rate'] = float(val)
             elif key == 'scan_dir':
                 params['scan_dir'] = val
+            elif key == 'subtract':
+                v = val.strip().lower()
+                if v not in ('ref', 'bent'):
+                    print(f"ERROR: subtract must be 'ref' or 'bent', got "
+                          f"{val!r}", file=sys.stderr)
+                    sys.exit(2)
+                params['subtract'] = v
         elif arg in ('deltamaps', 'delta', 'nofit', 'run_refinement', 'refine'):
             if arg in ('deltamaps', 'delta'):
                 params['deltamaps'] = True
@@ -2281,15 +2291,24 @@ def _map2mtz(mapfile, mtzfile):
 
 
 def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col,
-                            mtzfile, anisotropic=False, n_cycles=4):
+                            mtzfile, anisotropic=False, n_cycles=4,
+                            subtract='ref'):
     """FFT bent_map; F-space fit (k, B) of bent → ref MTZ; compute scaled bent
-    F + F-space DELFWT; write cootme.mtz; return (diff_real, riso, k, B).
+    F + F-space DELFWT; write bent.mtz; return (diff_real, riso, k, B).
 
-    diff_real is the inverse-FFT of (F_ref·exp(iφ_ref) − k·exp(-B·s²/4)·F_bent
-    ·exp(iφ_bent)) on ref's grid — i.e. the residual density after absorbing
-    the resolution-dependent scale.  See compute_riso docstring for the LS
-    target details.
+    subtract : 'ref'  → diff = bent_scaled − ref   (default)
+                        positive peak = density present in bent but absent (or
+                        weaker) in ref
+               'bent' → diff = ref − bent_scaled
+                        positive peak = density present in ref but absent (or
+                        weaker) in bent
+
+    diff_real is the inverse-FFT of the F-space diff on ref's grid — i.e. the
+    residual density after absorbing the resolution-dependent scale.  See
+    compute_riso docstring for the LS target details.
     """
+    if subtract not in ('ref', 'bent'):
+        raise ValueError(f"subtract must be 'ref' or 'bent', got {subtract!r}")
     from scipy.optimize import least_squares
 
     cell = gemmi.UnitCell(*ref_h['cell'])
@@ -2380,14 +2399,17 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
     bF_scaled = scale * bF
     riso = float(np.sum(np.abs(rF - bF_scaled)) / np.sum(np.abs(rF)))
 
-    # ── F-space diff
+    # ── F-space diff (sign controlled by `subtract`)
     ref_c       = rF        * np.exp(1j * np.radians(rPH))
     bent_c_scl  = bF_scaled * np.exp(1j * np.radians(bPH))
-    diff_c      = ref_c - bent_c_scl
+    if subtract == 'ref':
+        diff_c = bent_c_scl - ref_c           # positive peak = bent has more
+    else:
+        diff_c = ref_c - bent_c_scl           # positive peak = ref has more
     diff_F      = np.abs(diff_c).astype(np.float32)
     diff_PH     = np.degrees(np.angle(diff_c)).astype(np.float32)
 
-    # ── Write cootme.mtz with scaled FDM and F-space DELFWT
+    # ── Write bent.mtz with scaled FDM and F-space DELFWT
     out = gemmi.Mtz(with_base=True)
     out.cell, out.spacegroup = cell, sg
     out.add_dataset('dataset')
@@ -2438,7 +2460,7 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
 
 
 def _write_scan_mtz(bent_arr, diff_arr, ref_h, mtzfile):
-    """Write cootme.mtz with FDM/PHIDM (bent map) + DELFWT/PHDELWT (diff map)."""
+    """Write bent.mtz with FDM/PHIDM (bent map) + DELFWT/PHDELWT (diff map)."""
     tmp_b = _tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
     tmp_d = _tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
     try:
@@ -2491,6 +2513,7 @@ def fitreso_scan(
     outlier_sigma=2.5, b_sigma=3.0, drop_snr=0.0, od_margin=1.5,
     batch_hkls=100, chunk_size=50000,
     riso_n_cycles=4, riso_sigma_cut=float('inf'),
+    subtract='ref',
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -2514,7 +2537,13 @@ def fitreso_scan(
     fitreso_list     : seq   Resolution endpoints for section 3 (Å)
     max_hkl_scan     : int   Number of non-DC canonical HKLs in section 2 (default 10)
     chunk_size       : int   Voxel batch size for eval_shift_field (default 50000)
+    subtract         : str   Diff sign convention.  'ref' (default) → diff =
+                              bent − ref so positive peaks = density present
+                              in bent but absent (or weaker) in ref.  'bent' →
+                              diff = ref − bent (opposite sign).
     """
+    if subtract not in ('ref', 'bent'):
+        raise ValueError(f"subtract must be 'ref' or 'bent', got {subtract!r}")
     import time
 
     _CANONICAL_F = {'FWT', '2FOFCWT'}
@@ -2654,6 +2683,10 @@ def fitreso_scan(
 
     # ── print header + "pre" row ─────────────────────────────────────────────
     if verbose:
+        _sign_note = ('diff = bent − ref  (+peak ⇒ density in bent absent from ref)'
+                      if subtract == 'ref' else
+                      'diff = ref − bent  (+peak ⇒ density in ref absent from bent)')
+        print(f"\nsign convention: {_sign_note}", flush=True)
         print(f"\n{'label':>7}  {'RMSD':>6}  {'active':>6}  "
               f"{'Rbent':>6}  {'Rbend':>6}  "
               f"{'peak':>7}  {'atom':>20}", flush=True)
@@ -2670,14 +2703,16 @@ def fitreso_scan(
     def _atoms1_pts(ref_pts):
         return ref_pts
 
-    # Path to the hkl00 (unbent-resampled) cootme MTZ — set after first _save_point
-    _unbent_cootme = [None]
+    # Path to the hkl00 (unbent-resampled) bent.mtz — set after first _save_point
+    _unbent_bent = [None]
+    # Accumulate one dict per scan point for the final scan_fitreso.log table
+    _log_rows = []
 
     def _save_point(label, outdir, bent_map, rmsd_before, rmsd_after,
                     n_active, t_elapsed, hkls=None, AB_xyz=None):
         bent_map_name    = f'bent{col_suffix}.map'
         diffnorm_name    = f'diff_norm{col_suffix}.map'
-        cootme_name      = f'cootme{col_suffix}.mtz'
+        bent_mtz_name    = f'bent{col_suffix}.mtz'
         write_ccp4(f'{outdir}/{bent_map_name}', bent_map, ref_h)
         if hkls is not None and AB_xyz is not None:
             write_bent_pdb(mov_pdb, ref_pdb, hkls, AB_xyz, f'{outdir}/bent.pdb')
@@ -2689,38 +2724,37 @@ def fitreso_scan(
         _relsymlink(os.path.abspath(os.path.join(scan_dir, 'unbent.pdb')),
                     f'{outdir}/unbent.pdb')
         _relsymlink(os.path.abspath(riso_ref_mtz), f'{outdir}/ref.mtz')
-        # unbent.mtz: chain through scan_dir/unbent.mtz → hkl00/cootme.mtz so
-        # that "unbent" (mov density resampled in ref frame) lines up with
-        # unbent.pdb (mov atoms with origin shift) inside Coot.
         _relsymlink(os.path.abspath(os.path.join(scan_dir, 'unbent.mtz')),
                     f'{outdir}/unbent.mtz')
         # F-space scale (k, B) bent → ref, then compute diff in F-space and
         # inverse-FFT to diff.map.  Absorbs resolution-dependent amplitude
         # mismatch so the diff highlights structural changes, not scaling.
-        cootme_path = f'{outdir}/{cootme_name}'
+        # Rbent reported here IS post-scaling (riso returned from the scaled fit).
+        bent_mtz_path = f'{outdir}/{bent_mtz_name}'
         diff, riso, kF, B = _fspace_scale_and_diff(
             bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
-            cootme_path, n_cycles=riso_n_cycles)
+            bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract)
         if diff is None:
             # F-space path failed (too few matched reflections) — fall back to
-            # z-scored real-space diff
+            # z-scored real-space diff (matches the requested sign convention)
             ref_n     = (ref_d    - ref_d.mean())    / ref_d.std()
             bent_n    = (bent_map - bent_map.mean()) / bent_map.std()
-            diff      = ref_n - bent_n
-            _write_scan_mtz(bent_map, diff, ref_h, cootme_path)
+            diff      = (bent_n - ref_n) if subtract == 'ref' else (ref_n - bent_n)
+            _write_scan_mtz(bent_map, diff, ref_h, bent_mtz_path)
             riso, kF, B = compute_riso(riso_ref_mtz, riso_ref_col,
-                                       cootme_path, 'FDM',
+                                       bent_mtz_path, 'FDM',
                                        n_cycles=riso_n_cycles,
                                        sigma_cut=riso_sigma_cut)
         diff_norm = diff / diff.std()
         write_ccp4(f'{outdir}/{diffnorm_name}', diff_norm, ref_h)
-        # Rbend = R-factor of bent map vs unbent-resampled map (how much bending changed it)
-        if _unbent_cootme[0] is None:
+        # Rbend = R-factor of bent map vs hkl00-resampled map (how much bending
+        # changed the resampled mov density).
+        if _unbent_bent[0] is None:
             rbend = 0.0  # hkl00 row: bent IS unbent
-            _unbent_cootme[0] = f'{outdir}/{cootme_name}'
+            _unbent_bent[0] = f'{outdir}/{bent_mtz_name}'
         else:
-            rbend, _, _ = compute_riso(_unbent_cootme[0], 'FDM',
-                                        f'{outdir}/{cootme_name}', 'FDM',
+            rbend, _, _ = compute_riso(_unbent_bent[0], 'FDM',
+                                        f'{outdir}/{bent_mtz_name}', 'FDM',
                                         n_cycles=riso_n_cycles,
                                         sigma_cut=riso_sigma_cut)
         peaks = _scan_find_peaks(diff_norm, ref_h, atoms, M)
@@ -2729,11 +2763,18 @@ def fitreso_scan(
         rbent_str  = f'{riso*100:.1f}%'  if riso  is not None else '  N/A'
         rbend_str  = f'{rbend*100:.1f}%' if rbend is not None else '  N/A'
         after_str  = f'{rmsd_after:.3f}'  if rmsd_after  is not None else '  ---'
+        atom_str   = _atom_label(p_top[1])
+        row_str = (f"{label:>7}  {after_str:>6}  {n_active:>6d}  "
+                   f"{rbent_str:>6}  {rbend_str:>6}  "
+                   f"{p_top[0]:>+7.2f}σ  {atom_str:>20} {p_top[2]:.2f}Å  "
+                   f"[{t_elapsed:.0f}s]")
+        _log_rows.append(dict(label=label, rmsd=rmsd_after, n_active=n_active,
+                              rbent=riso, rbend=rbend, k=kF, B=B,
+                              peak_sigma=p_top[0], peak_atom=atom_str,
+                              peak_dist=p_top[2], t=t_elapsed,
+                              row_str=row_str))
         if verbose:
-            print(f"{label:>7}  {after_str:>6}  {n_active:>6d}  "
-                  f"{rbent_str:>6}  {rbend_str:>6}  "
-                  f"{p_top[0]:>+7.2f}σ  {_atom_label(p_top[1]):>20} {p_top[2]:.2f}Å  "
-                  f"[{t_elapsed:.0f}s]", flush=True)
+            print(row_str, flush=True)
 
     # ── Section 1: hkl00 — zero shift field (post-resolve baseline) ──────────
     outdir0 = os.path.join(scan_dir, 'hkl00')
@@ -2748,7 +2789,7 @@ def fitreso_scan(
     # frame.  For MTZ input, symlink to the post-resolve mov MTZ.  For CCP4
     # input, FFT the input map directly so unbent.mtz is the FT of the moving
     # density in the moving's own cell/SG (no reciprocal-space cross-frame
-    # transform; the cootme.mtz FDM column carries the ref-frame view).
+    # transform; the bent.mtz FDM column carries the ref-frame view).
     if mov_mtz_resolved is not None:
         _relsymlink_dir(os.path.abspath(mov_mtz_resolved),
                          os.path.join(scan_dir, 'unbent.mtz'))
@@ -2830,8 +2871,41 @@ def fitreso_scan(
                        result.hkls, result.AB, result.active, result.snr,
                        result.cell1, result.cell2, result.dimensions, result.rmsd)
 
+    # ── Final summary log ───────────────────────────────────────────────────
+    _sign_note = ('diff = bent − ref  (+peak ⇒ density in bent absent from ref)'
+                  if subtract == 'ref' else
+                  'diff = ref − bent  (+peak ⇒ density in ref absent from bent)')
+    log_path = os.path.join(scan_dir, 'scan_fitreso.log')
+    with open(log_path, 'w') as fh:
+        fh.write(f"# fitreso_scan summary\n")
+        fh.write(f"# mov_pdb : {mov_pdb}\n")
+        fh.write(f"# ref_pdb : {ref_pdb}\n")
+        fh.write(f"# mov_mtz : {mov_mtz}\n")
+        fh.write(f"# ref_mtz : {ref_mtz}\n")
+        fh.write(f"# scan_dir: {scan_dir}\n")
+        fh.write(f"# sign    : {_sign_note}\n")
+        fh.write(f"# Rbent   : Rfac after F-space (k+B) scaling of bent → ref\n")
+        fh.write(f"# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)\n")
+        fh.write(f"# k, B    : F-space scale + isotropic B (Å²) used for Rbent\n\n")
+        hdr = (f"{'label':>7}  {'RMSD':>6}  {'active':>6}  "
+               f"{'Rbent':>6}  {'Rbend':>6}  "
+               f"{'k':>6}  {'B(Å²)':>7}  "
+               f"{'peak':>7}  {'atom':>20}  {'dist':>6}  {'t(s)':>5}\n")
+        fh.write(hdr)
+        fh.write('-' * (len(hdr) - 1) + '\n')
+        for r in _log_rows:
+            rmsd_s = f"{r['rmsd']:.3f}" if r['rmsd']  is not None else '  ---'
+            rbe_s  = f"{r['rbent']*100:.1f}%" if r['rbent'] is not None else '  N/A'
+            rbd_s  = f"{r['rbend']*100:.1f}%" if r['rbend'] is not None else '  N/A'
+            k_s    = f"{r['k']:.3f}"   if r['k'] is not None else '  N/A'
+            B_s    = f"{r['B']:+6.2f}" if r['B'] is not None else '   N/A'
+            fh.write(f"{r['label']:>7}  {rmsd_s:>6}  {r['n_active']:>6d}  "
+                     f"{rbe_s:>6}  {rbd_s:>6}  "
+                     f"{k_s:>6}  {B_s:>7}  "
+                     f"{r['peak_sigma']:>+7.2f}σ  {r['peak_atom']:>20}  "
+                     f"{r['peak_dist']:>5.2f}Å  {r['t']:>4.0f}s\n")
     if verbose:
-        print('\nDone.', flush=True)
+        print(f'\nDone.  Summary table: {log_path}', flush=True)
 
 
 def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
@@ -3453,7 +3527,8 @@ def main():
                      f_col=p['f_col'], phi_col=p['phi_col'],
                      run_refinement_flag=p['run_refinement'],
                      refine_cycles=p['refine_cycles'],
-                     sample_rate=p['sample_rate'])
+                     sample_rate=p['sample_rate'],
+                     subtract=p['subtract'])
         sys.exit(0)
 
     # ── altindex / origin resolution for single-fit path ─────────────────────
