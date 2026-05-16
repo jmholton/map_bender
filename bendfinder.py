@@ -2196,10 +2196,20 @@ def _scan_cell_matrix(hdr):
     ])
 
 
-def _scan_read_pdb_atoms_p1(pdb_path):
-    st  = gemmi.read_pdb(pdb_path)
-    sg  = st.find_spacegroup()
-    ops = sg.operations() if sg else gemmi.SpaceGroup('P1').operations()
+def _scan_read_pdb_atoms_p1(pdb_path, src='ref', cell_override=None):
+    """Read PDB, expand to P1, return list of atom dicts with frac coords.
+
+    src           : tag stored in each atom (e.g. 'ref', 'mov') so peak
+                    labels can show which structure an atom came from.
+    cell_override : if not None, fractionalize Cartesian atom positions with
+                    this gemmi.UnitCell instead of the PDB's own cell.  Use
+                    when loading mov atoms for peak hunting against a
+                    diff_map on ref's grid — keeps all fractional coords in
+                    the same frame even if mov/ref cells differ slightly."""
+    st       = gemmi.read_pdb(pdb_path)
+    sg       = st.find_spacegroup()
+    ops      = sg.operations() if sg else gemmi.SpaceGroup('P1').operations()
+    frac_cell = cell_override if cell_override is not None else st.cell
     out = []
     for model in st:
         for chain in model:
@@ -2207,7 +2217,7 @@ def _scan_read_pdb_atoms_p1(pdb_path):
                 for atom in res:
                     if atom.has_altloc() and atom.altloc != 'A':
                         continue
-                    f0 = st.cell.fractionalize(atom.pos)
+                    f0 = frac_cell.fractionalize(atom.pos)
                     f0 = np.array([f0.x, f0.y, f0.z])
                     for op in ops:
                         R = np.array([[op.rot[i][j] for j in range(3)]
@@ -2218,6 +2228,7 @@ def _scan_read_pdb_atoms_p1(pdb_path):
                                     'resseq': res.seqid.num,
                                     'resname': res.name,
                                     'atomname': atom.name,
+                                    'src': src,
                                     'frac': (R @ f0 + t) % 1.0})
     return out
 
@@ -2266,7 +2277,9 @@ def _scan_find_peaks(data, hdr, atoms, M, fp=5):
 
 
 def _atom_label(a):
-    return f"{a['chain']}/{a['resseq']}{a['resname']}/{a['atomname']}"
+    tag = a.get('src')
+    suffix = f"({tag[0]})" if tag else ''
+    return f"{a['chain']}/{a['resseq']}{a['resname']}/{a['atomname']}{suffix}"
 
 
 def _map2mtz(mapfile, mtzfile):
@@ -2623,7 +2636,16 @@ def fitreso_scan(
     ref_pts = np.stack([frac_x, frac_y, frac_z], axis=1)
 
     M     = _scan_cell_matrix(ref_h)
-    atoms = _scan_read_pdb_atoms_p1(ref_pdb)
+    # Atoms used for peak-labelling: union of ref and mov atoms.  Both
+    # fractionalized in ref's cell so distances are computed in a single
+    # frame (mov has already been moved into ref's frame by resolve_altindex
+    # when applicable).  Each atom carries an `src` tag ('r' or 'm') shown
+    # in the peak label.
+    _ref_cell = gemmi.UnitCell(*ref_h['cell'])
+    atoms     = (_scan_read_pdb_atoms_p1(ref_pdb, src='ref',
+                                          cell_override=_ref_cell)
+                 + _scan_read_pdb_atoms_p1(mov_pdb, src='mov',
+                                            cell_override=_ref_cell))
 
     # ── ref MTZ for Riso (FT of reference density map) ────────────────────────
     _PHI_LOOKUP = {'FWT': 'PHWT', '2FOFCWT': 'PH2FOFCWT', 'F': 'PHI'}
