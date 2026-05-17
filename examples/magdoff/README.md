@@ -23,24 +23,33 @@ ribonuclease as the case study:
 > isomorphous replacement for protein crystals. I.* Acta Cryst. **9**,
 > 901.
 
-The 1955 paper documents a "new shrinkage phenomenon" in ribonuclease II
-(P 2₁) crystals: when mounted somewhat dry, small temperature gradients
-over the capillary drive small local changes in vapor pressure, which
-in turn cause continuous, reversible cell-dimension fluctuations of up
-to ~0.5 Å.  Magdoff and Crick measured the intensity changes that
-accompany these sub-Ångström cell changes, established their magnitude,
-and showed they can be suppressed by mounting wetter or by blowing
-room-temperature air across the capillary.  The 1956 paper then
-develops the first-order theory linking small isomorphous displacements
-to changes in F — to first order, ΔF is *linear* in the imposed
-displacement field.
+The 1955 paper documents a continuous, reversible sub-Ångström
+cell-dimension fluctuation in ribonuclease II (P 2₁) crystals, driven
+by small temperature gradients across the mounting capillary and the
+associated humidity changes.  The point relevant here: such cell
+fluctuations produce measurable intensity changes — enough to confound
+isomorphous-replacement measurements unless they're either suppressed
+(mount wetter, equalise temperature) or modeled out.
 
-That linearity is the foundation a low-order Fourier shift field encodes.
-bendfinder solves the inverse problem: given the difference in atom
-positions between two crystal forms, recover the shift field.  These
-tests use **7rsa (ribonuclease A, P 2₁)** in honour of the original
-analysis, and Test 1 (uniform cell scaling 0.5 %) is a direct synthetic
-analogue of the Magdoff-Crick shrinkage.
+The 1956 paper then develops the first-order theory.  Working out the
+expected intensity change in centric and acentric reflections for both
+heavy-atom addition and for small displacements of the protein
+molecules, it derives explicit linear-in-displacement formulae for
+translations, rotations, cell-parameter changes, and "breathing"
+motions.  Two key qualitative results: (i) ΔI grows linearly with 1/d,
+so the same imposed displacement matters more at high resolution, and
+(ii) very small molecular shifts already interfere with isomorphous
+replacement at high 1/d while remaining negligible at low 1/d.
+
+Both results are exactly the regime a low-order Fourier shift field
+operates in: ΔF is approximately linear in the imposed displacement
+field, and the bandlimited cutoff is a feature, not a bug — it
+restricts the fit to the resolution range where first-order theory is
+valid.  bendfinder solves the inverse problem: given the difference in
+atom positions between two crystal forms, recover the shift field.
+These tests use **7rsa (ribonuclease A, P 2₁)** in honour of the
+original analysis, and Test 1 (uniform cell scaling 0.5 %) is a direct
+synthetic analogue of the Magdoff-Crick shrinkage.
 
 ## What `make_test_pdbs.py` produces
 

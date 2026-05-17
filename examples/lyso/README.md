@@ -8,10 +8,9 @@
 | CA pairs | 1008 |
 | sign convention | `subtract=ref` (default) → diff = bent − ref |
 
-Classic Magdoff scenario: same protein, slightly different unit cell
-(~2.5% cell change between humidity points).  Almost all the difference
-density is absorbed by the bending; what remains is real waters near the
-protein surface.
+Same protein, slightly different unit cell (~2.5 % cell change between
+humidity points).  Almost all the difference density is absorbed by the
+bending; what remains is real waters near the protein surface.
 
 ## Run
 

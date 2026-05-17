@@ -1353,49 +1353,62 @@ def _relabel_ops(atoms, k_offset, n_ops):
 # Alternative-indexing candidates by crystal system (fractional coords, det=+1).
 # These are proper rotations in the Laue-group holohedry that may be absent
 # from lower-symmetry space groups.
-_ALTINDEX_CANDIDATES = {
-    # hexagonal 2-folds about [110], [100], [010]-type axes
-    'trigonal':    [np.array([[0, 1, 0],[1, 0, 0],[0, 0,-1]], float),
-                    np.array([[1,-1, 0],[0,-1, 0],[0, 0,-1]], float),
-                    np.array([[0,-1, 0],[-1, 1, 0],[0, 0,-1]], float)],
-    'hexagonal':   [np.array([[0, 1, 0],[1, 0, 0],[0, 0,-1]], float),
-                    np.array([[1,-1, 0],[0,-1, 0],[0, 0,-1]], float),
-                    np.array([[0,-1, 0],[-1, 1, 0],[0, 0,-1]], float)],
-    # tetragonal 2-fold about [110] (swaps a,b, inverts c)
-    'tetragonal':  [np.array([[0, 1, 0],[1, 0, 0],[0, 0,-1]], float)],
-    # orthorhombic axis permutations
-    'orthorhombic':[np.array([[0, 1, 0],[0, 0, 1],[1, 0, 0]], float),
-                    np.array([[0, 0, 1],[1, 0, 0],[0, 1, 0]], float),
-                    np.array([[0, 1, 0],[1, 0, 0],[0, 0,-1]], float),
-                    np.array([[0, 0, 1],[0,-1, 0],[1, 0, 0]], float),
-                    np.array([[-1, 0, 0],[0, 0, 1],[0, 1, 0]], float)],
-    # cubic cyclic axis permutations
-    'cubic':       [np.array([[0, 1, 0],[0, 0, 1],[1, 0, 0]], float),
-                    np.array([[0, 0, 1],[1, 0, 0],[0, 1, 0]], float)],
-    'monoclinic':  [],
-    'triclinic':   [],
-}
+def _metric_tensor(cell):
+    """Lattice metric tensor G = O^T·O in cartesian, where O is the
+    fractional→cartesian basis matrix (columns are a, b, c vectors).
+    Accepts a (a,b,c,α,β,γ) tuple or a gemmi.UnitCell."""
+    if not isinstance(cell, gemmi.UnitCell):
+        cell = gemmi.UnitCell(*cell)
+    O = np.zeros((3, 3))
+    for i, b in enumerate([(1, 0, 0), (0, 1, 0), (0, 0, 1)]):
+        p = cell.orthogonalize(gemmi.Fractional(*b))
+        O[:, i] = [p.x, p.y, p.z]
+    return O.T @ O
 
 
-def _get_altindex_ops(sg_name):
-    """Return list of altindex rotation matrices not already in the SG."""
+def _get_altindex_ops(sg_name, cell=None):
+    """All proper-rotation integer matrices R (entries in {-1, 0, 1}) that
+    preserve the cell's lattice metric tensor and are NOT in this SG's
+    rotation set.  These are the "altindex" candidates: rotations that map
+    the lattice to itself but aren't already symmetries of the SG (e.g.
+    the 6-fold along c for H 3 / R 3 Sohncke groups, hex 2-folds for
+    trigonal point group 3, axis permutations for orthorhombic, etc.).
+
+    Returns a list of (3, 3) float arrays (empty if the SG already spans
+    its lattice holohedry, e.g. P -1, P 2/m, F 4/mmm).
+
+    A `cell` is needed because metric-preservation depends on the lattice
+    parameters (a hex 2-fold is a rotation only when a=b and γ=120°).  If
+    cell is None we use a generic isotropic test that may admit non-
+    physical ops; pass the real cell for correctness.
+    """
+    import itertools
     sg = gemmi.find_spacegroup_by_name(sg_name)
-    cs = sg.crystal_system_str()
-    candidates = _ALTINDEX_CANDIDATES.get(cs, [])
-    if not candidates:
-        return []
-    # Collect the SG's proper rotation matrices (integer form ×1 after rounding)
-    sg_rots = set()
+    if cell is None:
+        # Fall back to crystal-system-typical metric (identity); imperfect
+        cell_for_G = (10.0, 10.0, 10.0, 90.0, 90.0, 90.0)
+    else:
+        cell_for_G = cell
+    G = _metric_tensor(cell_for_G)
+
+    # SG's existing proper rotations (integer R with det = +1)
+    sg_R = set()
     for op in sg.operations():
-        R = np.array(op.rot, dtype=float) / 24.0
-        if round(np.linalg.det(R)) == 1:
-            sg_rots.add(tuple(np.round(R).astype(int).ravel()))
-    result = []
-    for R in candidates:
-        key = tuple(np.round(R).astype(int).ravel())
-        if key not in sg_rots:
-            result.append(R)
-    return result
+        R = (np.array(op.rot, dtype=int) // op.DEN)
+        if int(round(np.linalg.det(R))) == 1:
+            sg_R.add(tuple(R.flatten()))
+
+    tol = 1e-6 * float(np.max(np.abs(G)))
+    out = []
+    for comps in itertools.product([-1, 0, 1], repeat=9):
+        R = np.array(comps, dtype=int).reshape(3, 3)
+        if int(round(np.linalg.det(R))) != 1:        # proper rotations only
+            continue
+        if tuple(R.flatten()) in sg_R:               # already an SG op
+            continue
+        if np.allclose(R.T @ G @ R, G, atol=tol):
+            out.append(R.astype(float))
+    return out
 
 
 def _apply_rotation_to_atoms(atoms, R):
@@ -1434,7 +1447,7 @@ def _reexpand_atoms_with_rotation(atoms_full, R_alt, sg_name):
     return out
 
 
-def _find_best_origin(atoms1_op0, atoms2, sg_name, n_polar=12):
+def _find_best_origin(atoms1_op0, atoms2, sg_name, cell=None, n_polar=12):
     """Find best (origin_shift, symop_idx, altindex_R, improved).
 
     Searches (allowed_shift, operator_k) combinations.  If no improvement,
@@ -1485,7 +1498,7 @@ def _find_best_origin(atoms1_op0, atoms2, sg_name, n_polar=12):
     best_R_alt = None
 
     if not (best_score < ref_score * 0.9):
-        for R_alt in _get_altindex_ops(sg_name):
+        for R_alt in _get_altindex_ops(sg_name, cell=cell):
             atoms2_alt = _reexpand_atoms_with_rotation(atoms2, R_alt, sg_name)
             s, d, k = _search(atoms2_alt)
             if s < best_score:
@@ -1514,7 +1527,8 @@ def find_origin_alignment(pdb1_path, pdb2_path,
     if not len(op0_ca_sh) or np.max(np.sqrt(np.sum(op0_ca_sh**2, axis=1))) <= 0.1:
         return np.zeros(3), 0, None, False
     shift, best_k, best_R_alt, improved = _find_best_origin(
-        [a for a in atoms1 if a['uid'].endswith('_op0')], atoms2, sg1)
+        [a for a in atoms1 if a['uid'].endswith('_op0')], atoms2, sg1,
+        cell=cell1)
     if improved and (np.any(np.abs(shift) > 1e-6) or best_k != 0
                      or best_R_alt is not None):
         return shift, best_k, best_R_alt, True
@@ -1573,7 +1587,8 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, fitreso=None, drop_snr=1.0,
                         for u, m in zip(uids, ca_mask)], 3:6]
     if len(op0_ca_sh) and np.max(np.sqrt(np.sum(op0_ca_sh**2, axis=1))) > 0.1:
         shift, best_k, best_R_alt, improved = _find_best_origin(
-            [a for a in atoms1 if a['uid'].endswith('_op0')], atoms2, sg1)
+            [a for a in atoms1 if a['uid'].endswith('_op0')], atoms2, sg1,
+            cell=cell1)
         if improved and (np.any(np.abs(shift) > 1e-6) or best_k != 0
                          or best_R_alt is not None):
             msg = f"  origin shift: ({shift[0]:.4f}, {shift[1]:.4f}, {shift[2]:.4f}) for {sg1}"
@@ -1822,7 +1837,8 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                             for u, m in zip(uids, ca_mask)], 3:6]
         if len(op0_ca_sh) and np.max(np.sqrt(np.sum(op0_ca_sh**2, axis=1))) > 0.1:
             shift, best_k, best_R_alt, improved = _find_best_origin(
-                [a for a in atoms1 if a['uid'].endswith('_op0')], atoms2, sg1)
+                [a for a in atoms1 if a['uid'].endswith('_op0')], atoms2, sg1,
+                cell=cell1)
             if improved and (np.any(np.abs(shift) > 1e-6) or best_k != 0
                              or best_R_alt is not None):
                 msg = f"  origin shift: ({shift[0]:.4f}, {shift[1]:.4f}, {shift[2]:.4f}) for {sg1}"
@@ -3347,9 +3363,15 @@ def _enum_alt_rot_origin_candidates(cell, sg, sg_name):
 
     sg_name is the H-M symbol from the PDB header (e.g. 'H 3'); used to look up
     origin choices in _ORIGINS_TABLE.  gemmi's xhm() returns 'R 3:H' for H3 etc.,
-    which doesn't match _ORIGINS_TABLE keys."""
-    cs = sg.crystal_system_str()
-    alt_rots = [np.eye(3)] + list(_ALTINDEX_CANDIDATES.get(cs, []))
+    which doesn't match _ORIGINS_TABLE keys.
+
+    Altindex rotations come from `_get_altindex_ops(sg_name, cell)` —
+    metric-tensor enumeration of integer proper rotations preserving the
+    cell's lattice that are NOT already in the SG.  This finds the full
+    set of valid altindex candidates (including 6-folds along c for
+    Sohncke trig/hex groups, axis permutations for orthorhombic, etc.),
+    not just a hand-coded subset."""
+    alt_rots = [np.eye(3)] + list(_get_altindex_ops(sg_name, cell=cell))
     sym_ops = list(sg.operations())
     key = _sg_origins_key(sg_name)
     entries = _ORIGINS_TABLE.get(key)

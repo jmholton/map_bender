@@ -1,0 +1,32 @@
+# fitreso_scan summary
+# mov_pdb : insulin/scan_fitreso/altindex_resolve/4fg3_alt_refined.pdb
+# ref_pdb : insulin/4e7u.pdb
+# mov_mtz : insulin/scan_fitreso/altindex_resolve/4fg3_alt_refined.mtz
+# ref_mtz : insulin/scan_fitreso/refine_ref/4e7u_refined.mtz
+# scan_dir: insulin/scan_fitreso
+# sign    : diff = bent − ref  (+peak ⇒ density in bent absent from ref)
+# Rbent   : Rfac after F-space (k+B) scaling of bent → ref
+# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)
+# k, B    : F-space scale + isotropic B (Å²) used for Rbent
+
+  label    RMSD  active   Rbent   Rbend       k    B(Å²)     peak                  atom    dist   t(s)
+------------------------------------------------------------------------------------------------------
+  hkl00   2.612       0   98.1%    0.0%   0.217    -2.60   -39.25σ         D/101ZN/ZN(r)   0.04Å     0s
+  hkl01   2.607       2   98.1%    0.2%   0.217    -2.58   -39.23σ         D/101ZN/ZN(r)   0.04Å     0s
+  hkl02   3.043       5   94.1%  118.8%   0.309    -4.94   -38.02σ         D/101ZN/ZN(r)   0.04Å     1s
+  hkl03   2.522       8   92.1%  121.2%   0.366    -6.04   -37.72σ         D/101ZN/ZN(r)   0.04Å     1s
+  hkl04   2.524      11   92.1%  120.5%   0.364    -6.05   -37.74σ         D/101ZN/ZN(r)   0.04Å     1s
+  hkl05   2.578      12   87.8%  123.9%   0.435    -7.47   -35.97σ         D/101ZN/ZN(r)   0.04Å     1s
+  hkl06   2.625      13   87.4%  124.1%   0.440    -7.54   -35.88σ         D/101ZN/ZN(r)   0.04Å     1s
+  hkl07   2.237      18   87.4%  132.4%   0.435    -7.41   -37.04σ         D/101ZN/ZN(r)   0.04Å     2s
+  hkl08   2.237      19   87.4%  132.4%   0.435    -7.41   -37.04σ         D/101ZN/ZN(r)   0.04Å     2s
+  hkl09   2.237      24   87.4%  132.4%   0.435    -7.41   -37.04σ         D/101ZN/ZN(r)   0.04Å     2s
+  hkl10   2.237      26   87.4%  132.4%   0.435    -7.41   -37.04σ         D/101ZN/ZN(r)   0.04Å     2s
+   fr20   1.635      53   78.2%  132.9%   0.511   -10.83   -34.64σ         D/101ZN/ZN(r)   0.04Å     1s
+   fr15   1.550     101   76.9%  133.7%   0.513   -11.16   -34.41σ         D/101ZN/ZN(r)   0.04Å     1s
+   fr12   1.113     201   73.1%  133.1%   0.534   -11.34   -34.23σ         D/101ZN/ZN(r)   0.04Å     2s
+   fr10   0.864     401   72.8%  138.8%   0.512   -10.25   -33.34σ         D/101ZN/ZN(r)   0.04Å     9s
+    fr8   0.907     501   73.0%  140.2%   0.547    -8.29   -33.06σ         D/101ZN/ZN(r)   0.04Å    15s
+    fr7   0.907     501   73.0%  140.2%   0.547    -8.29   -33.06σ         D/101ZN/ZN(r)   0.04Å    15s
+    fr6   0.907     501   73.0%  140.2%   0.547    -8.29   -33.06σ         D/101ZN/ZN(r)   0.04Å    15s
+    fr5   0.907     501   73.0%  140.2%   0.547    -8.29   -33.06σ         D/101ZN/ZN(r)   0.04Å    16s

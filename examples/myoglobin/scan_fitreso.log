@@ -1,0 +1,32 @@
+# fitreso_scan summary
+# mov_pdb : myoglobin/1mbo.pdb
+# ref_pdb : myoglobin/1a6m.pdb
+# mov_mtz : myoglobin/scan_fitreso/refine_mov/1mbo_refined.mtz
+# ref_mtz : myoglobin/scan_fitreso/refine_ref/1a6m_refined.mtz
+# scan_dir: myoglobin/scan_fitreso
+# sign    : diff = bent − ref  (+peak ⇒ density in bent absent from ref)
+# Rbent   : Rfac after F-space (k+B) scaling of bent → ref
+# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)
+# k, B    : F-space scale + isotropic B (Å²) used for Rbent
+
+  label    RMSD  active   Rbent   Rbend       k    B(Å²)     peak                  atom    dist   t(s)
+------------------------------------------------------------------------------------------------------
+  hkl00   0.308       0   55.7%    0.0%   0.907    -3.45   -32.75σ        A/155HEM/FE(m)   0.14Å     0s
+  hkl01   0.196       2   54.3%   12.0%   0.908    -3.65   -38.35σ        A/155HEM/FE(m)   0.14Å     0s
+  hkl02   0.186       3   54.0%   14.1%   0.906    -3.73   -37.32σ        A/155HEM/FE(m)   0.14Å     0s
+  hkl03   0.180       4   53.9%   15.6%   0.904    -3.78   -36.72σ        A/155HEM/FE(m)   0.14Å     0s
+  hkl04   0.173       5   53.9%   16.0%   0.904    -3.80   -35.26σ        A/155HEM/FE(m)   0.14Å     0s
+  hkl05   0.165       6   53.8%   16.2%   0.903    -3.83   -35.08σ        A/155HEM/FE(m)   0.14Å     0s
+  hkl06   0.169       7   53.8%   17.6%   0.902    -3.86   -35.78σ        A/155HEM/FE(m)   0.14Å     0s
+  hkl07   0.159       9   53.7%   17.2%   0.902    -3.87   -35.41σ        A/155HEM/FE(m)   0.14Å     1s
+  hkl08   0.150      10   53.5%   17.4%   0.901    -3.90   -34.90σ        A/155HEM/FE(m)   0.14Å     1s
+  hkl09   0.150      11   53.5%   17.4%   0.901    -3.91   -35.29σ        A/155HEM/FE(m)   0.14Å     1s
+  hkl10   0.147      13   53.4%   17.8%   0.900    -3.95   -35.72σ        A/155HEM/FE(m)   0.14Å     1s
+   fr20   0.136      23   53.3%   18.9%   0.899    -3.98   -35.31σ        A/155HEM/FE(m)   0.14Å     0s
+   fr15   0.120      42   53.0%   19.9%   0.895    -4.11   -36.61σ        A/155HEM/FE(m)   0.14Å     0s
+   fr12   0.097      81   52.7%   22.5%   0.888    -4.29   -41.30σ        A/155HEM/FE(m)   0.14Å     1s
+   fr10   0.091     101   52.6%   23.2%   0.886    -4.35   -40.99σ        A/155HEM/FE(m)   0.14Å     1s
+    fr8   0.073     201   51.9%   26.6%   0.876    -4.68   -38.37σ        A/155HEM/FE(m)   0.14Å     6s
+    fr7   0.060     401   50.7%   32.4%   0.855    -5.30   -38.47σ        A/155HEM/FE(m)   0.14Å    40s
+    fr6   0.063     501   49.7%   39.4%   0.832    -5.76   -38.53σ        A/155HEM/FE(m)   0.14Å    71s
+    fr5   0.063     501   49.7%   39.4%   0.832    -5.76   -38.53σ        A/155HEM/FE(m)   0.14Å    68s
