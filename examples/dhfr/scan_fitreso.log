@@ -1,0 +1,32 @@
+# fitreso_scan summary
+# mov_pdb : dhfr/1rx2.pdb
+# ref_pdb : dhfr/1rx1.pdb
+# mov_mtz : dhfr/scan_fitreso/refine_mov/1rx2_refined.mtz
+# ref_mtz : dhfr/scan_fitreso/refine_ref/1rx1_refined.mtz
+# scan_dir: dhfr/scan_fitreso
+# sign    : diff = bent − ref  (+peak ⇒ density in bent absent from ref)
+# Rbent   : Rfac after F-space (k+B) scaling of bent → ref
+# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)
+# k, B    : F-space scale + isotropic B (Å²) used for Rbent
+
+  label    RMSD  active   Rbent   Rbend       k    B(Å²)     peak                  atom    dist   t(s)
+------------------------------------------------------------------------------------------------------
+  hkl00   0.448       0   43.0%    0.0%   0.943    +1.96    -8.40σ          A/73THR/O(r)   0.43Å     0s
+  hkl01   0.405       2   42.3%   13.0%   0.948    +2.00    +7.62σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl02   0.402       3   42.0%   14.2%   0.948    +1.97    +7.74σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl03   0.325       4   40.2%   21.9%   0.951    +1.74    +8.32σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl04   0.325       5   40.0%   21.1%   0.950    +1.68    +8.65σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl05   0.303       7   39.5%   24.3%   0.951    +1.62    +8.40σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl06   0.300       8   39.3%   23.9%   0.951    +1.59    +8.41σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl07   0.275      10   39.0%   25.8%   0.952    +1.59    +8.75σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl08   0.281      11   39.1%   28.0%   0.953    +1.63    +8.68σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl09   0.267      13   38.6%   26.5%   0.953    +1.54    +8.85σ       A/161FOL/C14(m)   0.36Å     0s
+  hkl10   0.251      15   38.4%   27.3%   0.954    +1.54    +8.81σ       A/161FOL/C14(m)   0.36Å     0s
+   fr20   0.213      42   38.0%   27.8%   0.956    +1.48    +9.11σ       A/161FOL/C14(m)   0.36Å     1s
+   fr15   0.177      98   37.7%   29.1%   0.955    +1.39    +8.39σ       A/161FOL/C14(m)   0.36Å     2s
+   fr12   0.175     101   37.7%   29.3%   0.955    +1.39    -8.04σ         A/357HOH/O(r)   0.37Å     2s
+   fr10   0.121     301   37.9%   31.4%   0.957    +1.40    -8.10σ         A/300CA/CA(r)   0.68Å    12s
+    fr8   0.087     601   39.9%   36.1%   0.947    +1.46    +8.44σ       A/161FOL/C14(m)   0.66Å    72s
+    fr7   0.070     901   41.5%   38.3%   0.948    +1.80   -10.46σ         A/300CA/CA(r)   0.68Å   200s
+    fr6   0.070     901   41.5%   38.3%   0.948    +1.80   -10.46σ         A/300CA/CA(r)   0.68Å   201s
+    fr5   0.070     901   41.5%   38.3%   0.948    +1.80   -10.46σ         A/300CA/CA(r)   0.68Å   202s

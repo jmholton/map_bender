@@ -239,19 +239,50 @@ Both tests fit 3 progressive iterations (20→7 Å), completing in ~25 s per fit
 
 All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `batch_hkls=100`).
 
-| System | Space group | CA pairs | fr5 RMSD | fr5 Rfac | hkl00 Rfac |
-|--------|------------|----------|----------|----------|------------|
-| Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.034 Å | 33.2% | 59.5% |
-| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 636 | 0.070 Å | 41.5% | 43.0% |
-| Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | — | — |
-| Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.082 Å | 20.6% | 13.4% |
-| Raddam 5kxk→5kxm | P4₃2₁2 | 984 | — | — | 11.0% |
-| Raddam 5kxk→5kxn | P4₃2₁2 | ~992 | — | — | — |
-| Insulin 4fg3→4e7u | H3 | 534 | 1.063 Å | 68.7% | 83.7% |
+| System | Space group | CA pairs | fr5 RMSD | fr5 Rbent | hkl00 Rbent | subtract |
+|--------|------------|----------|----------|-----------|-------------|----------|
+| Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.034 Å | 29.6% | 53.1% | ref |
+| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 636 | 0.070 Å | 41.5% | 43.0% | ref |
+| Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.086 Å | 22.1% | 11.0% | bent |
+| Raddam 5kxk→5kxm | P4₃2₁2 | 984 | 0.047 Å | 19.2% |  9.4% | bent |
+| Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.051 Å | 24.6% | 18.1% | bent |
+| Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | — | — | — |
+| Insulin 4fg3→4e7u | H3 | 534 | 1.063 Å | 68.7% | 83.7% | — |
+
+Rbent values are post-F-space (k+B) scaling (compute_riso F-LS).  See per-
+system README files in `lyso/`, `dhfr/`, `raddam/` for invocation details
+and full peak tables.
 
 Notes:
-- Lyso Rfac plateaus at ~33% by fr20 and barely changes with higher resolution — real structural differences remain in the diff map (A/74ASN/O is the persistent −10σ peak).
-- DHFR Rfac barely improves (43% → 42%) — these crystal forms are more dissimilar; the FOL ligand (in 1rx2 only) and Ca²⁺/Mn²⁺ ions dominate the diff map at all resolutions. With mov=1rx2 ref=1rx1 and the default subtract=ref, FOL atoms show as +4–7σ positive (green) density (top atom O4 at +6.78σ in fr5) while the Ca²⁺ (present only in 1rx1) appears as a −10σ negative (red) peak at A/300CA/CA. FOL is **not** present in 1rx1; the title "complexed with" refers to the NADPH-analog NAP that's in both structures.
-- Raddam Rfac *starts* low (13–11%) because the fc maps are nearly identical; huge water peaks (±30–65σ) reflect water molecules appearing/disappearing with radiation dose.
-- Myoglobin Rfac pending (gemmi map2mtz re-run in progress); heme iron dominates diff map throughout (±35σ at A/154HEM/FE).
-- Insulin: high Rfac (68.7%) and high residual RMSD (1.063 Å) reflect genuine T→R conformational change — LEU B6 shifts ~8 Å between T-state (4fg3) and R-state (4e7u), which is outside the smooth shift-field model. RMSD best at fr10 (0.988 Å, 401 HKLs); OD limit hit at 501 HKLs for fr8–fr5. Dominant diff peaks: +34σ at D/101ZN/ZN (zinc position differs), −10σ at waters/SCN.
+- **Lyso** Rbent plateaus at ~30% by fr10 and barely changes with higher
+  resolution — real structural differences remain in the diff map (waters
+  near the protein surface are the persistent ±5σ peaks; cell+protein
+  flex are absorbed by the PSDVF).  B-factor drops from +16 (hkl00,
+  pre-bending mismatch) → +8 (fr10+, true residual B).
+- **DHFR** Rbent barely improves (43% → 42%); these crystal forms are
+  more dissimilar.  With mov=1rx2 ref=1rx1 and the default `subtract=ref`,
+  **FOL ligand atoms appear as +4–7σ positive (green) density** (O4 +6.78σ,
+  C14 +9σ at low res) and the **Ca²⁺ at A/300CA(r) appears as a −10σ red
+  peak** (Ca²⁺ is in 1rx1 only).  FOL is **not** in 1rx1; the title
+  "complexed with" refers to NAP which is in both.  rigid-body refmac
+  keeps both FWT outputs on the same scale so B stays near zero.
+- **Raddam** (5kxk undamaged → 5kxl/m/n increasingly damaged) is run with
+  `subtract=bent` so **positive peaks = features appearing with dose**.
+  Findings across the dose series:
+    * Persistent strongly-negative CYS/SG peaks (5kxk has more sulfur
+      density than the damaged refs) — disulfide breakage/oxidation.
+      5kxl: −10σ at A/30CYS/SG and A/115CYS/SG; 5kxn: −13 to −15σ at
+      A/30CYS/SG, A/94CYS/SG.
+    * **5kxm Cl⁻ accumulation**: +22.4σ positive peak at A/205CL/CL(m) by
+      fr5 — chloride radiolysis product accumulating with mid-dose.
+    * Waters reorganize — A/394HOH(r) −15.9σ in 5kxl, A/398HOH(r) +13.2σ
+      in 5kxn.
+    * fr5 RMSD: 5kxl 0.086, 5kxm 0.047, 5kxn 0.051 Å — 5kxm gives the
+      cleanest fit (best data quality of the damaged set).
+- **Myoglobin** Rbent pending; heme iron dominates diff map throughout
+  (±35σ at A/154HEM/FE).
+- **Insulin**: high Rbent (68.7%) and residual RMSD (1.063 Å) reflect
+  genuine T→R conformational change — LEU B6 shifts ~8 Å between
+  T-state (4fg3) and R-state (4e7u), which is outside the smooth
+  shift-field model.  Dominant diff peaks: +34σ at D/101ZN/ZN
+  (zinc position differs), −10σ at waters/SCN.

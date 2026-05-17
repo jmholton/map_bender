@@ -1,0 +1,32 @@
+# fitreso_scan summary
+# mov_pdb : raddam/5kxk.pdb
+# ref_pdb : raddam/5kxl.pdb
+# mov_mtz : raddam/scan_fitreso_5kxl/refine_mov/5kxk_refined.mtz
+# ref_mtz : raddam/scan_fitreso_5kxl/refine_ref/5kxl_refined.mtz
+# scan_dir: raddam/scan_fitreso_5kxl
+# sign    : diff = ref − bent  (+peak ⇒ density in ref absent from bent)
+# Rbent   : Rfac after F-space (k+B) scaling of bent → ref
+# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)
+# k, B    : F-space scale + isotropic B (Å²) used for Rbent
+
+  label    RMSD  active   Rbent   Rbend       k    B(Å²)     peak                  atom    dist   t(s)
+------------------------------------------------------------------------------------------------------
+  hkl00   0.118       0   11.0%    0.0%   0.976    +0.26    -9.61σ         A/30CYS/SG(m)   0.18Å     1s
+  hkl01   0.119       2   11.0%    0.9%   0.976    +0.25    -9.84σ         A/30CYS/SG(m)   0.18Å     1s
+  hkl02   0.118       4   11.0%    1.1%   0.976    +0.25   -10.18σ         A/30CYS/SG(m)   0.18Å     1s
+  hkl03   0.119       6   11.0%    2.0%   0.976    +0.25   -10.36σ         A/30CYS/SG(m)   0.18Å     1s
+  hkl04   0.118       8   11.0%    1.8%   0.976    +0.25   -10.12σ         A/30CYS/SG(m)   0.18Å     2s
+  hkl05   0.119       9   11.0%    2.0%   0.976    +0.25   -10.21σ         A/30CYS/SG(m)   0.18Å     2s
+  hkl06   0.118      13   11.1%    2.5%   0.976    +0.25    -9.41σ         A/30CYS/SG(m)   0.18Å     2s
+  hkl07   0.119      17   11.0%    2.4%   0.976    +0.25    -9.82σ        A/115CYS/SG(m)   0.12Å     3s
+  hkl08   0.118      21   11.0%    2.3%   0.976    +0.25   -10.09σ        A/115CYS/SG(m)   0.12Å     3s
+  hkl09   0.118      23   11.0%    2.4%   0.976    +0.25   -10.09σ        A/115CYS/SG(m)   0.12Å     3s
+  hkl10   0.118      27   11.0%    2.3%   0.976    +0.25   -10.44σ        A/115CYS/SG(m)   0.12Å     4s
+   fr20   0.114      60   11.5%    4.1%   0.976    +0.24   -11.09σ        A/115CYS/SG(m)   0.12Å     1s
+   fr15   0.110     101   12.4%    6.1%   0.975    +0.23   -11.83σ         A/94CYS/SG(r)   0.39Å     1s
+   fr12   0.102     201   13.0%    7.4%   0.974    +0.22   -11.63σ         A/94CYS/SG(r)   0.39Å     2s
+   fr10   0.096     401   14.7%   10.0%   0.973    +0.22   +11.34σ         A/203CL/CL(r)   0.70Å     8s
+    fr8   0.088     901   19.4%   16.6%   0.966    +0.22   +14.84σ         A/427HOH/O(m)   0.34Å    50s
+    fr7   0.086    1201   22.1%   19.9%   0.962    +0.24   -15.85σ         A/394HOH/O(r)   0.90Å   103s
+    fr6   0.086    1201   22.1%   19.9%   0.962    +0.24   -15.85σ         A/394HOH/O(r)   0.90Å   117s
+    fr5   0.086    1201   22.1%   19.9%   0.962    +0.24   -15.85σ         A/394HOH/O(r)   0.90Å   102s

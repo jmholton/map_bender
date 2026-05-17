@@ -1,0 +1,32 @@
+# fitreso_scan summary
+# mov_pdb : raddam/5kxk.pdb
+# ref_pdb : raddam/5kxm.pdb
+# mov_mtz : raddam/scan_fitreso_5kxm/refine_mov/5kxk_refined.mtz
+# ref_mtz : raddam/scan_fitreso_5kxm/refine_ref/5kxm_refined.mtz
+# scan_dir: raddam/scan_fitreso_5kxm
+# sign    : diff = ref − bent  (+peak ⇒ density in ref absent from bent)
+# Rbent   : Rfac after F-space (k+B) scaling of bent → ref
+# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)
+# k, B    : F-space scale + isotropic B (Å²) used for Rbent
+
+  label    RMSD  active   Rbent   Rbend       k    B(Å²)     peak                  atom    dist   t(s)
+------------------------------------------------------------------------------------------------------
+  hkl00   0.082       0    9.4%    0.0%   0.982    -0.25    -4.37σ         A/427HOH/O(m)   1.08Å     1s
+  hkl01   0.082       2    9.4%    0.3%   0.982    -0.25    +4.32σ        A/35GLU/OE2(r)   1.54Å     1s
+  hkl02   0.082       4    9.4%    0.3%   0.982    -0.25    -4.38σ         A/427HOH/O(m)   1.08Å     1s
+  hkl03   0.082       6    9.4%    0.3%   0.982    -0.25    -4.36σ         A/427HOH/O(m)   1.08Å     1s
+  hkl04   0.082       8    9.4%    0.3%   0.982    -0.25    -4.37σ         A/427HOH/O(m)   1.08Å     2s
+  hkl05   0.082       9    9.5%    0.6%   0.982    -0.25    -4.46σ         A/427HOH/O(m)   1.08Å     2s
+  hkl06   0.082      13    9.5%    0.9%   0.982    -0.25    -4.29σ         A/334HOH/O(r)   1.12Å     2s
+  hkl07   0.082      17    9.5%    1.0%   0.982    -0.25    -4.39σ         A/427HOH/O(m)   1.08Å     3s
+  hkl08   0.082      21    9.5%    1.0%   0.982    -0.25    -4.38σ         A/334HOH/O(r)   1.12Å     3s
+  hkl09   0.082      23    9.5%    1.3%   0.982    -0.25    -4.43σ         A/334HOH/O(r)   1.12Å     3s
+  hkl10   0.082      27    9.5%    1.1%   0.982    -0.25    -4.60σ         A/334HOH/O(r)   0.46Å     4s
+   fr20   0.080      60    9.9%    2.9%   0.982    -0.25    +5.75σ        A/105MET/SD(r)   0.60Å     1s
+   fr15   0.076     101   10.6%    4.5%   0.982    -0.26    +6.46σ        A/105MET/SD(r)   0.60Å     1s
+   fr12   0.070     201   10.7%    4.7%   0.981    -0.26    -7.64σ         A/427HOH/O(m)   0.57Å     3s
+   fr10   0.062     401   12.2%    7.4%   0.980    -0.27   -11.37σ         A/205CL/CL(m)   0.51Å     8s
+    fr8   0.048     901   17.3%   14.4%   0.977    -0.24   +20.53σ         A/205CL/CL(m)   0.29Å    52s
+    fr7   0.047    1201   19.2%   16.8%   0.980    -0.17   +22.36σ         A/205CL/CL(m)   0.29Å   106s
+    fr6   0.047    1201   19.2%   16.8%   0.980    -0.17   +22.36σ         A/205CL/CL(m)   0.29Å   106s
+    fr5   0.047    1201   19.2%   16.8%   0.980    -0.17   +22.36σ         A/205CL/CL(m)   0.29Å   107s

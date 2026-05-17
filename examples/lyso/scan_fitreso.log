@@ -1,0 +1,32 @@
+# fitreso_scan summary
+# mov_pdb : lyso/3aw6.pdb
+# ref_pdb : lyso/3aw7.pdb
+# mov_mtz : lyso/scan_fitreso/refine_mov/3aw6_refined.mtz
+# ref_mtz : lyso/scan_fitreso/refine_ref/3aw7_refined.mtz
+# scan_dir: lyso/scan_fitreso
+# sign    : diff = bent − ref  (+peak ⇒ density in bent absent from ref)
+# Rbent   : Rfac after F-space (k+B) scaling of bent → ref
+# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)
+# k, B    : F-space scale + isotropic B (Å²) used for Rbent
+
+  label    RMSD  active   Rbent   Rbend       k    B(Å²)     peak                  atom    dist   t(s)
+------------------------------------------------------------------------------------------------------
+  hkl00   0.759       0   53.1%    0.0%   0.992   +16.34    +6.94σ            A/80CYS/SG   1.72Å     0s
+  hkl01   0.616       2   50.0%   19.0%   0.998   +15.33    +6.33σ            A/80CYS/SG   1.72Å     0s
+  hkl02   0.367       4   37.7%   45.3%   0.999   +11.05    +5.41σ            A/76CYS/SG   1.19Å     0s
+  hkl03   0.307       6   33.9%   42.7%   0.996    +9.93    -6.17σ             A/89THR/O   0.56Å     0s
+  hkl04   0.305       8   33.9%   42.6%   0.996    +9.92    -6.52σ             A/89THR/O   0.56Å     0s
+  hkl05   0.304       9   34.0%   42.5%   0.995    +9.90    -6.80σ             A/89THR/O   0.56Å     0s
+  hkl06   0.269      13   32.8%   45.2%   0.998    +9.96    -5.99σ           A/15HIS/CD2   0.85Å     0s
+  hkl07   0.242      17   31.5%   43.6%   0.993    +9.63    -5.83σ           A/15HIS/CD2   0.85Å     0s
+  hkl08   0.212      21   30.5%   44.0%   0.987    +9.37    -5.58σ           A/15HIS/CD2   0.85Å     1s
+  hkl09   0.201      23   29.9%   44.2%   0.987    +9.27    -5.82σ           A/89THR/OG1   0.99Å     1s
+  hkl10   0.196      27   29.7%   44.7%   0.985    +9.20    -5.82σ           A/15HIS/CD2   0.85Å     1s
+   fr20   0.136      60   28.0%   45.3%   0.981    +8.78    -5.18σ           A/89THR/OG1   0.99Å     1s
+   fr15   0.118     101   27.6%   45.3%   0.979    +8.64    +4.78σ            A/12MET/SD   0.76Å     1s
+   fr12   0.090     201   27.1%   45.3%   0.975    +8.48    -4.71σ            A/137HOH/O   0.83Å     3s
+   fr10   0.069     401   27.0%   45.5%   0.969    +8.31    -4.75σ            A/143HOH/O   0.68Å     9s
+    fr8   0.042     901   27.2%   45.8%   0.964    +8.14    -5.37σ            A/137HOH/O   0.83Å    58s
+    fr7   0.033    1401   28.7%   46.9%   0.957    +8.01    -5.69σ            A/141HOH/O   0.90Å   181s
+    fr6   0.034    1501   29.6%   47.3%   0.954    +8.10    +6.93σ            A/183HOH/O   4.44Å   216s
+    fr5   0.034    1501   29.6%   47.3%   0.954    +8.10    +6.93σ            A/183HOH/O   4.44Å   216s
