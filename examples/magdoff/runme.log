@@ -1,0 +1,34 @@
+wrote 7rsa_scaled.pdb   (CRYST1 a,b,c x 1.005; atoms unchanged)
+wrote 7rsa_rotated.pdb  (0.5 deg about axis [+0.231,-0.789,+0.569], seed=42)
+
+================  Test 1: cell scaling x 1.005 ================
+expanding 7rsa_scaled.pdb from P21 to P1
+expanding 7rsa.pdb from P21 to P1
+  atom_sel='auto': 1912 atoms used for fitting
+largest fractional CA shift: 0.0088166 for A_61_LYS_CA_op1
+CA RMSD after origin fix: 0.197 Å  (248 CA pairs)
+fitreso=7.0 A → 372 HKLs for each dimension: xyz
+
+=================  Starting nhkls 373 fit at 0 s
+
+214 canonical HKLs (2 proper symops, reduction 373/214=1.7x)
+SNR-pruned 95 params
+RMSD(CA) = 0.011 A  (248 CA atoms, 278 active HKLs, 32 s)
+fitparams saved to psdvf.mtz
+bent PDB: bent278.pdb
+
+================  Test 2: rigid rotation 0.5 deg ================
+expanding 7rsa_rotated.pdb from P21 to P1
+expanding 7rsa.pdb from P21 to P1
+  atom_sel='auto': 1912 atoms used for fitting
+largest fractional CA shift: 0.0098471 for A_76_TYR_CA_op0
+CA RMSD after origin fix: 0.335 Å  (248 CA pairs)
+fitreso=7.0 A → 364 HKLs for each dimension: xyz
+
+=================  Starting nhkls 365 fit at 0 s
+
+210 canonical HKLs (2 proper symops, reduction 365/210=1.7x)
+SNR-pruned 105 params
+RMSD(CA) = 0.017 A  (248 CA atoms, 260 active HKLs, 29 s)
+fitparams saved to psdvf.mtz
+bent PDB: bent260.pdb

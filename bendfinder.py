@@ -1662,6 +1662,7 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, fitreso=None, drop_snr=1.0,
     frac_coords = fitme_fit[:, :3]
 
     # Use symmetry-constrained fitting when all xyz dims are present and sg > P1
+    proper_ops = get_proper_symops(sg1)
     do_symm = (use_symm and len(proper_ops) > 1
                and all(d in dim_list for d in 'xyz'))
 
