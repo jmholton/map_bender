@@ -148,26 +148,56 @@ All test-system maps are ASU maps (not full-cell): lysozyme covers ~½ cell in e
 
 **Additional fix for fitreso_scan with CCP4 ASU map input:** reflect-padding the *unmoved* hkl00 boundary is fine, but once the shift field is active (fr20 onwards), `delta(ref_pt)` can push the sample point past the ASU edge. The reflected value is then physically unrelated to the actual reference density at that boundary, producing a concentrated noise plane at y=0.5 / z=0.5 in `diff_norm.map` (lyso fr20 baseline: 176 voxels > 5σ, max |peak| = 14σ). The fix is to expand the moving CCP4 ASU map to the full unit cell via `read_ccp4_fullcell` and use `pad_mode='wrap'`. `fitreso_scan` now defaults `mov_fullcell=None` which auto-enables this for `.map`/`.ccp4`/`.mrc` inputs (MTZ inputs are full-cell by construction via `mtz_to_map_data`). After fix, lyso fr20 boundary peaks drop from 176 → 3 voxels > 5σ. Do not pass `mov_fullcell=False` unless you specifically want ASU-only voxels (almost always wrong for scanning).
 
-## gemmi map→MTZ conversion
+## gemmi map→MTZ conversion — known `prepare_asu_data` incompleteness bugs
 
-The `map2mtz` function in scan scripts uses:
+**Do not use `transform_map_to_f_phi + prepare_asu_data` for writing bent.mtz.**
+Both gemmi v0.6 (CCP4 8) and v0.7 (CCP4 9) have ASU-completeness bugs for
+trigonal/hexagonal space groups that cause ~50% of unique reflections to be
+absent from the output MTZ.  The map itself is always correct; only the
+map→MTZ FFT step is broken.
 
-```python
-ccp4 = gemmi.read_ccp4_map(mapfile)
-ccp4.setup(float('nan'))
-sf   = gemmi.transform_map_to_f_phi(ccp4.grid, half_l=True)
-data = sf.prepare_asu_data(dmin=0.0)
-mtz  = gemmi.Mtz(with_base=True)
-mtz.spacegroup = ccp4.grid.spacegroup
-mtz.cell       = ccp4.grid.unit_cell
-mtz.add_dataset('dataset')
-mtz.add_column('F', 'F')
-mtz.add_column('PHI', 'P')
-...
-mtz.write_to_file(mtzfile)
+### v0.6 (CCP4 8) bug
+`prepare_asu_data` used an orthorhombic-style h≥0 ∧ k≥0 ∧ l≥0 wedge for
+R 3:H instead of the correct trigonal ASU — dropping all reflections with
+l < 0.  Result for insulin: 22,991 rows (l ∈ [0, 30]) instead of the correct
+~46,000.
+
+### v0.7 (CCP4 9) bug
+A different incompleteness: k=0 reflections (the (h,0,l) plane, including
+the entire (0,0,l) axis) are absent.  Result: 23,527 rows (k ∈ [1, 55])
+instead of ~46,000.  Confirmed by `gemmi map2sf --dmin 1` on the same
+bent.map, which gives 46,032 rows at 100% completeness.
+
+Diagnostic used:
+```
+gemmi map2sf --dmin 1 bent.map bent_back.mtz F PHI
+diff.com bent.mtz FDM bent_back.mtz
+mtzdmp Fdiff.mtz
+# → Fref (FDM) 51% complete; (0,0,l) axis 100% missing from FDM
 ```
 
-This replaces the old sfall subprocess approach (which failed for P2₁ maps). No CCP4 programs needed for this step; gemmi handles axis ordering from the CCP4 header automatically.
+### Fix: direct numpy FFT lookup
+
+Replace the `transform_map_to_f_phi + prepare_asu_data` path with a direct
+`np.fft.fftn` and index into the FFT grid at the required HKL positions.
+For a map stored as `(NZ, NY, NX)` (maps=3, mapr=2, mapc=1):
+
+```python
+F_grid = np.fft.fftn(data.astype(np.float64))   # shape (NZ, NY, NX)
+# Crystallographic convention: F(H,K,L) = F_grid[-L%NZ, -K%NY, -H%NX]
+H, K, L = hkl[:,0], hkl[:,1], hkl[:,2]
+F_complex = F_grid[(-L)%NZ, (-K)%NY, (-H)%NX]
+```
+
+In `_fspace_scale_and_diff`, extract bent SFs directly at the ref.mtz HKL
+positions — no ASU enumeration, no temp file, 100% HKL match by construction.
+This is the planned replacement for the broken gemmi path.  See
+`GEMMI_DEPENDENCY.md` for fuller notes on gemmi dependency scope.
+
+The old `_map2mtz` / `_fspace_scale_and_diff` code using
+`transform_map_to_f_phi + prepare_asu_data` remains in the source as a
+reference but **must not be relied on for correct MTZ output in H 3 or any
+trigonal/hexagonal SG**.
 
 ## Space-group generality and testing
 
