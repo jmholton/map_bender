@@ -887,18 +887,53 @@ def read_ccp4_fullcell(path):
     return data, hdr_full
 
 
+def _symop_block_for_sg(sg_number):
+    """Return CCP4 symop string block (80-char ASCII records, no terminator).
+
+    Each record is "X1, X2, X3" in CCP4 convention, padded to 80 chars.
+    Falls back to identity (P1) if the spacegroup can't be resolved.
+    """
+    import gemmi as _gm
+    sg = _gm.find_spacegroup_by_number(int(sg_number)) if sg_number else None
+    if sg is None:
+        ops = [_gm.Op('x,y,z')]
+    else:
+        ops = list(sg.operations())
+    records = b''
+    for op in ops:
+        txt = op.triplet().upper().replace(' ', '').replace(',', ', ')
+        records += txt.ljust(80).encode('ascii', 'replace')[:80]
+    return records
+
+
 def write_ccp4(path, data, hdr_template, cell_override=None):
     """Write a CCP4 map, borrowing the header from hdr_template.
 
     Overwrites DMIN/DMAX/DMEAN (words 20-22) and RMS (word 54) with
     actual stats.  ISPG (word 23, byte 88) is preserved from the template.
+    Symop strings (after the 1024-byte header) are written from the
+    spacegroup when synthesizing a fresh header — older CCP4 tools
+    (mapdump, sfall) require these to be present, falling back to P1
+    and corrupting downstream FFT/scaling when they're missing.
     cell_override: optional (a,b,c,al,be,ga) to replace cell in header.
 
     If hdr_template lacks 'raw_header' (e.g. MTZ-derived header), synthesises
-    a minimal valid 1024-byte CCP4 header from the dict fields.
+    a 1024-byte CCP4 header + symop block from the dict fields.
     """
+    sg_num = hdr_template.get('spacegroup')
     if 'raw_header' in hdr_template:
         raw = bytearray(hdr_template['raw_header'])
+        # If the template header lacks symops (NSYMBT=0) but does name
+        # a non-trivial spacegroup, regenerate them so the output map
+        # is mapdump-readable.
+        nsymbt_existing = struct.unpack_from('<i', raw, 92)[0]
+        ispg_existing   = struct.unpack_from('<i', raw, 88)[0]
+        if nsymbt_existing == 0 and ispg_existing > 1:
+            symops = _symop_block_for_sg(ispg_existing)
+            if symops:
+                raw = bytearray(raw[:1024]) + bytearray(symops)
+                struct.pack_into('<i', raw, 92, len(symops))
+        symops_block = b''  # already inlined into raw above
     else:
         raw = bytearray(1024)
         struct.pack_into('<i', raw, 12, 2)       # MODE = float32
@@ -913,9 +948,11 @@ def write_ccp4(path, data, hdr_template, cell_override=None):
         struct.pack_into('<i', raw, 64, hdr_template.get('mapc', 1))
         struct.pack_into('<i', raw, 68, hdr_template.get('mapr', 2))
         struct.pack_into('<i', raw, 72, hdr_template.get('maps', 3))
-        struct.pack_into('<i', raw, 88, hdr_template.get('spacegroup', 1))
+        struct.pack_into('<i', raw, 88, int(sg_num or 1))
         raw[208:212] = b'MAP '
         raw[212:216] = b'\x44\x44\x00\x00'   # little-endian machine stamp
+        symops_block = _symop_block_for_sg(sg_num or 1)
+        struct.pack_into('<i', raw, 92, len(symops_block))   # NSYMBT
 
     mn, mx = float(data.min()), float(data.max())
     mean   = float(data.mean())
@@ -933,6 +970,8 @@ def write_ccp4(path, data, hdr_template, cell_override=None):
 
     with open(path, 'wb') as f:
         f.write(raw)
+        if symops_block:
+            f.write(symops_block)
         f.write(data.astype(np.float32).tobytes())
 
 
@@ -2387,7 +2426,7 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         return None, None, None, None
 
     # ── Reciprocal-cart h, s² = 1/d²
-    M_frac = np.array(cell.fractionalization_matrix.tolist())
+    M_frac = np.array(cell.frac.mat.tolist())
     h_orth = hkl.astype(float) @ M_frac
     s_sq   = np.sum(h_orth ** 2, axis=1)
 
@@ -2581,15 +2620,20 @@ def fitreso_scan(
     os.makedirs(scan_dir, exist_ok=True)
 
     # ── optional refinement ───────────────────────────────────────────────────
+    # Refmac can drop disordered atoms during the run, so subsequent steps
+    # (altindex resolution + re-refinement, write_bent_pdb, peak hunting)
+    # all use the *refined* PDB to keep the atom set consistent.
     if run_refinement_flag:
         if mov_mtz.lower().endswith('.mtz'):
-            mov_mtz = run_refinement(mov_pdb, mov_mtz,
-                                     outdir=os.path.join(scan_dir, 'refine_mov'),
-                                     n_cycles=refine_cycles)
+            mov_pdb, mov_mtz = run_refinement(
+                mov_pdb, mov_mtz,
+                outdir=os.path.join(scan_dir, 'refine_mov'),
+                n_cycles=refine_cycles)
         if ref_mtz.lower().endswith('.mtz'):
-            ref_mtz = run_refinement(ref_pdb, ref_mtz,
-                                     outdir=os.path.join(scan_dir, 'refine_ref'),
-                                     n_cycles=refine_cycles)
+            ref_pdb, ref_mtz = run_refinement(
+                ref_pdb, ref_mtz,
+                outdir=os.path.join(scan_dir, 'refine_ref'),
+                n_cycles=refine_cycles)
 
     # ── altindex / origin resolution ──────────────────────────────────────────
     # Discrete (rotation × symop × origin) enumeration ranked by post-transform
@@ -2716,9 +2760,9 @@ def fitreso_scan(
                                                b_sigma=b_sigma, bfacs=_bfo)
     hkl00_rmsd = rmsd_ca(_fmo, _cao, _h0, _AB0, _cell2o)
 
-    # unbent.pdb is the (post-resolve) moving model — already in ref frame.
-    write_bent_pdb(mov_pdb, ref_pdb, _h0, _AB0,
-                   os.path.join(scan_dir, 'unbent.pdb'))
+    # unbent.pdb: written further down (after hkl00 is set up) as a symlink
+    # to hkl00/bent.pdb, keeping it in the same cell+frame as unbent.mtz
+    # and overlaying cleanly with ref structures in Coot.
 
     # ── print header + "pre" row ─────────────────────────────────────────────
     if verbose:
@@ -2734,8 +2778,14 @@ def fitreso_scan(
               f"{'   ---':>6}  {'   ---':>6}  "
               f"{'      ':>7}  (pre-origin alignment)", flush=True)
 
-    # mov is already in ref frame (resolve_altindex handled any altindex/origin).
-    # The shift-field delta is applied directly: mov query = ref_pt - delta(ref_pt).
+    # The PSDVF maps every fractional point in the moving cell to its
+    # corresponding fractional point in the reference cell.  For PSDVF=0
+    # (hkl00) the transform preserves fractional coordinates exactly —
+    # bent_map(ref_frac) = mov_d(SAME ref_frac).  Cell differences
+    # between mov and ref are reflected only in the cell header of the
+    # output map, not in any cartesian rescaling.  Hence: sample mov_d
+    # at the same fractional positions as ref_pts, no cell-aware
+    # cartesian round-trip.
     def _map_query(ref_pts, delta=None):
         return ref_pts if delta is None else ref_pts - delta
 
@@ -2824,11 +2874,18 @@ def fitreso_scan(
     bent_map0 = bent_vals.reshape(ns2, nr2, nc2)
     _save_point('hkl00', outdir0, bent_map0, hkl00_rmsd, hkl00_rmsd, 0,
                 time.time() - t0, hkls=_h0, AB_xyz=_AB0)
-    # unbent.mtz: the (post-resolve) moving MTZ — already in the ref crystal
-    # frame.  For MTZ input, symlink to the post-resolve mov MTZ.  For CCP4
-    # input, FFT the input map directly so unbent.mtz is the FT of the moving
-    # density in the moving's own cell/SG (no reciprocal-space cross-frame
-    # transform; the bent.mtz FDM column carries the ref-frame view).
+
+    # unbent.{pdb,mtz}: symlink to the post-resolve mov PDB and MTZ
+    # (whatever resolve_altindex chose — refine_mov/<stem>_refined.* for
+    # the simple case, or altindex_resolve/<stem>_sgop.* / *_alt_refined.*
+    # for the SG-op / true-altindex cases).  Both files are in mov's cell
+    # and are bit-identical to the refmac output (no gemmi re-write).  For
+    # mov cells that differ from ref's (e.g. insulin H 3) the unbent pair
+    # won't overlay with ref structures in Coot — use the per-subdir
+    # bent.{pdb,mtz} files for that overlay (they're written on ref's grid
+    # by definition).
+    _relsymlink_dir(os.path.abspath(mov_pdb),
+                     os.path.join(scan_dir, 'unbent.pdb'))
     if mov_mtz_resolved is not None:
         _relsymlink_dir(os.path.abspath(mov_mtz_resolved),
                          os.path.join(scan_dir, 'unbent.mtz'))
@@ -2836,7 +2893,8 @@ def fitreso_scan(
         unbent_mtz_path = os.path.join(scan_dir, 'unbent.mtz')
         if not os.path.exists(unbent_mtz_path):
             if verbose:
-                print(f'  Converting mov map → MTZ for unbent.mtz...', flush=True)
+                print(f'  Converting mov map → MTZ for unbent.mtz...',
+                      flush=True)
             _map2mtz(mov_mtz, unbent_mtz_path)
 
     # ── Section 2: hkl01..hklNN — progressive, one canon HKL at a time ───────
@@ -3012,7 +3070,7 @@ def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
         # Reciprocal-cartesian h vectors: h_orth_row = hkl_row · M_frac
         # (cell.fractionalization_matrix takes direct cart→frac; its rows are
         # the reciprocal cartesian basis vectors a*, b*, c*.)
-        M_frac = np.array(cell.fractionalization_matrix.tolist())
+        M_frac = np.array(cell.frac.mat.tolist())
         h_orth = hkl @ M_frac           # (N, 3)
         s_sq   = np.sum(h_orth ** 2, axis=1)   # 1/d²
 
@@ -3135,10 +3193,16 @@ def mtz_to_map_data(mtz_path, f_col, phi_col, sample_rate=0.0):
 
 
 def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
-    """Run refmac5 or phenix.refine on pdb_path+mtz_path; return refined MTZ path.
+    """Run refmac5 or phenix.refine on pdb_path+mtz_path; return
+    (refined_pdb_path, refined_mtz_path).
 
     Tries refmac5 first ($CCP4/bin or PATH), then phenix.refine.
     Calls sys.exit(1) if both fail.
+
+    Returning both paths lets the caller chain subsequent operations
+    (altindex resolution, peak hunting, etc.) on the refined atom set —
+    which can differ from the input atom set when refmac drops
+    disordered residues during the run.
     """
     import shutil as _sh2
     os.makedirs(outdir, exist_ok=True)
@@ -3170,10 +3234,18 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
             print(f'  run_refinement: {os.path.basename(refmac)} rigid '
                   f'({n_cycles} cycles)...', flush=True)
             r = subprocess.run(cmd, input=script, capture_output=True, text=True)
+            log_path = os.path.join(outdir, f'{stem}_refmac.log')
+            with open(log_path, 'w') as _lf:
+                _lf.write(f'# refmac5 command: {" ".join(cmd)}\n')
+                _lf.write(f'# script:\n{script}\n')
+                _lf.write(f'# returncode: {r.returncode}\n\n--- stdout ---\n')
+                _lf.write(r.stdout or '')
+                _lf.write('\n--- stderr ---\n')
+                _lf.write(r.stderr or '')
             if r.returncode == 0 and os.path.exists(out_mtz):
-                print(f'  refmac5 done → {out_mtz}', flush=True)
-                return out_mtz
-            print(f'  refmac5 failed (rc={r.returncode}):\n{r.stderr[-1000:]}',
+                print(f'  refmac5 done → {out_mtz}  (log: {log_path})', flush=True)
+                return out_pdb, out_mtz
+            print(f'  refmac5 failed (rc={r.returncode}); see {log_path}',
                   file=sys.stderr)
 
     # ── phenix.refine ─────────────────────────────────────────────────────────
@@ -3184,11 +3256,21 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
                f'output.prefix={os.path.join(outdir, stem)}']
         print(f'  run_refinement: phenix.refine ({n_cycles} cycles)...', flush=True)
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=outdir)
-        candidate = os.path.join(outdir, f'{stem}_refine_001.mtz')
-        if r.returncode == 0 and os.path.exists(candidate):
-            print(f'  phenix.refine done → {candidate}', flush=True)
-            return candidate
-        print(f'  phenix.refine failed (rc={r.returncode}):\n{r.stderr[-1000:]}',
+        log_path = os.path.join(outdir, f'{stem}_phenix.log')
+        with open(log_path, 'w') as _lf:
+            _lf.write(f'# phenix.refine command: {" ".join(cmd)}\n')
+            _lf.write(f'# cwd: {outdir}\n')
+            _lf.write(f'# returncode: {r.returncode}\n\n--- stdout ---\n')
+            _lf.write(r.stdout or '')
+            _lf.write('\n--- stderr ---\n')
+            _lf.write(r.stderr or '')
+        candidate_mtz = os.path.join(outdir, f'{stem}_refine_001.mtz')
+        candidate_pdb = os.path.join(outdir, f'{stem}_refine_001.pdb')
+        if r.returncode == 0 and os.path.exists(candidate_mtz):
+            print(f'  phenix.refine done → {candidate_mtz}  (log: {log_path})',
+                  flush=True)
+            return candidate_pdb, candidate_mtz
+        print(f'  phenix.refine failed (rc={r.returncode}); see {log_path}',
               file=sys.stderr)
 
     print('ERROR: neither refmac5 nor phenix.refine succeeded.\n'
@@ -3342,6 +3424,71 @@ def _reindex_mtz_fobs(mtz_in, R_frac_int, mtz_out):
     out.write_to_file(mtz_out)
 
 
+def _apply_op_to_mtz(mtz_in, R_frac_int, t_frac, mtz_out):
+    """Apply the SF transformation theorem to ALL F/PHI column pairs:
+
+        F'(h) = F(R^T · h) · exp(2πi · h · t)
+
+    i.e. HKL relabel h → (R^T)^-1 · h plus a per-HKL phase shift.  For
+    SG-symmetric inputs (FWT/PHWT from refmac), F(R^T h) = F(h) (when R
+    is in the SG), so the effect on amplitudes is a permutation of
+    identical values; phases additionally shift by exp(2πi h · (t − R^T t_sym))
+    where t_sym is the SG translation matching R.  This helper applies
+    the *full* (R, t) formula; the caller is responsible for picking the
+    right t.
+
+    The formula matches VALIDATE_ALTINDEX.md (validated end-to-end through
+    refmac on insulin H 3 to 1.24° mean Δphi).
+
+    R_frac_int : integer 3×3 with det = ±1 (the rotation in fractional coords)
+    t_frac     : (3,) fractional translation
+    """
+    R = np.asarray(R_frac_int, dtype=int)
+    R_inv = np.round(np.linalg.inv(R.astype(float))).astype(int)
+    if not np.allclose(R @ R_inv, np.eye(3), atol=1e-6):
+        raise ValueError(f"R not invertible to integer: {R}")
+
+    mtz = gemmi.read_mtz_file(mtz_in)
+    old_miller = mtz.make_miller_array().astype(int)
+    # F_new(h_new) = F_orig(R^T h_new); equivalently, an input row at
+    # h_orig contributes to h_new = (R^T)^-1 h_orig = R^-T h_orig.
+    # Row form: h_new_row = h_orig_row · R^-1.
+    new_miller = old_miller @ R_inv
+
+    # Phase shift per row: PHI' = PHI + 360° · h_new · t
+    delta_phi_deg = (360.0 * (new_miller.astype(np.float64)
+                              @ np.asarray(t_frac, dtype=np.float64))
+                     ).astype(np.float32)
+
+    data = np.array(mtz.array, copy=True)
+    data[:, 0:3] = new_miller.astype(np.float32)
+
+    cols = list(mtz.columns)
+    f_cols = [(i, c) for i, c in enumerate(cols) if c.type in ('F', 'G')]
+    phi_cols = [(i, c) for i, c in enumerate(cols) if c.type == 'P']
+
+    for fi, fc in f_cols:
+        # Match phase by canonical name suffix (FWT↔PHWT, F↔PHI, etc.)
+        target = None
+        candidates = ['PH' + fc.label, 'PHI' + fc.label,
+                      fc.label.replace('FWT', 'PHWT', 1),
+                      fc.label.replace('2FOFCWT', 'PH2FOFCWT', 1),
+                      fc.label.replace('DELFWT', 'PHDELWT', 1),
+                      fc.label.replace('FC', 'PHIC', 1)]
+        for pi, pc in phi_cols:
+            if pc.label in candidates:
+                target = pi; break
+        if target is None and len(phi_cols) == 1:
+            target = phi_cols[0][0]
+        if target is None:
+            continue
+        data[:, target] = ((data[:, target] + delta_phi_deg) % 360.0
+                            ).astype(np.float32)
+
+    mtz.set_data(data)
+    mtz.write_to_file(mtz_out)
+
+
 def _apply_cart_transform_to_pdb(pdb_in, R_cart, t_cart, pdb_out, ref_cell=None):
     """Write pdb_out with all atoms transformed by p' = R_cart @ p + t_cart."""
     st = gemmi.read_pdb(pdb_in)
@@ -3474,6 +3621,24 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
     t_wrapped = t_frac - np.round(t_frac)
     is_zero_t = float(np.linalg.norm(t_wrapped)) < 0.01
 
+    # Is R_frac one of the SG's own proper rotations?  If so, this isn't a
+    # genuine altindex — it's just a chain re-assignment via an existing
+    # symmetry operator (e.g. insulin H 3, where the two deposits chose
+    # different H 3-equivalent ASUs).  Reindexing Fobs by an in-SG op is
+    # a no-op (|F| is SG-symmetric) but rotating + translating atoms then
+    # re-refining will diverge: refmac sees atoms that have been moved to
+    # a non-canonical origin choice while the Fobs still expects them at
+    # the canonical origin.  Treat as `action='none'` and let
+    # bend_fit_progressive's own symop search handle the chain matching.
+    R_frac_int_chk = np.round(R_frac).astype(int)
+    R_in_sg = False
+    if np.allclose(R_frac, R_frac_int_chk, atol=1e-4):
+        for op in sg.operations():
+            sg_R = (np.array(op.rot, dtype=int) // op.DEN)
+            if np.array_equal(sg_R, R_frac_int_chk):
+                R_in_sg = True
+                break
+
     if rmsd_top >= improve_threshold * rmsd_base:
         if verbose:
             print(f"  best discrete op: rmsd={rmsd_top:.2f} A vs baseline "
@@ -3490,6 +3655,34 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
 
     mov_stem = os.path.splitext(os.path.basename(mov_pdb))[0]
     mtz_stem = os.path.splitext(os.path.basename(mov_mtz))[0]
+
+    if R_in_sg and not is_identity_R:
+        # R is one of the SG's own rotations + an origin shift — not a
+        # genuine altindex but an alternative origin choice + chain
+        # re-assignment.  Apply the *discrete* SG op (R + exact discrete
+        # t_frac, not the COM-aligned continuous t_cart_opt) to BOTH PDB
+        # and MTZ via the SF transformation theorem:
+        #     F'(h) = F(R^T h) · exp(2πi h · t)
+        # See VALIDATE_ALTINDEX.md (formula validated to 1.24° mean Δphi
+        # end-to-end through refmac on insulin H 3).  For in-SG R the
+        # F(R^T h) lookup is a no-op on amplitudes (SG-symmetric data)
+        # but the phase shift is essential to keep map + atoms consistent.
+        action  = 'sg_op_origin'
+        out_pdb = os.path.join(outdir, f'{mov_stem}_sgop.pdb')
+        out_mtz = os.path.join(outdir, f'{mtz_stem}_sgop.mtz')
+        t_cart_discrete = O @ t_frac
+        _apply_cart_transform_to_pdb(mov_pdb, R_cart, t_cart_discrete,
+                                     out_pdb, ref_cell=cell)
+        R_frac_int = np.round(R_frac).astype(int)
+        _apply_op_to_mtz(mov_mtz, R_frac_int, t_frac, out_mtz)
+        if verbose:
+            print(f"  action=sg_op_origin  R is an in-SG symop  "
+                  f"t_frac={t_frac}  rmsd_after={rmsd_top:.2f} A", flush=True)
+            print(f"  applied (R, t) to PDB (cartesian) and to MTZ "
+                  f"(F-space, no re-refinement)", flush=True)
+        return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
+                    action=action, R_frac=R_frac, t_frac=t_frac,
+                    drot_deg=drot_deg, rmsd_after=rmsd_top)
 
     if is_identity_R:
         # Origin-only: translate PDB, phase-shift MTZ.  No re-refinement.
@@ -3525,15 +3718,8 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         print(f"  re-refining {os.path.basename(pre_pdb)} against "
               f"{os.path.basename(pre_mtz)} ...", flush=True)
 
-    out_mtz = run_refinement(pre_pdb, pre_mtz, outdir=outdir,
-                             n_cycles=refine_cycles)
-    pre_stem = os.path.splitext(os.path.basename(pre_pdb))[0]
-    out_pdb  = os.path.join(outdir, f'{pre_stem}_refined.pdb')
-    if not os.path.exists(out_pdb):
-        # phenix output path differs
-        cand = os.path.join(outdir, f'{pre_stem}_refine_001.pdb')
-        if os.path.exists(cand):
-            out_pdb = cand
+    out_pdb, out_mtz = run_refinement(pre_pdb, pre_mtz, outdir=outdir,
+                                       n_cycles=refine_cycles)
 
     return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
                 action=action, R_frac=R_frac, t_frac=t_frac,
@@ -3579,11 +3765,11 @@ def main():
 
     # ── Single-fit path: refinement (if requested) then altindex resolution ──
     if mov_mtz and p['run_refinement']:
-        mov_mtz = run_refinement(pdb1, mov_mtz, outdir='refine_mov',
-                                 n_cycles=p['refine_cycles'])
+        pdb1, mov_mtz = run_refinement(pdb1, mov_mtz, outdir='refine_mov',
+                                        n_cycles=p['refine_cycles'])
     if ref_mtz and p['run_refinement']:
-        ref_mtz = run_refinement(pdb2, ref_mtz, outdir='refine_ref',
-                                 n_cycles=p['refine_cycles'])
+        pdb2, ref_mtz = run_refinement(pdb2, ref_mtz, outdir='refine_ref',
+                                        n_cycles=p['refine_cycles'])
 
     if mov_mtz:
         _res = resolve_altindex(pdb1, pdb2, mov_mtz,
