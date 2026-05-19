@@ -2338,23 +2338,120 @@ def _atom_label(a):
     return f"{a['chain']}/{a['resseq']}{a['resname']}/{a['atomname']}{suffix}"
 
 
+def _grid_xyz_fullcell(data, hdr):
+    """Return full-cell density as (NX, NY, NZ) float64, in canonical
+    crystallographic axis order (axis 0 = a, axis 1 = b, axis 2 = c).
+
+    `data` is the (ns, nr, nc) CCP4-shaped array described by `hdr`.  If the
+    header indicates an ASU subset (nonzero starts or dims < unit-cell grid),
+    the map is round-tripped through `gemmi.read_ccp4_map(..., setup=True)`
+    so the spacegroup operators expand the ASU to the full cell.
+    """
+    NX, NY, NZ = hdr['nx'], hdr['ny'], hdr['nz']
+    mc, mr, ms = hdr['mapc'], hdr['mapr'], hdr['maps']
+    N_by_cryst = {mc: hdr['nc'], mr: hdr['nr'], ms: hdr['ns']}
+    is_fullcell = (N_by_cryst.get(1) == NX
+                   and N_by_cryst.get(2) == NY
+                   and N_by_cryst.get(3) == NZ
+                   and hdr['ncstart'] == 0
+                   and hdr['nrstart'] == 0
+                   and hdr['nsstart'] == 0)
+    if is_fullcell:
+        # data[i_s, i_r, i_c] where i_s is the maps-axis index, etc.
+        # Permute so new axis 0 = crystallographic axis 1 (a), etc.
+        data_axis_for_cryst = {ms: 0, mr: 1, mc: 2}
+        perm = (data_axis_for_cryst[1],
+                data_axis_for_cryst[2],
+                data_axis_for_cryst[3])
+        return np.ascontiguousarray(data.transpose(perm).astype(np.float64))
+
+    # ASU subset: round-trip via gemmi to apply spacegroup expansion.
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
+    try:
+        write_ccp4(tmp, data, hdr)
+        ccp4 = gemmi.read_ccp4_map(tmp)
+        ccp4.setup(0.0)
+        # gemmi grid.array shape is (nu, nv, nw) = (NX, NY, NZ) after setup
+        return np.array(ccp4.grid.array, dtype=np.float64)
+    finally:
+        try: os.unlink(tmp)
+        except OSError: pass
+
+
+def _fft_lookup_at_hkls(grid_xyz, hkls, cell_volume):
+    """Direct numpy FFT + crystallographic-convention F lookup.
+
+    grid_xyz : (NX, NY, NZ) float density.
+    hkls     : (M, 3) int Miller indices.
+    cell_volume : Å³, used to match gemmi's F-vs-density normalization.
+
+    Returns complex128 array of shape (M,) with F values matching the
+    convention of `gemmi.transform_map_to_f_phi` (so amplitudes line up
+    with a reference MTZ written by gemmi for the same density).
+    """
+    NX, NY, NZ = grid_xyz.shape
+    N_grid     = NX * NY * NZ
+    # numpy: A[k] = Σ a[n] exp(-2πi k·n/N); crystallographic F has +2πi.
+    # ⇒ F(h,k,l) = A[(-h)%NX, (-k)%NY, (-l)%NZ]
+    # Numpy F is unnormalized — multiply by V/N to match gemmi's convention.
+    F_grid = np.fft.fftn(grid_xyz)
+    H = hkls[:, 0].astype(int)
+    K = hkls[:, 1].astype(int)
+    L = hkls[:, 2].astype(int)
+    F = F_grid[(-H) % NX, (-K) % NY, (-L) % NZ]
+    return F * (cell_volume / N_grid)
+
+
+def _fft_box_hkls(NX, NY, NZ):
+    """Enumerate Friedel-unique (h,k,l) inside the FFT box of an
+    (NX,NY,NZ) grid.  Excludes (0,0,0).  Used by `_map2mtz` and
+    `_write_scan_mtz` to write complete MTZs without going through
+    the broken `prepare_asu_data` path.
+    """
+    h_max = (NX - 1) // 2
+    k_max = (NY - 1) // 2
+    l_max = (NZ - 1) // 2
+    hs = np.arange(-h_max, h_max + 1)
+    ks = np.arange(-k_max, k_max + 1)
+    ls = np.arange(-l_max, l_max + 1)
+    H, K, L = np.meshgrid(hs, ks, ls, indexing='ij')
+    H = H.ravel(); K = K.ravel(); L = L.ravel()
+    # Friedel dedup: keep (l>0) OR (l==0 & k>0) OR (l==0 & k==0 & h>0)
+    keep = (L > 0) | ((L == 0) & ((K > 0) | ((K == 0) & (H > 0))))
+    return np.stack([H[keep], K[keep], L[keep]], axis=1).astype(np.int32)
+
+
 def _map2mtz(mapfile, mtzfile):
-    ccp4 = gemmi.read_ccp4_map(mapfile)
-    ccp4.setup(float('nan'))
-    grid = ccp4.grid
-    sf   = gemmi.transform_map_to_f_phi(grid, half_l=True)
-    data = sf.prepare_asu_data(dmin=0.0)
+    """Convert a CCP4 map to an MTZ via direct numpy FFT.
+
+    Replaces the gemmi `transform_map_to_f_phi + prepare_asu_data` pipeline
+    which silently drops ~50% of unique reflections for trigonal/hexagonal
+    spacegroups (v0.6 wedge bug; v0.7 missing-k=0-plane bug; see CLAUDE.md).
+    """
+    data, hdr = read_ccp4(mapfile)
+    cell_tuple = hdr['cell']
+    cell_obj   = gemmi.UnitCell(*cell_tuple)
+    sg_num     = hdr.get('spacegroup')
+    if sg_num is None:
+        ispg = struct.unpack_from('<i', hdr['raw_header'], 88)[0]
+        sg_num = ispg if ispg > 0 else 1
+    sg = gemmi.find_spacegroup_by_number(int(sg_num)) or gemmi.SpaceGroup('P 1')
+
+    grid_xyz = _grid_xyz_fullcell(data, dict(hdr, spacegroup=sg_num))
+    NX, NY, NZ = grid_xyz.shape
+    hkls = _fft_box_hkls(NX, NY, NZ)
+    F    = _fft_lookup_at_hkls(grid_xyz, hkls, cell_obj.volume)
     mtz  = gemmi.Mtz(with_base=True)
-    mtz.spacegroup = grid.spacegroup
-    mtz.cell       = grid.unit_cell
+    mtz.spacegroup = sg
+    mtz.cell       = cell_obj
     mtz.add_dataset('dataset')
     mtz.add_column('F',   'F')
     mtz.add_column('PHI', 'P')
-    n   = len(data)
-    arr = np.zeros((n, 5), dtype=np.float32)
-    arr[:, :3] = data.miller_array
-    arr[:,  3] = np.abs(data.value_array)
-    arr[:,  4] = np.degrees(np.angle(data.value_array))
+    arr = np.zeros((len(hkls), 5), dtype=np.float32)
+    arr[:, :3] = hkls
+    arr[:,  3] = np.abs(F).astype(np.float32)
+    arr[:,  4] = np.degrees(np.angle(F)).astype(np.float32)
     mtz.set_data(arr)
     mtz.write_to_file(mtzfile)
 
@@ -2383,42 +2480,27 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
     cell = gemmi.UnitCell(*ref_h['cell'])
     sg   = gemmi.find_spacegroup_by_number(ref_h['spacegroup'])
 
-    # ── FFT bent_map via temp .map → gemmi setup, so ASU↔full-cell handling
-    # matches what's already done in _write_scan_mtz / _map2mtz
-    import tempfile
-    tmp_b = tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
-    try:
-        write_ccp4(tmp_b, bent_map, ref_h)
-        ccp4_b = gemmi.read_ccp4_map(tmp_b)
-        ccp4_b.setup(float('nan'))
-        sf_b   = gemmi.transform_map_to_f_phi(ccp4_b.grid, half_l=True)
-        asu_b  = sf_b.prepare_asu_data(dmin=0.0)
-    finally:
-        try: os.unlink(tmp_b)
-        except OSError: pass
-
-    bent_hkl = asu_b.miller_array.astype(int)
-    bent_c   = asu_b.value_array.astype(np.complex128)
-    bent_F   = np.abs(bent_c)
-    bent_PH  = np.degrees(np.angle(bent_c))
-
-    # ── Load ref MTZ
+    # ── Load ref MTZ first — its HKL list is the lookup target ────────────
     ref_mtz_obj = gemmi.read_mtz_file(ref_mtz_path)
     ref_data    = np.array(ref_mtz_obj.array)
     ref_lbls    = ref_mtz_obj.column_labels()
-    ref_hkl     = ref_data[:, :3].astype(int)
+    ref_hkl     = ref_data[:, :3].astype(np.int32)
     ref_F_all   = ref_data[:, ref_lbls.index(ref_f_col)]
     ref_PH_all  = ref_data[:, ref_lbls.index(ref_phi_col)]
 
-    # ── Match HKLs (use ref HKL set as common index)
-    bdict = {(int(h[0]), int(h[1]), int(h[2])): i
-             for i, h in enumerate(bent_hkl)}
-    keep = [bdict.get((int(h[0]), int(h[1]), int(h[2]))) for h in ref_hkl]
-    mask = np.array([k is not None for k in keep])
-    hkl  = ref_hkl[mask]
-    rF   = ref_F_all[mask];   rPH = ref_PH_all[mask]
-    bidx = np.array([i for i in keep if i is not None])
-    bF   = bent_F[bidx];      bPH = bent_PH[bidx]
+    # ── FFT bent_map and look up F directly at the ref HKLs.  Replaces the
+    # broken gemmi `transform_map_to_f_phi + prepare_asu_data` pipeline,
+    # which dropped ~50% of unique reflections for trigonal/hexagonal SGs
+    # (v0.6 wedge bug; v0.7 missing-k=0-plane bug; see CLAUDE.md).  Direct
+    # lookup gives 100% HKL match by construction.
+    grid_xyz = _grid_xyz_fullcell(bent_map, ref_h)
+    bent_c   = _fft_lookup_at_hkls(grid_xyz, ref_hkl, cell.volume)
+
+    hkl = ref_hkl
+    bF  = np.abs(bent_c)
+    bPH = np.degrees(np.angle(bent_c))
+    rF  = ref_F_all
+    rPH = ref_PH_all
 
     ok = (rF > 0) & (bF > 0) & np.isfinite(rF) & np.isfinite(bF)
     hkl, rF, rPH, bF, bPH = hkl[ok], rF[ok], rPH[ok], bF[ok], bPH[ok]
@@ -2529,39 +2611,38 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
 
 
 def _write_scan_mtz(bent_arr, diff_arr, ref_h, mtzfile):
-    """Write bent.mtz with FDM/PHIDM (bent map) + DELFWT/PHDELWT (diff map)."""
-    tmp_b = _tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
-    tmp_d = _tempfile.NamedTemporaryFile(suffix='.map', delete=False).name
-    try:
-        write_ccp4(tmp_b, bent_arr, ref_h)
-        write_ccp4(tmp_d, diff_arr,  ref_h)
-        ccp4_b = gemmi.read_ccp4_map(tmp_b); ccp4_b.setup(float('nan'))
-        ccp4_d = gemmi.read_ccp4_map(tmp_d); ccp4_d.setup(float('nan'))
-        sf_b   = gemmi.transform_map_to_f_phi(ccp4_b.grid, half_l=True)
-        sf_d   = gemmi.transform_map_to_f_phi(ccp4_d.grid, half_l=True)
-        data_b = sf_b.prepare_asu_data(dmin=0.0)
-        data_d = sf_d.prepare_asu_data(dmin=0.0)
-        mtz = gemmi.Mtz(with_base=True)
-        mtz.spacegroup = ccp4_b.grid.spacegroup
-        mtz.cell       = ccp4_b.grid.unit_cell
-        mtz.add_dataset('dataset')
-        mtz.add_column('FDM',     'F')
-        mtz.add_column('PHIDM',   'P')
-        mtz.add_column('DELFWT',  'F')
-        mtz.add_column('PHDELWT', 'P')
-        n   = len(data_b)
-        arr = np.zeros((n, 7), dtype=np.float32)
-        arr[:, :3] = data_b.miller_array
-        arr[:,  3] = np.abs(data_b.value_array)
-        arr[:,  4] = np.degrees(np.angle(data_b.value_array))
-        arr[:,  5] = np.abs(data_d.value_array)
-        arr[:,  6] = np.degrees(np.angle(data_d.value_array))
-        mtz.set_data(arr)
-        mtz.write_to_file(mtzfile)
-    finally:
-        for p in (tmp_b, tmp_d):
-            try: os.unlink(p)
-            except OSError: pass
+    """Write bent.mtz with FDM/PHIDM (bent map) + DELFWT/PHDELWT (diff map).
+
+    Uses direct numpy FFT + Friedel-unique HKL enumeration; avoids the
+    broken gemmi `prepare_asu_data` path (see CLAUDE.md).
+    """
+    cell_obj = gemmi.UnitCell(*ref_h['cell'])
+    sg_num   = ref_h.get('spacegroup', 1)
+    sg = gemmi.find_spacegroup_by_number(int(sg_num)) or gemmi.SpaceGroup('P 1')
+
+    grid_b = _grid_xyz_fullcell(bent_arr, ref_h)
+    grid_d = _grid_xyz_fullcell(diff_arr, ref_h)
+    NX, NY, NZ = grid_b.shape
+    hkls = _fft_box_hkls(NX, NY, NZ)
+    Fb = _fft_lookup_at_hkls(grid_b, hkls, cell_obj.volume)
+    Fd = _fft_lookup_at_hkls(grid_d, hkls, cell_obj.volume)
+
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = sg
+    mtz.cell       = cell_obj
+    mtz.add_dataset('dataset')
+    mtz.add_column('FDM',     'F')
+    mtz.add_column('PHIDM',   'P')
+    mtz.add_column('DELFWT',  'F')
+    mtz.add_column('PHDELWT', 'P')
+    arr = np.zeros((len(hkls), 7), dtype=np.float32)
+    arr[:, :3] = hkls
+    arr[:,  3] = np.abs(Fb).astype(np.float32)
+    arr[:,  4] = np.degrees(np.angle(Fb)).astype(np.float32)
+    arr[:,  5] = np.abs(Fd).astype(np.float32)
+    arr[:,  6] = np.degrees(np.angle(Fd)).astype(np.float32)
+    mtz.set_data(arr)
+    mtz.write_to_file(mtzfile)
 
 
 def _eval_chunked(ref_pts, hkls, AB_xyz, chunk=50000):
