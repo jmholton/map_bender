@@ -47,17 +47,28 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
     3poq.pdb, 3pou.pdb          NB: 3poq.mtz is 89.9% complete
                                  (3pou.mtz 99.6%) — needs
                                  `fill_fcalc=True`.  **Currently fails
-                                 (May 2026):** `resolve_altindex` picks
-                                 R=diag(-1,-1,1) + a translation that
-                                 leaves CA RMSD at 26.6 Å (vs 86.9 Å
-                                 baseline), so the post-altindex
-                                 re-refinement and scan see a wholly
-                                 misaligned mov.  hkl00 RMSD = 10 Å
-                                 trips bend_fit_progressive's >5 Å
-                                 sanity check.  Real fix needs altindex
-                                 enumeration to consider more candidates
-                                 and reject "improved but still bad"
-                                 solutions; not done yet.
+                                 (May 2026):** the two structures are
+                                 in *different cells* (3poq
+                                 77.31×77.31×330.36, 3pou
+                                 85.71×85.71×332.94), not just
+                                 different settings of the same cell.
+                                 `resolve_altindex` assumes same cell
+                                 and picks a discrete op with
+                                 rmsd_after=26.6 Å (vs 86.9 Å baseline)
+                                 → hkl00 RMSD 10 Å trips
+                                 bend_fit_progressive's >5 Å sanity
+                                 check.  Even an exhaustive altindex
+                                 enumeration (via
+                                 `~/projects/origins/claude/nearest_altindex.py`)
+                                 only gets to drot=56°, RMSD=15.6 Å —
+                                 because no crystallographic altindex
+                                 op realises the genuine ~180° rigid-
+                                 body rotation between the two cells.
+                                 The working workflow in origins/claude
+                                 is stretch_to_cell → LSQ → altindex,
+                                 which would need to be ported into
+                                 bendfinder's `resolve_altindex` to
+                                 handle cross-cell pairs like this.
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
   magdoff/                      Magdoff synthetic deformation validation tests
     test_magdoff.py             test script (7rsa, P2₁, 248 CA)
@@ -348,7 +359,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.048 Å | 24.1% | 18.1% | bent |
 | Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | 49.8% | 53.8% | ref |
 | Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 79.8% | ref (fill_fcalc=True) |
-| Porin 3poq→3pou | H 3 2 | 340 | — | — | — | fails: altindex picks wrong R |
+| Porin 3poq→3pou | H 3 2 | 340 | — | — | — | fails: cross-cell pair (77→86 Å a/b), see directory note |
 
 All "from-raw" runs in `<system>/scan_fitreso_fc/` (May 2026,
 fill_fcalc=True propagated through refmac and altindex re-refinement).
