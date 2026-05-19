@@ -2971,7 +2971,8 @@ def fitreso_scan(
     if mov_mtz.lower().endswith('.mtz'):
         _res = resolve_altindex(mov_pdb, ref_pdb, mov_mtz,
                                  outdir=os.path.join(scan_dir, 'altindex_resolve'),
-                                 refine_cycles=refine_cycles, verbose=verbose)
+                                 refine_cycles=refine_cycles, verbose=verbose,
+                                 fill_fcalc=fill_fcalc)
         mov_pdb = _res['mov_pdb_out']
         mov_mtz = _res['mov_mtz_out']
 
@@ -3925,7 +3926,7 @@ def _no_op_resolve_result(mov_pdb, mov_mtz, drot=0.0, rmsd=0.0):
 
 def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                      refine_cycles=5, improve_threshold=0.7,
-                     verbose=True):
+                     verbose=True, fill_fcalc=False):
     """Find (altindex × symop × origin) discrete transform that aligns mov onto ref.
 
     Strategy: Kabsch LSQ fit gives the continuous rigid-body answer; enumerate
@@ -4093,8 +4094,13 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         print(f"  re-refining {os.path.basename(pre_pdb)} against "
               f"{os.path.basename(pre_mtz)} ...", flush=True)
 
+    # Re-refinement of the altindex-reindexed MTZ: reindex generally drops
+    # ~half the reflections (the reindex is a SG-asymmetric reshuffle, and
+    # any unmatched HKLs become missing).  Propagate fill_fcalc so the
+    # completeness gate inside run_refinement engages here too.
     out_pdb, out_mtz = run_refinement(pre_pdb, pre_mtz, outdir=outdir,
-                                       n_cycles=refine_cycles)
+                                       n_cycles=refine_cycles,
+                                       fill_fcalc=fill_fcalc)
 
     return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
                 action=action, R_frac=R_frac, t_frac=t_frac,

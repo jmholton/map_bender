@@ -43,6 +43,21 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
                                  `fill_fcalc=True` (CLI `--fill-fcalc`)
                                  to fitreso_scan or run_refinement will
                                  sys.exit(1).
+  porin/                        porin 3poq→3pou (H 3 2)
+    3poq.pdb, 3pou.pdb          NB: 3poq.mtz is 89.9% complete
+                                 (3pou.mtz 99.6%) — needs
+                                 `fill_fcalc=True`.  **Currently fails
+                                 (May 2026):** `resolve_altindex` picks
+                                 R=diag(-1,-1,1) + a translation that
+                                 leaves CA RMSD at 26.6 Å (vs 86.9 Å
+                                 baseline), so the post-altindex
+                                 re-refinement and scan see a wholly
+                                 misaligned mov.  hkl00 RMSD = 10 Å
+                                 trips bend_fit_progressive's >5 Å
+                                 sanity check.  Real fix needs altindex
+                                 enumeration to consider more candidates
+                                 and reject "improved but still bad"
+                                 solutions; not done yet.
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
   magdoff/                      Magdoff synthetic deformation validation tests
     test_magdoff.py             test script (7rsa, P2₁, 248 CA)
@@ -326,13 +341,20 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 
 | System | Space group | CA pairs | fr5 RMSD | fr5 Rbent | hkl00 Rbent | subtract |
 |--------|------------|----------|----------|-----------|-------------|----------|
-| Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.034 Å | 29.6% | 53.1% | ref |
-| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 636 | 0.070 Å | 41.5% | 43.0% | ref |
-| Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.086 Å | 22.1% | 11.0% | bent |
+| Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.033 Å | 33.2% | 53.1% | ref |
+| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 592 | 0.070 Å | 41.5% | 38.3% | ref |
+| Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.087 Å | 21.9% | 11.0% | bent |
 | Raddam 5kxk→5kxm | P4₃2₁2 | 984 | 0.047 Å | 19.2% |  9.4% | bent |
-| Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.051 Å | 24.6% | 18.1% | bent |
-| Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | — | — | — |
+| Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.048 Å | 24.1% | 18.1% | bent |
+| Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | 49.8% | 53.8% | ref |
 | Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 79.8% | ref (fill_fcalc=True) |
+| Porin 3poq→3pou | H 3 2 | 340 | — | — | — | fails: altindex picks wrong R |
+
+All "from-raw" runs in `<system>/scan_fitreso_fc/` (May 2026,
+fill_fcalc=True propagated through refmac and altindex re-refinement).
+Self-test runs: `test_symm_all_sgs.py` 65/65 PASS (max violation
+2.68e-13 Å); `magdoff/test_magdoff.py` Test 2 recovery 91.8%/92.2%
+(constrained/unconstrained).
 
 Rbent values are post-F-space (k+B) scaling (compute_riso F-LS).  See per-
 system README files in `lyso/`, `dhfr/`, `raddam/` for invocation details
@@ -364,8 +386,8 @@ Notes:
       in 5kxn.
     * fr5 RMSD: 5kxl 0.086, 5kxm 0.047, 5kxn 0.051 Å — 5kxm gives the
       cleanest fit (best data quality of the damaged set).
-- **Myoglobin** Rbent pending; heme iron dominates diff map throughout
-  (±35σ at A/154HEM/FE).
+- **Myoglobin** fr5 Rbent 49.8%; heme iron dominates diff map throughout
+  (−38.4σ at A/155HEM/FE(m) by fr5, climbing through the scan).
 - **Insulin**: high Rbent (~60%) and residual RMSD (~0.5 Å) reflect
   genuine T→R conformational change — LEU B6 shifts ~8 Å between
   T-state (4fg3) and R-state (4e7u), which is outside the smooth
@@ -375,3 +397,9 @@ Notes:
   (4e7u 93%, 4fg3 97.6%); without filling, refmac inherits the gaps
   and bent.mtz shows missing-HKL chunks in Coot.  Reference run:
   `scan_fitreso_fc/` (raw inputs → fill → refmac → altindex → scan).
+  The hkl01 → hkl02 jump (Rbend 0.1% → 64%, the canonical (1,1,0)
+  HKL picking up `|d| = 2.1 Å` in `hkl02/PSDVF.mtz`) **is not an
+  over-fit** — inspecting the bent map at that stage shows the
+  displacement matches a genuine low-frequency shift between the two
+  crystal forms; later iterations damp the same mode to ~1 Å as
+  higher-order HKLs absorb part of the signal.
