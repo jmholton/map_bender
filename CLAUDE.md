@@ -46,29 +46,35 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
   porin/                        porin 3poq→3pou (H 3 2)
     3poq.pdb, 3pou.pdb          NB: 3poq.mtz is 89.9% complete
                                  (3pou.mtz 99.6%) — needs
-                                 `fill_fcalc=True`.  **Currently fails
-                                 (May 2026):** the two structures are
-                                 in *different cells* (3poq
-                                 77.31×77.31×330.36, 3pou
-                                 85.71×85.71×332.94), not just
-                                 different settings of the same cell.
-                                 `resolve_altindex` assumes same cell
-                                 and picks a discrete op with
-                                 rmsd_after=26.6 Å (vs 86.9 Å baseline)
-                                 → hkl00 RMSD 10 Å trips
-                                 bend_fit_progressive's >5 Å sanity
-                                 check.  Even an exhaustive altindex
-                                 enumeration (via
-                                 `~/projects/origins/claude/nearest_altindex.py`)
-                                 only gets to drot=56°, RMSD=15.6 Å —
-                                 because no crystallographic altindex
-                                 op realises the genuine ~180° rigid-
-                                 body rotation between the two cells.
-                                 The working workflow in origins/claude
-                                 is stretch_to_cell → LSQ → altindex,
-                                 which would need to be ported into
-                                 bendfinder's `resolve_altindex` to
-                                 handle cross-cell pairs like this.
+                                 `fill_fcalc=True`.  The two cells
+                                 differ slightly (3poq 77.31×77.31×330.36
+                                 vs 3pou 85.71×85.71×332.94) but they
+                                 are alt-cell-related, not genuinely
+                                 different.  origins/claude's
+                                 stretch_to_cell + LSQ workflow brings
+                                 the pair to ~5 Å CA RMSD — that
+                                 residual is what bendfinder should
+                                 bend.  **Currently fails (May 2026):**
+                                 `resolve_altindex` only enumerates
+                                 integer-rotation altindex ops with
+                                 entries in {-1,0,1} (3³=19683 cands),
+                                 which can't realise the ~180° LSQ
+                                 rotation about [1,-0.89,0] that
+                                 actually aligns the cells.  The best
+                                 discrete altindex (origins/claude's
+                                 `nearest_altindex.py`, basis-change
+                                 entries in {-2..2}) gets drot=56°,
+                                 RMSD=15.6 Å.  Even after that altindex,
+                                 the residual ~5 Å is not a SG-allowed
+                                 rigid body, so the aligned mov PDB
+                                 doesn't have a self-consistent MTZ in
+                                 that frame.  Porting the
+                                 stretch_to_cell + LSQ path into
+                                 bendfinder requires generating mov
+                                 MTZs by Fcalc (since the original
+                                 mov MTZ phases can't be carried
+                                 through a non-crystallographic
+                                 rotation) — not done yet.
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
   magdoff/                      Magdoff synthetic deformation validation tests
     test_magdoff.py             test script (7rsa, P2₁, 248 CA)
