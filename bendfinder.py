@@ -1163,23 +1163,32 @@ def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
     mtz.add_column('K', 'H')
     mtz.add_column('L', 'H')
     for dim in dimensions:
-        mtz.add_column(f'd{dim.upper()}', 'F')   # amplitude of d{x,y,z} shift (fractional Å)
-        mtz.add_column(f'PH{dim.upper()}', 'P')  # phase in degrees
+        mtz.add_column(f'd{dim.upper()}', 'F')   # amplitude of d{x,y,z} shift (Å)
+        mtz.add_column(f'PH{dim.upper()}', 'P')  # phase (degrees)
     mtz.add_column('SNR', 'R')
     mtz.add_column('ACTIVE', 'R')
 
-    # Convert (A, B) Cartesian coefficients to (amplitude, phase in degrees).
-    # Shift field: dx = Σ a*cos(2π(hx+ky+lz) + phi)
+    # Convert (A, B) fractional shift coefficients to (amplitude, phase).
+    # Shift field: d_frac = Σ a*cos(2π(hx+ky+lz) + phi)
     # where A = -a*sin(phi_rad), B = a*cos(phi_rad)
-    # so a = sqrt(A²+B²), phi_rad = atan2(-A, B)
+    # so a = sqrt(A²+B²), phi_rad = atan2(-A, B).
+    # Then convert fractional amplitudes to Å by multiplying by the cell
+    # length along that dimension's axis (a/b/c for x/y/z) — much more
+    # interpretable for diagnostics.  load_fitparams reads the
+    # `amplitude_units` history tag and back-converts to fractional for
+    # all downstream consumers (eval_shift_field, write_bent_pdb, etc.)
+    # so this is purely a display-units change.
+    _AXIS_LEN = {'x': cell1[0], 'y': cell1[1], 'z': cell1[2]}
+    mtz.history = list(mtz.history) + ['BENDFINDER amplitude_units angstrom']
     n_cols = 3 + 2 * n_dims + 2
     data = np.zeros((n_hkls, n_cols), dtype=np.float32)
     data[:, 0] = hkls[:, 0]
     data[:, 1] = hkls[:, 1]
     data[:, 2] = hkls[:, 2]
-    for d in range(n_dims):
+    for d, dim in enumerate(dimensions):
         A, B = AB[d, :, 0], AB[d, :, 1]
-        data[:, 3 + 2*d]     = np.sqrt(A**2 + B**2)
+        amp_frac = np.sqrt(A**2 + B**2)
+        data[:, 3 + 2*d]     = amp_frac * _AXIS_LEN[dim]
         data[:, 3 + 2*d + 1] = np.degrees(np.arctan2(-A, B))
     data[:, 3 + 2*n_dims]     = snr
     data[:, 3 + 2*n_dims + 1] = active.astype(np.float32)
@@ -1210,6 +1219,7 @@ def load_fitparams(path):
     cell2 = cell1
     dimensions = 'xyz'
     rmsd = 0.0
+    amp_units = 'fractional'   # default for files written before the unit tag
     for line in mtz.history:
         parts = line.split()
         if len(parts) < 2 or parts[0] != 'BENDFINDER':
@@ -1223,6 +1233,8 @@ def load_fitparams(path):
             dimensions = parts[2]
         elif key == 'rmsd':
             rmsd = float(parts[2])
+        elif key == 'amplitude_units' and len(parts) >= 3:
+            amp_units = parts[2].lower()
 
     data = np.array(mtz, copy=False)
     labels = [c.label for c in mtz.columns]
@@ -1235,6 +1247,12 @@ def load_fitparams(path):
     n_hkls = len(hkls)
     n_dims = len(dimensions)
     AB = np.zeros((n_dims, n_hkls, 2))
+    # Back-convert Å amplitudes to fractional for downstream consumers
+    # (eval_shift_field expects fractional AB).  Files without the
+    # `amplitude_units` history tag are read as fractional unchanged.
+    _AXIS_LEN = {'x': cell1[0], 'y': cell1[1], 'z': cell1[2]}
+    amp_scale = (1.0 / np.array([_AXIS_LEN[d] for d in dimensions])
+                 if amp_units == 'angstrom' else np.ones(n_dims))
     for d, dim in enumerate(dimensions):
         DIM = dim.upper()
         amp_col = (f'd{DIM}' if f'd{DIM}' in labels else
@@ -1242,12 +1260,12 @@ def load_fitparams(path):
                    f'F{DIM}' if f'F{DIM}' in labels else None)
         if amp_col is not None:
             # Amplitude + phase in degrees
-            a       = data[:, labels.index(amp_col)]
+            a       = data[:, labels.index(amp_col)] * amp_scale[d]
             phi_rad = np.radians(data[:, labels.index(f'PH{DIM}')])
             AB[d, :, 0] = -a * np.sin(phi_rad)
             AB[d, :, 1] =  a * np.cos(phi_rad)
         else:
-            # Legacy Cartesian A, B coefficients
+            # Legacy Cartesian A, B coefficients (always fractional)
             AB[d, :, 0] = data[:, labels.index(f'A{DIM}')]
             AB[d, :, 1] = data[:, labels.index(f'B{DIM}')]
 

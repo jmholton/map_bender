@@ -148,56 +148,107 @@ All test-system maps are ASU maps (not full-cell): lysozyme covers ~½ cell in e
 
 **Additional fix for fitreso_scan with CCP4 ASU map input:** reflect-padding the *unmoved* hkl00 boundary is fine, but once the shift field is active (fr20 onwards), `delta(ref_pt)` can push the sample point past the ASU edge. The reflected value is then physically unrelated to the actual reference density at that boundary, producing a concentrated noise plane at y=0.5 / z=0.5 in `diff_norm.map` (lyso fr20 baseline: 176 voxels > 5σ, max |peak| = 14σ). The fix is to expand the moving CCP4 ASU map to the full unit cell via `read_ccp4_fullcell` and use `pad_mode='wrap'`. `fitreso_scan` now defaults `mov_fullcell=None` which auto-enables this for `.map`/`.ccp4`/`.mrc` inputs (MTZ inputs are full-cell by construction via `mtz_to_map_data`). After fix, lyso fr20 boundary peaks drop from 176 → 3 voxels > 5σ. Do not pass `mov_fullcell=False` unless you specifically want ASU-only voxels (almost always wrong for scanning).
 
-## gemmi map→MTZ conversion — known `prepare_asu_data` incompleteness bugs
+## Map→MTZ via direct numpy FFT (replaces broken gemmi prepare_asu_data)
 
-**Do not use `transform_map_to_f_phi + prepare_asu_data` for writing bent.mtz.**
-Both gemmi v0.6 (CCP4 8) and v0.7 (CCP4 9) have ASU-completeness bugs for
-trigonal/hexagonal space groups that cause ~50% of unique reflections to be
-absent from the output MTZ.  The map itself is always correct; only the
-map→MTZ FFT step is broken.
+`_map2mtz`, `_write_scan_mtz`, and `_fspace_scale_and_diff` all FFT the
+density grid with `np.fft.fftn` and look up F at the required HKLs:
 
-### v0.6 (CCP4 8) bug
-`prepare_asu_data` used an orthorhombic-style h≥0 ∧ k≥0 ∧ l≥0 wedge for
-R 3:H instead of the correct trigonal ASU — dropping all reflections with
-l < 0.  Result for insulin: 22,991 rows (l ∈ [0, 30]) instead of the correct
-~46,000.
+```python
+grid_xyz = _grid_xyz_fullcell(data, hdr)            # (NX, NY, NZ); ASU→full via gemmi setup
+F_grid   = np.fft.fftn(grid_xyz.astype(np.float64))
+# Crystallographic +2πi convention vs numpy's -2πi:
+#   F(h,k,l) = F_grid[(-h)%NX, (-k)%NY, (-l)%NZ]
+# Multiply by V/N to match gemmi's amplitude convention.
+F = F_grid[(-H)%NX, (-K)%NY, (-L)%NZ] * (cell.volume / (NX*NY*NZ))
+```
 
-### v0.7 (CCP4 9) bug
-A different incompleteness: k=0 reflections (the (h,0,l) plane, including
-the entire (0,0,l) axis) are absent.  Result: 23,527 rows (k ∈ [1, 55])
-instead of ~46,000.  Confirmed by `gemmi map2sf --dmin 1` on the same
-bent.map, which gives 46,032 rows at 100% completeness.
+Phases agree with `gemmi map2sf` to 0.003° (verified by reverse-FFT of a
+synthetic MTZ → numpy forward-FFT → lookup → recover injected F to 1e-7).
+Amplitudes differ only by a global k_fit that the F-space LS fit absorbs.
 
-Diagnostic used:
+In `_fspace_scale_and_diff`, F is looked up at the ref MTZ HKL positions
+directly — 100% HKL match by construction, no `bdict` intersect that
+used to drop ~half the rows.
+
+### Why this replaced `transform_map_to_f_phi + prepare_asu_data`
+
+`prepare_asu_data` silently dropped ~50% of unique reflections for
+trigonal/hexagonal SGs in both gemmi versions we tried:
+- **v0.6 (CCP4 8)** — orthorhombic-style h≥0 ∧ k≥0 ∧ l≥0 wedge for R 3:H,
+  dropping all l<0.  Insulin: 22,991 rows (l ∈ [0, 30]) instead of ~46k.
+- **v0.7 (CCP4 9)** — k=0 plane absent (including the entire (0,0,l)
+  axis).  Insulin: 23,527 rows (k ∈ [1, 55]) instead of ~46k.
+
+Diagnostic that exposed it:
 ```
 gemmi map2sf --dmin 1 bent.map bent_back.mtz F PHI
 diff.com bent.mtz FDM bent_back.mtz
-mtzdmp Fdiff.mtz
-# → Fref (FDM) 51% complete; (0,0,l) axis 100% missing from FDM
+mtzdmp Fdiff.mtz                    # → FDM 51% complete; (0,0,l) 100% missing
 ```
 
-### Fix: direct numpy FFT lookup
+The map itself is always correct; only `prepare_asu_data` is broken.
+The replacement is in commit 6f05d2c.
 
-Replace the `transform_map_to_f_phi + prepare_asu_data` path with a direct
-`np.fft.fftn` and index into the FFT grid at the required HKL positions.
-For a map stored as `(NZ, NY, NX)` (maps=3, mapr=2, mapc=1):
+## SG-ASU vs Friedel-box MTZ output
 
-```python
-F_grid = np.fft.fftn(data.astype(np.float64))   # shape (NZ, NY, NX)
-# Crystallographic convention: F(H,K,L) = F_grid[-L%NZ, -K%NY, -H%NX]
-H, K, L = hkl[:,0], hkl[:,1], hkl[:,2]
-F_complex = F_grid[(-L)%NZ, (-K)%NY, (-H)%NX]
-```
+All map→MTZ writers (`_map2mtz`, `_write_scan_mtz`,
+`_fill_missing_with_fcalc`) emit one row per **SG-unique** HKL, not per
+Friedel-unique FFT-box HKL.  Writing the same density in N point-group
+copies as a P1-equivalent file amplifies the map by N on inverse-FFT
+(commit d80eaa5 fix).
 
-In `_fspace_scale_and_diff`, extract bent SFs directly at the ref.mtz HKL
-positions — no ASU enumeration, no temp file, 100% HKL match by construction.
-This is the planned replacement for the broken gemmi path.  See
-`GEMMI_DEPENDENCY.md` for fuller notes on gemmi dependency scope.
+The enumerator `_enumerate_sg_asu_hkls(cell, sg, d_min)`:
+1. Calls `generate_hkls` to get Friedel-unique HKLs at d≥d_min.
+2. Maps each to its SG-canonical representative via the existing
+   `get_proper_symops` + `_canonical_hkl` (lexicographic min of
+   {R_k^T h} reduced to Friedel-unique form).
+3. Filters out systematic absences via
+   `gemmi.GroupOps.is_systematically_absent` (which is reliable,
+   unlike `prepare_asu_data` / `ReciprocalAsu` for certain SGs).
 
-The old `_map2mtz` / `_fspace_scale_and_diff` code using
-`transform_map_to_f_phi + prepare_asu_data` remains in the source as a
-reference but **must not be relied on for correct MTZ output in H 3 or any
-trigonal/hexagonal SG**.
+Result matches CCP4 `unique` to within rounding (insulin H 3 at 1.23 Å:
+25,283 vs uniqueify's 25,291; at 2.0 Å: 5,620 vs 5,620).
+
+## Incomplete input MTZs → opt-in Fcalc-fill before refmac
+
+Refmac writes FWT/PHWT only for HKLs present in its input MTZ.  PDB-
+deposited datasets are routinely incomplete (4e7u: 93%; 4fg3: 97.6%),
+so the FWT inherits the same gaps and downstream bent.mtz shows missing
+chunks in Coot.
+
+`run_refinement` now:
+1. Measures SG-ASU completeness of its input MTZ
+   (`_mtz_completeness` returns n_obs / n_expected).
+2. Refuses to proceed below 99% unless caller passes `fill_fcalc=True`
+   (CLI: `--fill-fcalc`).
+3. When set, calls `_fill_missing_with_fcalc(in, pdb, out)` which:
+   - Strips any pre-existing systematic absences from input rows
+     (they're zero by symmetry and confuse downstream tools).
+   - Adds rows for missing SG-ASU HKLs with F=Fcalc (computed via
+     `gemmi.DensityCalculatorX` + the same numpy FFT lookup),
+     SIGFP=median(observed), FREE=0.
+   - Original observation rows and free-R flags are untouched.
+
+Plumbed through `fitreso_scan(..., fill_fcalc=False)` → `run_refinement`.
+
+Insulin 4fg3→4e7u from raw, fill_fcalc=True:
+- 4fg3: 5,487 → 5,620 (100%)
+- 4e7u: 23,527 → 25,285 (100%)
+- bent.mtz at every scan point: 25,285 rows = full H 3 ASU at 1.23 Å.
+- Coot view: artifact-free.
+
+## PSDVF.mtz amplitude units
+
+The `dX`, `dY`, `dZ` columns store the **amplitude of the fitted shift
+coefficient along the corresponding fractional axis, in Å** (=
+sqrt(A²+B²) × cell_<axis>).  Phase (`PHX`, `PHY`, `PHZ`) is unchanged.
+
+Internally `eval_shift_field`, `write_bent_pdb`, etc. expect AB in
+fractional units.  `load_fitparams` reads the `BENDFINDER amplitude_units
+angstrom` history tag (added by `save_fitparams`) and divides by
+cell_<axis> on load to restore fractional AB — so the units change is
+display-only.  Files written before this change have no tag and are
+read as fractional unchanged.
 
 ## Space-group generality and testing
 
