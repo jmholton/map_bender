@@ -38,7 +38,11 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
   raddam/                       radiation damage 5kxk→5kxl/m/n (P4₃2₁2, ~980 CA pairs)
     fitreso_scan_5kxl/, fitreso_scan_5kxm/, fitreso_scan_5kxn/
   insulin/                      insulin hexamer 4fg3→4e7u (H3, T→R transition)
-    4fg3.pdb, 4e7u.pdb
+    4fg3.pdb, 4e7u.pdb          NB: both deposited MTZs are < 99% SG-ASU
+                                 complete (4e7u 93%, 4fg3 97.6%) — pass
+                                 `fill_fcalc=True` (CLI `--fill-fcalc`)
+                                 to fitreso_scan or run_refinement will
+                                 sys.exit(1).
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
   magdoff/                      Magdoff synthetic deformation validation tests
     test_magdoff.py             test script (7rsa, P2₁, 248 CA)
@@ -328,7 +332,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxm | P4₃2₁2 | 984 | 0.047 Å | 19.2% |  9.4% | bent |
 | Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.051 Å | 24.6% | 18.1% | bent |
 | Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | — | — | — |
-| Insulin 4fg3→4e7u | H3 | 534 | 1.063 Å | 68.7% | 83.7% | — |
+| Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 79.8% | ref (fill_fcalc=True) |
 
 Rbent values are post-F-space (k+B) scaling (compute_riso F-LS).  See per-
 system README files in `lyso/`, `dhfr/`, `raddam/` for invocation details
@@ -362,8 +366,12 @@ Notes:
       cleanest fit (best data quality of the damaged set).
 - **Myoglobin** Rbent pending; heme iron dominates diff map throughout
   (±35σ at A/154HEM/FE).
-- **Insulin**: high Rbent (68.7%) and residual RMSD (1.063 Å) reflect
+- **Insulin**: high Rbent (~60%) and residual RMSD (~0.5 Å) reflect
   genuine T→R conformational change — LEU B6 shifts ~8 Å between
   T-state (4fg3) and R-state (4e7u), which is outside the smooth
-  shift-field model.  Dominant diff peaks: +34σ at D/101ZN/ZN
-  (zinc position differs), −10σ at waters/SCN.
+  shift-field model.  Dominant diff peak: −39σ at D/101ZN/ZN(r) (zinc
+  position differs between T and R states).  **Requires
+  `fill_fcalc=True`** — both deposited MTZs are < 99% SG-ASU complete
+  (4e7u 93%, 4fg3 97.6%); without filling, refmac inherits the gaps
+  and bent.mtz shows missing-HKL chunks in Coot.  Reference run:
+  `scan_fitreso_fc/` (raw inputs → fill → refmac → altindex → scan).
