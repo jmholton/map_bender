@@ -2150,6 +2150,7 @@ def _parse_args(argv):
         'phi_col':        None,
         'run_refinement': False,
         'refine_cycles':  5,
+        'fill_fcalc':     False,
         'sample_rate':    0.0,
         'scan_dir':       None,
         'subtract':       'ref',
@@ -2201,6 +2202,8 @@ def _parse_args(argv):
                 params['run_refinement'] = val.lower() not in ('false', '0', 'no')
             elif key == 'refine_cycles':
                 params['refine_cycles'] = int(val)
+            elif key in ('fill_fcalc', 'fill-fcalc'):
+                params['fill_fcalc'] = val.lower() not in ('false', '0', 'no')
             elif key == 'sample_rate':
                 params['sample_rate'] = float(val)
             elif key == 'scan_dir':
@@ -2212,11 +2215,14 @@ def _parse_args(argv):
                           f"{val!r}", file=sys.stderr)
                     sys.exit(2)
                 params['subtract'] = v
-        elif arg in ('deltamaps', 'delta', 'nofit', 'run_refinement', 'refine'):
+        elif arg in ('deltamaps', 'delta', 'nofit', 'run_refinement', 'refine',
+                     'fill_fcalc', 'fill-fcalc', '--fill-fcalc'):
             if arg in ('deltamaps', 'delta'):
                 params['deltamaps'] = True
             elif arg in ('run_refinement', 'refine'):
                 params['run_refinement'] = True
+            elif arg in ('fill_fcalc', 'fill-fcalc', '--fill-fcalc'):
+                params['fill_fcalc'] = True
             # nofit: ignored — lstsq always fits
     # mapfile: tuple (mov, ref) if both maps given; bare path if one; None if none
     if map2 is not None:
@@ -2422,12 +2428,229 @@ def _fft_box_hkls(NX, NY, NZ):
     return np.stack([H[keep], K[keep], L[keep]], axis=1).astype(np.int32)
 
 
+def _canonical_hkl(h, proper_ops_R_int):
+    """Return the SG-canonical representative of HKL h.
+
+    Convention matches `assign_canonical`: lexicographic minimum of the orbit
+    {R_k^T h} reduced to Friedel-unique form (first nonzero index positive).
+    `proper_ops_R_int` is a list of integer 3×3 rotation matrices (the
+    fractional rotation parts of the SG's proper operators).
+    """
+    h_arr = np.asarray(h, dtype=int)
+    orbit = set()
+    for R in proper_ops_R_int:
+        rh = R.T @ h_arr
+        t  = (int(rh[0]), int(rh[1]), int(rh[2]))
+        for v in t:
+            if v != 0:
+                if v < 0:
+                    t = (-t[0], -t[1], -t[2])
+                break
+        orbit.add(t)
+    return min(orbit) if orbit else (int(h_arr[0]), int(h_arr[1]), int(h_arr[2]))
+
+
+def _enumerate_sg_asu_hkls(cell_tuple, sg, d_min):
+    """Enumerate SG-unique (h,k,l) at resolution ≥ d_min, excluding
+    systematic absences and (0,0,0).
+
+    Uses `generate_hkls` (Friedel-unique) + `_canonical_hkl` to deduplicate
+    by SG orbit, then filters out HKLs forbidden by centering / glide /
+    screw operators via `gemmi.GroupOps.is_systematically_absent`.
+    Avoids gemmi's `ReciprocalAsu`/`prepare_asu_data` (both known to
+    misclassify HKLs for certain SGs).
+    """
+    fu_hkls = generate_hkls(cell_tuple, d_min)
+    if len(fu_hkls) and tuple(fu_hkls[0]) == (0, 0, 0):
+        fu_hkls = fu_hkls[1:]
+    proper_ops = get_proper_symops(sg.xhm())
+    R_ints = [np.round(R).astype(int) for R, _ in proper_ops] or [np.eye(3, dtype=int)]
+    ops = sg.operations()
+    canon = set()
+    for h in fu_hkls:
+        ch = _canonical_hkl(tuple(int(x) for x in h), R_ints)
+        if ops.is_systematically_absent(ch):
+            continue
+        canon.add(ch)
+    return np.array(sorted(canon), dtype=np.int32)
+
+
+def _mtz_completeness(mtz_path):
+    """Return (n_obs, n_expected, fraction) for an MTZ.
+
+    n_expected = unique SG-ASU reflections at the input's resolution limit,
+    excluding systematic absences and (0,0,0).  Counts only rows with finite
+    F (column auto-detected: FP / F / FOBS); rows with NaN F are treated as
+    missing observations even when the HKL is present.
+    """
+    mtz = gemmi.read_mtz_file(mtz_path)
+    data = np.array(mtz.array)
+    lbls = mtz.column_labels()
+    F_lbl = next((l for l in ('FP', 'F', 'FOBS') if l in lbls), None)
+    if F_lbl is None:
+        # No Fobs column (already a map-coef MTZ, e.g. post-refmac with just
+        # FWT/PHWT).  Refmac will choke on this anyway; return "complete"
+        # so the completeness gate doesn't preempt that error with a
+        # confusing one.
+        return 0, 0, 1.0
+    hkls = data[:, :3].astype(int)
+    Fcol = data[:, lbls.index(F_lbl)]
+    proper_ops = get_proper_symops(mtz.spacegroup.xhm())
+    R_ints = [np.round(R).astype(int) for R, _ in proper_ops] or [np.eye(3, dtype=int)]
+    in_canon_with_F = {_canonical_hkl(tuple(int(x) for x in h), R_ints)
+                       for h, f in zip(hkls, Fcol) if np.isfinite(f)}
+    cell = mtz.cell
+    d_min = float(mtz.resolution_high())
+    asu = _enumerate_sg_asu_hkls(
+        (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma),
+        mtz.spacegroup, d_min)
+    n_expected = len(asu)
+    n_obs = sum(1 for h in asu
+                if tuple(int(x) for x in h) in in_canon_with_F)
+    frac = n_obs / n_expected if n_expected else 0.0
+    return n_obs, n_expected, frac
+
+
+def _fcalc_at_hkls(pdb_path, hkls, d_min, blur=0.0):
+    """Fcalc at given HKLs from PDB model via gemmi DensityCalculatorX + numpy FFT.
+
+    `blur` adds Babinet-style B-blur to the density (refmac uses ≈ 60 Å²
+    by default to keep the grid compact; set to 0 for unblurred density —
+    we deblur via `addends` after FFT).
+    Returns (M,) complex128 in gemmi's F-convention.
+    """
+    st = gemmi.read_structure(pdb_path)
+    st.setup_entities()
+    dc = gemmi.DensityCalculatorX()
+    dc.d_min = float(d_min)
+    if blur > 0:
+        dc.blur = float(blur)
+    dc.set_grid_cell_and_spacegroup(st)
+    dc.put_model_density_on_grid(st[0])
+    grid_xyz = np.array(dc.grid.array, dtype=np.float64)
+    F = _fft_lookup_at_hkls(grid_xyz, np.asarray(hkls, dtype=np.int32),
+                            st.cell.volume)
+    if blur > 0:
+        # Undo B-blur: F_true = F_blurred * exp(+blur/4 * s²)
+        cell = st.cell
+        M_frac = np.array(cell.frac.mat.tolist())
+        h_orth = np.asarray(hkls, dtype=float) @ M_frac
+        s_sq   = np.sum(h_orth ** 2, axis=1)
+        F = F * np.exp(blur / 4.0 * s_sq)
+    return F
+
+
+def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
+    """Augment an MTZ with model-derived Fcalc at HKLs missing from its SG ASU.
+
+    Used by `run_refinement` to give refmac a complete-ASU input so its
+    FWT/PHWT output has no missing-data gaps.  Lighter than uniqueify in
+    that it preserves the input column layout exactly and assigns FREE=0
+    (work set) to filled rows without touching existing free-R flags.
+
+    For filled rows the F column gets Fcalc and SIGFP gets the median of
+    observed SIGFP (so refmac sees a finite weight).  If the input has no
+    F/SIGFP column, returns the input path unchanged.
+    """
+    mtz = gemmi.read_mtz_file(in_mtz_path)
+    cell = mtz.cell
+    sg   = mtz.spacegroup
+    data = np.array(mtz.array, copy=True)
+    lbls = mtz.column_labels()
+    types = [c.type for c in mtz.columns]
+    in_hkls = data[:, :3].astype(int)
+    if d_min is None:
+        d_min = float(mtz.resolution_high())
+
+    # Identify amplitude / sigma / free columns
+    F_lbl    = next((l for l in ('FP', 'F', 'FOBS') if l in lbls), None)
+    SIG_lbl  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in lbls), None)
+    FREE_lbl = next((l for l in ('FREE', 'RFREE', 'FreeR_flag') if l in lbls), None)
+    if F_lbl is None:
+        # Nothing to fill — input MTZ doesn't have an Fobs column refmac would use.
+        import shutil as _sh
+        _sh.copyfile(in_mtz_path, out_mtz_path)
+        return out_mtz_path
+
+    # Strip systematic absences from input rows.  They're zero by symmetry;
+    # presence is either a bug in the source MTZ or stale rows from a tool
+    # that wrote them in.  Refmac and other CCP4 tools either silently
+    # ignore them or flag them as soft errors — cleaner to drop them here.
+    ops = sg.operations()
+    keep_mask = np.array([not ops.is_systematically_absent(tuple(int(x) for x in h))
+                          for h in in_hkls])
+    n_stripped = int((~keep_mask).sum())
+    if n_stripped:
+        data = data[keep_mask]
+        in_hkls = data[:, :3].astype(int)
+
+    proper_ops = get_proper_symops(sg.xhm())
+    R_ints = [np.round(R).astype(int) for R, _ in proper_ops] or [np.eye(3, dtype=int)]
+
+    # Map existing input HKLs to canonical form so we don't double-count
+    in_canon = {_canonical_hkl(tuple(int(x) for x in h), R_ints)
+                for h in in_hkls}
+    cell_tuple = (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma)
+    asu_hkls = _enumerate_sg_asu_hkls(cell_tuple, sg, d_min)
+    missing = [tuple(int(x) for x in h) for h in asu_hkls
+               if tuple(int(x) for x in h) not in in_canon]
+    if not missing:
+        # All SG-ASU HKLs already present.  If we stripped any absences above,
+        # write out the cleaned MTZ — otherwise just copy the input.
+        if n_stripped:
+            mtz.set_data(data.astype(np.float32))
+            mtz.write_to_file(out_mtz_path)
+        else:
+            import shutil as _sh
+            _sh.copyfile(in_mtz_path, out_mtz_path)
+        return out_mtz_path
+
+    missing_hkl = np.array(missing, dtype=np.int32)
+    fc = _fcalc_at_hkls(pdb_path, missing_hkl, d_min)
+    fc_amp = np.abs(fc).astype(np.float32)
+
+    # Fill values for ancillary columns
+    F_idx = lbls.index(F_lbl)
+    sig_default = (np.float32(np.nanmedian(data[:, lbls.index(SIG_lbl)]))
+                   if SIG_lbl else np.float32(1.0))
+    free_default = np.float32(0.0)   # work set
+
+    new_rows = np.full((len(missing_hkl), data.shape[1]),
+                       np.nan, dtype=np.float32)
+    new_rows[:, :3] = missing_hkl
+    new_rows[:, F_idx] = fc_amp
+    if SIG_lbl:
+        new_rows[:, lbls.index(SIG_lbl)] = sig_default
+    if FREE_lbl:
+        new_rows[:, lbls.index(FREE_lbl)] = free_default
+
+    out_data = np.vstack([data, new_rows]).astype(np.float32)
+    mtz.set_data(out_data)
+    mtz.write_to_file(out_mtz_path)
+    return out_mtz_path
+
+
+def _fft_box_d_min(cell_obj, NX, NY, NZ):
+    """Resolution limit (Å) supported by an FFT grid (NX,NY,NZ) on `cell_obj`.
+
+    Conservative: takes the per-axis Nyquist min, so HKLs enumerated to this
+    d_min always fit inside the FFT box.
+    """
+    return float(min(2.0 * cell_obj.a / NX,
+                     2.0 * cell_obj.b / NY,
+                     2.0 * cell_obj.c / NZ))
+
+
 def _map2mtz(mapfile, mtzfile):
-    """Convert a CCP4 map to an MTZ via direct numpy FFT.
+    """Convert a CCP4 map to an SG-ASU MTZ via direct numpy FFT.
 
     Replaces the gemmi `transform_map_to_f_phi + prepare_asu_data` pipeline
     which silently drops ~50% of unique reflections for trigonal/hexagonal
     spacegroups (v0.6 wedge bug; v0.7 missing-k=0-plane bug; see CLAUDE.md).
+
+    Writes one row per SG-unique HKL — NOT a P1 / Friedel-unique full-box
+    MTZ.  Encoding the same density in N point-group copies would multiply
+    the inverse-FFT'd map by N.
     """
     data, hdr = read_ccp4(mapfile)
     cell_tuple = hdr['cell']
@@ -2440,8 +2663,9 @@ def _map2mtz(mapfile, mtzfile):
 
     grid_xyz = _grid_xyz_fullcell(data, dict(hdr, spacegroup=sg_num))
     NX, NY, NZ = grid_xyz.shape
-    hkls = _fft_box_hkls(NX, NY, NZ)
-    F    = _fft_lookup_at_hkls(grid_xyz, hkls, cell_obj.volume)
+    d_min = _fft_box_d_min(cell_obj, NX, NY, NZ)
+    hkls  = _enumerate_sg_asu_hkls(cell_tuple, sg, d_min)
+    F     = _fft_lookup_at_hkls(grid_xyz, hkls, cell_obj.volume)
     mtz  = gemmi.Mtz(with_base=True)
     mtz.spacegroup = sg
     mtz.cell       = cell_obj
@@ -2613,8 +2837,8 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
 def _write_scan_mtz(bent_arr, diff_arr, ref_h, mtzfile):
     """Write bent.mtz with FDM/PHIDM (bent map) + DELFWT/PHDELWT (diff map).
 
-    Uses direct numpy FFT + Friedel-unique HKL enumeration; avoids the
-    broken gemmi `prepare_asu_data` path (see CLAUDE.md).
+    SG-ASU MTZ via direct numpy FFT (not P1 / Friedel-box — see
+    `_map2mtz` docstring for why).
     """
     cell_obj = gemmi.UnitCell(*ref_h['cell'])
     sg_num   = ref_h.get('spacegroup', 1)
@@ -2623,7 +2847,11 @@ def _write_scan_mtz(bent_arr, diff_arr, ref_h, mtzfile):
     grid_b = _grid_xyz_fullcell(bent_arr, ref_h)
     grid_d = _grid_xyz_fullcell(diff_arr, ref_h)
     NX, NY, NZ = grid_b.shape
-    hkls = _fft_box_hkls(NX, NY, NZ)
+    d_min = _fft_box_d_min(cell_obj, NX, NY, NZ)
+    hkls = _enumerate_sg_asu_hkls(
+        (cell_obj.a, cell_obj.b, cell_obj.c,
+         cell_obj.alpha, cell_obj.beta, cell_obj.gamma),
+        sg, d_min)
     Fb = _fft_lookup_at_hkls(grid_b, hkls, cell_obj.volume)
     Fd = _fft_lookup_at_hkls(grid_d, hkls, cell_obj.volume)
 
@@ -2656,6 +2884,7 @@ def fitreso_scan(
     mov_pdb, ref_pdb, mov_mtz, ref_mtz, scan_dir,
     f_col=None, phi_col=None,
     run_refinement_flag=False, refine_cycles=5,
+    fill_fcalc=False,
     sample_rate=0.0,
     mov_fullcell=None,
     fitreso_list=(20, 15, 12, 10, 8, 7, 6, 5),
@@ -2709,12 +2938,12 @@ def fitreso_scan(
             mov_pdb, mov_mtz = run_refinement(
                 mov_pdb, mov_mtz,
                 outdir=os.path.join(scan_dir, 'refine_mov'),
-                n_cycles=refine_cycles)
+                n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
         if ref_mtz.lower().endswith('.mtz'):
             ref_pdb, ref_mtz = run_refinement(
                 ref_pdb, ref_mtz,
                 outdir=os.path.join(scan_dir, 'refine_ref'),
-                n_cycles=refine_cycles)
+                n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
 
     # ── altindex / origin resolution ──────────────────────────────────────────
     # Discrete (rotation × symop × origin) enumeration ranked by post-transform
@@ -3273,7 +3502,8 @@ def mtz_to_map_data(mtz_path, f_col, phi_col, sample_rate=0.0):
     return data, hdr
 
 
-def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
+def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
+                   fill_fcalc=False, completeness_threshold=0.99):
     """Run refmac5 or phenix.refine on pdb_path+mtz_path; return
     (refined_pdb_path, refined_mtz_path).
 
@@ -3284,6 +3514,17 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
     (altindex resolution, peak hunting, etc.) on the refined atom set —
     which can differ from the input atom set when refmac drops
     disordered residues during the run.
+
+    fill_fcalc : if True, augment input MTZ with model-derived Fcalc at
+                 SG-ASU HKLs missing from the deposited dataset before
+                 calling refmac.  Required when completeness is below
+                 `completeness_threshold` (default 99%) — refmac only
+                 writes FWT for HKLs present in input, so an incomplete
+                 input means incomplete FWT and incomplete downstream
+                 bent.mtz coverage.  When False and input is below
+                 threshold, sys.exit(1) with instructions.
+    completeness_threshold : minimum SG-ASU completeness required when
+                 fill_fcalc=False.
     """
     import shutil as _sh2
     os.makedirs(outdir, exist_ok=True)
@@ -3291,11 +3532,46 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
     out_pdb = os.path.join(outdir, f'{stem}_refined.pdb')
     out_mtz = os.path.join(outdir, f'{stem}_refined.mtz')
 
+    # ── Completeness check.  Refmac writes FWT/PHWT only for HKLs present
+    # in the input MTZ; an incomplete input means an incomplete FWT and
+    # downstream bent.mtz inherits the gaps (Coot shows missing chunks).
+    # Below `completeness_threshold` (default 99%) we refuse to proceed
+    # unless the caller opts into `fill_fcalc=True`, which augments the
+    # input MTZ with Fcalc-derived rows at SG-ASU HKLs missing from the
+    # deposited dataset.  This is a deliberate choice — silently filling
+    # would risk biasing the refinement / downstream fit, so make it
+    # explicit.
+    n_obs, n_exp, frac = _mtz_completeness(mtz_path)
+    print(f'  input completeness: {n_obs}/{n_exp} = {100*frac:.1f}%',
+          flush=True)
+    mtz_path_for_refmac = mtz_path
+    if frac < completeness_threshold:
+        if not fill_fcalc:
+            print(f'ERROR: {os.path.basename(mtz_path)} is {100*frac:.1f}% '
+                  f'complete (< {100*completeness_threshold:.0f}% threshold).\n'
+                  f'  Re-run with fill_fcalc=True (or pass --fill-fcalc on CLI) '
+                  f'to fill missing SG-ASU HKLs with model-derived Fcalc.\n'
+                  f'  This is required so refmac writes FWT for every SG-ASU '
+                  f'HKL and the downstream scan map is complete.',
+                  file=sys.stderr)
+            sys.exit(1)
+        mtz_filled = os.path.join(outdir, f'{stem}_filled.mtz')
+        try:
+            _fill_missing_with_fcalc(mtz_path, pdb_path, mtz_filled)
+            n2, e2, f2 = _mtz_completeness(mtz_filled)
+            print(f'  filled with Fcalc → {n2}/{e2} = {100*f2:.1f}% complete',
+                  flush=True)
+            mtz_path_for_refmac = mtz_filled
+        except Exception as e:
+            print(f'  _fill_missing_with_fcalc failed ({e!r}); aborting',
+                  file=sys.stderr)
+            sys.exit(1)
+
     # ── refmac5 ──────────────────────────────────────────────────────────────
     refmac = (_sh2.which('refmac5')
               or os.path.join(os.environ.get('CCP4', ''), 'bin', 'refmac5'))
     if refmac and os.path.exists(refmac):
-        mtz_in = gemmi.read_mtz_file(mtz_path)
+        mtz_in = gemmi.read_mtz_file(mtz_path_for_refmac)
         cols   = {c.label for c in mtz_in.columns}
         fp     = next((l for l in ('FP', 'F', 'FOBS')              if l in cols), None)
         sigfp  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS')     if l in cols), None)
@@ -3311,7 +3587,7 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
                       f'LABIN {labin}\n'
                       f'END\n')
             cmd    = [refmac, 'xyzin', pdb_path, 'xyzout', out_pdb,
-                      'hklin', mtz_path, 'hklout', out_mtz]
+                      'hklin', mtz_path_for_refmac, 'hklout', out_mtz]
             print(f'  run_refinement: {os.path.basename(refmac)} rigid '
                   f'({n_cycles} cycles)...', flush=True)
             r = subprocess.run(cmd, input=script, capture_output=True, text=True)
@@ -3332,7 +3608,7 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5):
     # ── phenix.refine ─────────────────────────────────────────────────────────
     phenix = _sh2.which('phenix.refine')
     if phenix:
-        cmd = [phenix, pdb_path, mtz_path,
+        cmd = [phenix, pdb_path, mtz_path_for_refmac,
                f'refinement.main.cycles={n_cycles}',
                f'output.prefix={os.path.join(outdir, stem)}']
         print(f'  run_refinement: phenix.refine ({n_cycles} cycles)...', flush=True)
@@ -3840,6 +4116,7 @@ def main():
                      f_col=p['f_col'], phi_col=p['phi_col'],
                      run_refinement_flag=p['run_refinement'],
                      refine_cycles=p['refine_cycles'],
+                     fill_fcalc=p['fill_fcalc'],
                      sample_rate=p['sample_rate'],
                      subtract=p['subtract'])
         sys.exit(0)
@@ -3847,10 +4124,12 @@ def main():
     # ── Single-fit path: refinement (if requested) then altindex resolution ──
     if mov_mtz and p['run_refinement']:
         pdb1, mov_mtz = run_refinement(pdb1, mov_mtz, outdir='refine_mov',
-                                        n_cycles=p['refine_cycles'])
+                                        n_cycles=p['refine_cycles'],
+                                        fill_fcalc=p['fill_fcalc'])
     if ref_mtz and p['run_refinement']:
         pdb2, ref_mtz = run_refinement(pdb2, ref_mtz, outdir='refine_ref',
-                                        n_cycles=p['refine_cycles'])
+                                        n_cycles=p['refine_cycles'],
+                                        fill_fcalc=p['fill_fcalc'])
 
     if mov_mtz:
         _res = resolve_altindex(pdb1, pdb2, mov_mtz,
