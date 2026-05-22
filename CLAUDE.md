@@ -46,35 +46,13 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
   porin/                        porin 3poq→3pou (H 3 2)
     3poq.pdb, 3pou.pdb          NB: 3poq.mtz is 89.9% complete
                                  (3pou.mtz 99.6%) — needs
-                                 `fill_fcalc=True`.  The two cells
-                                 differ slightly (3poq 77.31×77.31×330.36
-                                 vs 3pou 85.71×85.71×332.94) but they
-                                 are alt-cell-related, not genuinely
-                                 different.  origins/claude's
-                                 stretch_to_cell + LSQ workflow brings
-                                 the pair to ~5 Å CA RMSD — that
-                                 residual is what bendfinder should
-                                 bend.  **Currently fails (May 2026):**
-                                 `resolve_altindex` only enumerates
-                                 integer-rotation altindex ops with
-                                 entries in {-1,0,1} (3³=19683 cands),
-                                 which can't realise the ~180° LSQ
-                                 rotation about [1,-0.89,0] that
-                                 actually aligns the cells.  The best
-                                 discrete altindex (origins/claude's
-                                 `nearest_altindex.py`, basis-change
-                                 entries in {-2..2}) gets drot=56°,
-                                 RMSD=15.6 Å.  Even after that altindex,
-                                 the residual ~5 Å is not a SG-allowed
-                                 rigid body, so the aligned mov PDB
-                                 doesn't have a self-consistent MTZ in
-                                 that frame.  Porting the
-                                 stretch_to_cell + LSQ path into
-                                 bendfinder requires generating mov
-                                 MTZs by Fcalc (since the original
-                                 mov MTZ phases can't be carried
-                                 through a non-crystallographic
-                                 rotation) — not done yet.
+                                 `fill_fcalc=True`.  3poq/3pou are an
+                                 obverse/reverse pair — see the
+                                 "altalign.py and the porin
+                                 obverse/reverse problem" section
+                                 below.  The PDB side is solved
+                                 (altalign aligns to ~2 Å); the moving
+                                 MTZ needs the dual-solution writer.
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
   magdoff/                      Magdoff synthetic deformation validation tests
     test_magdoff.py             test script (7rsa, P2₁, 248 CA)
@@ -173,6 +151,82 @@ _ALTINDEX_CANDIDATES = {
 Callers (`bend_fit`, `bend_fit_progressive`) unpack all 4 values and print: `origin shift: (x, y, z) for SG  +altindex  +symop_idx=k`.
 
 **CA shift sanity check**: After outlier rejection, if the largest fractional CA shift among remaining atoms exceeds **0.35 cells** (~16 Å for a 47 Å cell), an error is raised. This threshold was raised from 0.1 to accommodate genuine large conformational differences (e.g. insulin T→R, LEU B6 shifts ~8 Å ≈ 0.165 fractional). Values >0.35 indicate gross misalignment or a wrong origin.
+
+## Basis-change altindex enumeration (`_get_altindex_ops`)
+
+`_get_altindex_ops(sg_name, cell, max_M=1, det_max=1)` returns the
+altindex candidate ops as `(R_frac, t_frac)` tuples (previously it
+returned bare `R` arrays — callers `_find_best_origin` and
+`_enum_alt_rot_origin_candidates` were updated to unpack the pair).
+
+The enumeration is ported from `~/projects/origins/claude/gemmi_altindex.py`:
+for every integer basis-change matrix `M` (entries in `{-max_M..max_M}`,
+`|det M| ≤ det_max`), build the alt-cell metric `G_alt = M G Mᵀ`,
+identify its crystal system, look up catalog SGs of that system, and
+conjugate each catalog symop back to the original frame as
+`R_old = Mᵀ R_alt M⁻ᵀ`, `t_old = Mᵀ t_alt`.  Keep ops where `R_old` is
+integer with entries in `{-1,0,1}`, metric-preserving, and `t_old` has
+denominator in `{1,2,3}`.  This finds altindex ops the old
+`{-1,0,1}`-only direct enumeration missed (e.g. the porin obverse↔reverse
+2-fold).  Vectorised + `lru_cache`d; `_catalog_ops_by_cs()` pre-extracts
+the catalog once.  ~30 s cold for a large trigonal cell, then free.
+
+A **normalizing** altindex op (one in the normalizer of the SG —
+preserves both rotations *and* centering) reindexes the moving MTZ
+cleanly: `R·SG·R⁻¹ = SG`.  A **non-normalizing** metric-preserving op
+does not — it lands the moving data in a conjugate setting (see porin
+below).  For H 3 2, 44 of the 75 enumerated ops normalize.
+
+## altalign.py and the porin obverse/reverse problem
+
+`altalign.py` is a standalone LSQ-based altindex+origin search (run it
+instead of a full `fitreso_scan` while iterating on alignment):
+
+1. Kabsch rigid-body fit of matched CA → continuous `R_lsq`.
+2. Enumerate `(altindex × symop × origin)` candidates via
+   `_enum_alt_rot_origin_candidates` (the basis-change enumeration).
+3. Score each in honest cartesian RMSD (one whole-lattice image shift
+   for the whole model, **not** per-atom fractional wrapping — the old
+   `resolve_altindex` per-coordinate `diff -= round(diff)` is what made
+   it fragile).  `discrete` = exact crystallographic translation;
+   `comfit` = COM-optimal continuous translation (the theoretical floor).
+4. Rank by honest discrete RMSD; `drot` (deviation from `R_lsq`) is
+   carried as a cross-check.
+
+`ccp4-python altalign.py mov.pdb ref.pdb [out.pdb] [mov.mtz] [out.mtz]`
+
+**Porin diagnosis (definitive, May 2026).**  3poq and 3pou are *both*
+deposited as standard obverse H 3 2 (every reflection obeys −h+k+l=3n).
+altalign finds the op that aligns them — a 2-fold,
+`R=[[0,-1,0],[-1,0,0],[0,0,-1]]` — and the moving PDB lands an honest
+**2.11 Å** (CA, no fit) from 3pou.  But that op is the obverse↔reverse
+2-fold: it is metric-preserving yet does **not** normalize H 3 2 (it
+maps centering vector (2/3,1/3,1/3) → (2/3,1/3,2/3), a *reverse*
+centering vector).  So the *aligned* moving crystal is unavoidably in
+the **reverse H setting**.  This is fundamental — the only clean
+(normalizing) altindex op gets porin no closer than 18.86 Å, and the
+reverse→obverse converter is a 180° rotation about c that re-scrambles
+the fit.  gemmi has no name for reverse-hex H 3 2
+(`find_spacegroup_by_ops` → `None`), which is why naively reindexing the
+moving MTZ then testing it against obverse H 3 2 reports 30%
+completeness (exactly ⅓ — 2-of-3 centering reflections look absent).
+
+**Planned fix — altalign emits two solutions.**  Neither is strictly
+better; which is preferred depends on the downstream workflow (notably
+whether the reference is allowed to change setting too):
+
+- **H 3 2 + SYMM**: keep hexagonal axes; write the moving PDB/MTZ with
+  the *conjugate* (reverse) symmetry operators in the explicit SYMM
+  records.  Reference stays untouched standard H 3 2.  Depends on
+  refmac honoring explicit SYMM over the SG name.
+- **R 3 2 :R**: convert the aligned moving crystal to the rhombohedral
+  primitive setting — primitive, no centering, no obverse/reverse
+  ambiguity, and both gemmi and refmac support it natively.  Cleanest
+  crystallographically, but the moving crystal is then in a different
+  setting from the (hexagonal) reference.
+
+Both are valid descriptions of the same aligned moving crystal; the
+dual-solution writer in `altalign.py` is the next implementation step.
 
 ## Cubic b-spline boundary fix (interpolate_map)
 
@@ -365,7 +419,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.048 Å | 24.1% | 18.1% | bent |
 | Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | 49.8% | 53.8% | ref |
 | Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 79.8% | ref (fill_fcalc=True) |
-| Porin 3poq→3pou | H 3 2 | 340 | — | — | — | fails: cross-cell pair (77→86 Å a/b), see directory note |
+| Porin 3poq→3pou | H 3 2 | 340 | — | — | — | obverse/reverse pair — altalign aligns PDB to 2.1 Å; MTZ pending dual-solution writer |
 
 All "from-raw" runs in `<system>/scan_fitreso_fc/` (May 2026,
 fill_fcalc=True propagated through refmac and altindex re-refinement).

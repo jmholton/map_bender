@@ -1423,49 +1423,219 @@ def _metric_tensor(cell):
     return O.T @ O
 
 
-def _get_altindex_ops(sg_name, cell=None):
-    """All proper-rotation integer matrices R (entries in {-1, 0, 1}) that
-    preserve the cell's lattice metric tensor and are NOT in this SG's
-    rotation set.  These are the "altindex" candidates: rotations that map
-    the lattice to itself but aren't already symmetries of the SG (e.g.
-    the 6-fold along c for H 3 / R 3 Sohncke groups, hex 2-folds for
-    trigonal point group 3, axis permutations for orthorhombic, etc.).
+_ALT_SYSTEM_GROUPS = {
+    'triclinic':    ('triclinic',),
+    'monoclinic':   ('triclinic', 'monoclinic'),
+    'orthorhombic': ('triclinic', 'monoclinic', 'orthorhombic'),
+    'tetragonal':   ('triclinic', 'monoclinic', 'orthorhombic', 'tetragonal'),
+    'trig_hex':     ('triclinic', 'monoclinic', 'orthorhombic',
+                     'trigonal', 'hexagonal'),
+    'cubic':        ('triclinic', 'monoclinic', 'orthorhombic',
+                     'tetragonal', 'cubic'),
+}
 
-    Returns a list of (3, 3) float arrays (empty if the SG already spans
-    its lattice holohedry, e.g. P -1, P 2/m, F 4/mmm).
+
+def _cell_params_from_G(G):
+    a  = float(np.sqrt(G[0, 0]))
+    b  = float(np.sqrt(G[1, 1]))
+    c  = float(np.sqrt(G[2, 2]))
+    al = float(np.degrees(np.arccos(np.clip(G[1, 2] / (b * c), -1, 1))))
+    be = float(np.degrees(np.arccos(np.clip(G[0, 2] / (a * c), -1, 1))))
+    ga = float(np.degrees(np.arccos(np.clip(G[0, 1] / (a * b), -1, 1))))
+    return (a, b, c, al, be, ga)
+
+
+def _crystal_system_of_params(params, deg=1.5, atol_a=1.0):
+    a, b, c, al, be, ga = params
+    is_90  = lambda x: abs(x - 90)  < deg
+    is_120 = lambda x: abs(x - 120) < deg
+    eq     = lambda x, y: abs(x - y) < atol_a
+    if is_90(al) and is_90(be) and is_90(ga):
+        if eq(a, b) and eq(b, c):    return 'cubic'
+        if eq(a, b) or eq(b, c) or eq(a, c): return 'tetragonal'
+        return 'orthorhombic'
+    if is_90(al) and is_90(be) and is_120(ga) and eq(a, b):
+        return 'trig_hex'
+    if sum(1 for x in (al, be, ga) if not is_90(x)) == 1:
+        return 'monoclinic'
+    return 'triclinic'
+
+
+import functools as _functools
+
+
+@_functools.lru_cache(maxsize=64)
+def _get_altindex_ops_cached(sg_name, cell_tuple, max_M, det_max):
+    """LRU-cached worker for _get_altindex_ops.  Cell is a tuple for
+    hashability; cell=None is encoded as None.  ~minute-long enumeration
+    runs only once per (sg, cell, max_M, det_max) within a process."""
+    return _get_altindex_ops_impl(sg_name, cell_tuple, max_M, det_max)
+
+
+def _get_altindex_ops(sg_name, cell=None, max_M=1, det_max=1):
+    if cell is None:
+        cell_tuple = None
+    elif hasattr(cell, 'a'):       # gemmi.UnitCell
+        cell_tuple = (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma)
+    else:
+        cell_tuple = tuple(cell)
+    return _get_altindex_ops_cached(sg_name, cell_tuple, max_M, det_max)
+
+
+@_functools.lru_cache(maxsize=1)
+def _catalog_ops_by_cs():
+    """Pre-extract (R_int, t_frac) arrays for every catalog SG, grouped
+    by crystal system.  Saves ~100× over per-call iteration of
+    gemmi.spacegroup_table() + .operations() + per-op array construction.
+    Returns dict: crystal_system → (R_all (n,3,3) float, t_all (n,3) float).
+    """
+    by_cs = {}
+    for cand in gemmi.spacegroup_table():
+        Rs, ts = [], []
+        for op in cand.operations():
+            Rs.append(np.array(op.rot, dtype=float) / op.DEN)
+            ts.append(np.array(op.tran, dtype=float) / op.DEN)
+        cs = cand.crystal_system_str()
+        prev = by_cs.get(cs)
+        if prev is None:
+            by_cs[cs] = ([Rs], [ts])
+        else:
+            prev[0].append(Rs); prev[1].append(ts)
+    # Concatenate per-cs into single arrays
+    out = {}
+    for cs, (Rs_list, ts_list) in by_cs.items():
+        R_flat = np.concatenate([np.array(r) for r in Rs_list], axis=0)
+        t_flat = np.concatenate([np.array(t) for t in ts_list], axis=0)
+        out[cs] = (R_flat, t_flat)
+    return out
+
+
+def _get_altindex_ops_impl(sg_name, cell=None, max_M=1, det_max=1):
+    """All proper-rotation (R, t) ops that preserve the cell's lattice metric
+    and are NOT already in this SG.  These are the "altindex" candidates:
+    rotations + translations that map the lattice to itself but aren't
+    already symmetries of the SG.
+
+    Uses a basis-change enumeration ported from ~/projects/origins/claude/
+    gemmi_altindex.py: integer M matrices with entries in {-max_M..max_M}
+    and |det(M)| ≤ det_max (defaults 2 and 4); for each M, build the alt-cell
+    metric G_alt = M G Mᵀ, identify its crystal system, look up catalog SGs
+    matching that system, then conjugate each catalog symop back to the
+    original frame as R_old = Mᵀ R_alt M⁻ᵀ, t_old = Mᵀ t_alt.  Keep ops
+    where R_old is integer with entries in {-1,0,1} and t_old has
+    denominator in {1,2,3} (centring fractions of standard SG settings).
+
+    Returns a list of (R_float, t_float) tuples.  Empty if the SG already
+    spans its lattice holohedry.  Identity is excluded.
 
     A `cell` is needed because metric-preservation depends on the lattice
-    parameters (a hex 2-fold is a rotation only when a=b and γ=120°).  If
-    cell is None we use a generic isotropic test that may admit non-
-    physical ops; pass the real cell for correctness.
+    parameters.  If cell is None we fall back to an isotropic generic
+    metric — imperfect but harmless when the SG strongly constrains the
+    cell anyway.
     """
     import itertools
+    from fractions import Fraction
     sg = gemmi.find_spacegroup_by_name(sg_name)
-    if cell is None:
-        # Fall back to crystal-system-typical metric (identity); imperfect
-        cell_for_G = (10.0, 10.0, 10.0, 90.0, 90.0, 90.0)
-    else:
-        cell_for_G = cell
+    cell_for_G = cell if cell is not None else (10.0, 10.0, 10.0, 90.0, 90.0, 90.0)
     G = _metric_tensor(cell_for_G)
 
-    # SG's existing proper rotations (integer R with det = +1)
+    # SG's existing proper rotations (drop these from the altindex set)
     sg_R = set()
     for op in sg.operations():
         R = (np.array(op.rot, dtype=int) // op.DEN)
         if int(round(np.linalg.det(R))) == 1:
             sg_R.add(tuple(R.flatten()))
 
-    tol = 1e-6 * float(np.max(np.abs(G)))
-    out = []
-    for comps in itertools.product([-1, 0, 1], repeat=9):
-        R = np.array(comps, dtype=int).reshape(3, 3)
-        if int(round(np.linalg.det(R))) != 1:        # proper rotations only
+    catalog = _catalog_ops_by_cs()
+    tol_G = 1e-6 * float(np.max(np.abs(G)))
+    all_ops = set()
+
+    # Pre-filter M matrices by det in [-det_max..det_max] excluding 0.
+    # At max_M=1 det_max=1 this drops 19683 → ~3000 (only |det|=1 survive).
+    M_candidates = []
+    for M_flat in itertools.product(range(-max_M, max_M + 1), repeat=9):
+        M = np.array(M_flat, dtype=float).reshape(3, 3)
+        d = int(round(np.linalg.det(M)))
+        if d == 0 or abs(d) > det_max:
             continue
-        if tuple(R.flatten()) in sg_R:               # already an SG op
+        M_candidates.append(M)
+
+    for M in M_candidates:
+        G_alt = M @ G @ M.T
+        try:
+            params = _cell_params_from_G(G_alt)
+        except (ValueError, FloatingPointError):
             continue
-        if np.allclose(R.T @ G @ R, G, atol=tol):
-            out.append(R.astype(float))
-    return out
+        if any(p < 1.0 for p in params[:3]):
+            continue
+        try:
+            M_inv_T = np.linalg.inv(M.T)
+        except np.linalg.LinAlgError:
+            continue
+        cs = _crystal_system_of_params(params)
+
+        # Vectorized per-M: build R_all/t_all by concatenating per-CS arrays
+        R_all_list, t_all_list = [], []
+        for sub_cs in _ALT_SYSTEM_GROUPS[cs]:
+            entry = catalog.get(sub_cs)
+            if entry is None: continue
+            R_all_list.append(entry[0])
+            t_all_list.append(entry[1])
+        if not R_all_list:
+            continue
+        R_alt = np.concatenate(R_all_list, axis=0)   # (N, 3, 3)
+        t_alt = np.concatenate(t_all_list, axis=0)   # (N, 3)
+
+        # Bulk conjugate: R_old[n] = M.T @ R_alt[n] @ M_inv_T
+        R_old = np.einsum('ij,njk,kl->nil', M.T, R_alt, M_inv_T)
+        # Filter integer R with |entries| ≤ 1
+        R_round = np.round(R_old)
+        ok_int = np.all(np.abs(R_old - R_round) < 1e-4, axis=(1, 2))
+        ok_small = np.all(np.abs(R_round) <= 1.0, axis=(1, 2))
+        keep = ok_int & ok_small
+        if not keep.any():
+            continue
+        R_int = R_round[keep].astype(int)            # (M, 3, 3)
+        t_old = (M.T @ t_alt[keep].T).T              # (M, 3)
+        det_R = np.round(np.linalg.det(R_int))
+        keep2 = det_R == 1
+        if not keep2.any():
+            continue
+        R_int = R_int[keep2]; t_old = t_old[keep2]
+
+        # Metric-preservation: R_int.T @ G @ R_int ≈ G  (fast manual check)
+        R_int_f = R_int.astype(float)
+        prod = np.einsum('nji,jk,nkl->nil', R_int_f, G, R_int_f)
+        keep3 = (np.max(np.abs(prod - G).reshape(len(R_int), -1), axis=1)
+                 < tol_G)
+        if not keep3.any():
+            continue
+        R_int = R_int[keep3]; t_old = t_old[keep3]
+
+        # Translation denominator ∈ {1, 2, 3}: equivalent to 2t OR 3t integer.
+        t_mod = t_old - np.floor(t_old + 1e-9)        # wrap to [0,1)
+        t2 = np.abs(t_mod * 2.0 - np.round(t_mod * 2.0)) < 1e-3
+        t3 = np.abs(t_mod * 3.0 - np.round(t_mod * 3.0)) < 1e-3
+        per_comp_ok = t2 | t3
+        keep4 = np.all(per_comp_ok, axis=1)
+        if not keep4.any():
+            continue
+        R_int = R_int[keep4]; t_mod = t_mod[keep4]
+        # Snap t_mod to its nearest /6 grid value to canonicalize for dedup
+        t_snap = np.round(t_mod * 6.0) / 6.0
+        # Wrap any 1.0 back to 0.0
+        t_snap = np.round(t_snap, 6) % 1.0
+
+        for i in range(len(R_int)):
+            R_tup = tuple(int(v) for v in R_int[i].flatten())
+            t_tup = tuple(float(round(v, 6)) for v in t_snap[i])
+            if R_tup in sg_R and all(abs(v) < 1e-6 for v in t_tup):
+                continue                              # plain SG identity-translation op
+            all_ops.add((R_tup, t_tup))
+
+    return [(np.array(R_tup, dtype=float).reshape(3, 3),
+             np.array(t_tup, dtype=float))
+            for R_tup, t_tup in sorted(all_ops)]
 
 
 def _apply_rotation_to_atoms(atoms, R):
@@ -1555,7 +1725,11 @@ def _find_best_origin(atoms1_op0, atoms2, sg_name, cell=None, n_polar=12):
     best_R_alt = None
 
     if not (best_score < ref_score * 0.9):
-        for R_alt in _get_altindex_ops(sg_name, cell=cell):
+        for R_alt, _t_alt in _get_altindex_ops(sg_name, cell=cell):
+            # _find_best_origin's caller applies altindex via
+            # _reexpand_atoms_with_rotation which takes R only; the
+            # translation is absorbed by the existing origin candidates
+            # loop above.
             atoms2_alt = _reexpand_atoms_with_rotation(atoms2, R_alt, sg_name)
             s, d, k = _search(atoms2_alt)
             if s < best_score:
@@ -2951,23 +3125,26 @@ def fitreso_scan(
     # Refmac can drop disordered atoms during the run, so subsequent steps
     # (altindex resolution + re-refinement, write_bent_pdb, peak hunting)
     # all use the *refined* PDB to keep the atom set consistent.
-    if run_refinement_flag:
-        if mov_mtz.lower().endswith('.mtz'):
-            mov_pdb, mov_mtz = run_refinement(
-                mov_pdb, mov_mtz,
-                outdir=os.path.join(scan_dir, 'refine_mov'),
-                n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
-        if ref_mtz.lower().endswith('.mtz'):
-            ref_pdb, ref_mtz = run_refinement(
-                ref_pdb, ref_mtz,
-                outdir=os.path.join(scan_dir, 'refine_ref'),
-                n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
+    if run_refinement_flag and ref_mtz.lower().endswith('.mtz'):
+        ref_pdb, ref_mtz = run_refinement(
+            ref_pdb, ref_mtz,
+            outdir=os.path.join(scan_dir, 'refine_ref'),
+            n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
 
     # ── altindex / origin resolution ──────────────────────────────────────────
     # Discrete (rotation × symop × origin) enumeration ranked by post-transform
     # CA RMSD.  On a non-trivial hit, mov PDB+MTZ are rewritten and re-refined
     # (or phase-shifted, for origin-only) so the rest of the scan sees an
     # already-aligned mov.
+    #
+    # Run on raw mov (NOT pre-refmac'd): refmac on raw mov against its own
+    # data shifts the model by ~0.5 Å, which can move it out of the basin of
+    # attraction of the best discrete altindex op (porin 3poq→3pou: best op
+    # gives 2.11 Å on raw mov, 38.8 Å on refined mov — refmac shift crosses
+    # a fractional boundary and the wrap-to-nearest-image hops to a wrong
+    # equivalent).  resolve_altindex's altindex_refine action re-refines
+    # internally on the reindexed MTZ, so mov gets a refinement pass in the
+    # correct frame anyway.
     if mov_mtz.lower().endswith('.mtz'):
         _res = resolve_altindex(mov_pdb, ref_pdb, mov_mtz,
                                  outdir=os.path.join(scan_dir, 'altindex_resolve'),
@@ -2975,6 +3152,15 @@ def fitreso_scan(
                                  fill_fcalc=fill_fcalc)
         mov_pdb = _res['mov_pdb_out']
         mov_mtz = _res['mov_mtz_out']
+
+    # When altindex_resolve returned action='none' (already aligned, no
+    # altindex needed), we still need refmac on mov to generate FWT/PHWT.
+    if (run_refinement_flag and mov_mtz.lower().endswith('.mtz')
+            and 'FWT' not in {c.label for c in gemmi.read_mtz_file(mov_mtz).columns}):
+        mov_pdb, mov_mtz = run_refinement(
+            mov_pdb, mov_mtz,
+            outdir=os.path.join(scan_dir, 'refine_mov'),
+            n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
 
     # ── load maps ─────────────────────────────────────────────────────────────
     # For CCP4 ASU map inputs, expand mov to the full unit cell so interpolation
@@ -3894,7 +4080,8 @@ def _enum_alt_rot_origin_candidates(cell, sg, sg_name):
     set of valid altindex candidates (including 6-folds along c for
     Sohncke trig/hex groups, axis permutations for orthorhombic, etc.),
     not just a hand-coded subset."""
-    alt_rots = [np.eye(3)] + list(_get_altindex_ops(sg_name, cell=cell))
+    alt_ops = [(np.eye(3), np.zeros(3))] + list(_get_altindex_ops(sg_name,
+                                                                    cell=cell))
     sym_ops = list(sg.operations())
     key = _sg_origins_key(sg_name)
     entries = _ORIGINS_TABLE.get(key)
@@ -3908,12 +4095,12 @@ def _enum_alt_rot_origin_candidates(cell, sg, sg_name):
         origins = _expand_origin_entries(entries, n_polar=12)
     origins = np.array(origins, dtype=float)
 
-    for alt_R in alt_rots:
+    for alt_R, alt_t in alt_ops:
         for op in sym_ops:
             sym_R = np.array(op.rot, dtype=float) / op.DEN
             sym_t = np.array(op.tran, dtype=float) / op.DEN
             R_comb = sym_R @ alt_R
-            t_base = sym_t   # alt_t = 0 for our candidates
+            t_base = sym_R @ alt_t + sym_t   # carry altindex t through sym
             for o in origins:
                 yield R_comb, (t_base + o)
 
