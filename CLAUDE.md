@@ -211,22 +211,49 @@ the fit.  gemmi has no name for reverse-hex H 3 2
 moving MTZ then testing it against obverse H 3 2 reports 30%
 completeness (exactly ⅓ — 2-of-3 centering reflections look absent).
 
-**Planned fix — altalign emits two solutions.**  Neither is strictly
-better; which is preferred depends on the downstream workflow (notably
-whether the reference is allowed to change setting too):
+**Dual-solution writer (implemented).**  When the chosen op is a
+non-normalizer in an R-lattice SG (`sg.ext == 'H'`), altalign writes
+*two* output pairs of `<stem>_{H32,R32R}.{pdb,mtz}`.  Neither is
+strictly better; which is preferred depends on the downstream workflow:
 
-- **H 3 2 + SYMM**: keep hexagonal axes; write the moving PDB/MTZ with
-  the *conjugate* (reverse) symmetry operators in the explicit SYMM
-  records.  Reference stays untouched standard H 3 2.  Depends on
-  refmac honoring explicit SYMM over the SG name.
+- **H 3 2 + SYMM**: hexagonal axes preserved; atoms and data reindexed
+  by (R, t).  Reference workflow is unchanged.  gemmi cannot name
+  reverse-hex H32 (`find_spacegroup_by_ops` → `None`), so the SYMM
+  records gemmi writes for the MTZ stay obverse — the data is in the
+  conjugate (reverse) setting under obverse labelling.  For refmac on
+  this output, swap SYMM records with CCP4 `mtzutils` first.
 - **R 3 2 :R**: convert the aligned moving crystal to the rhombohedral
-  primitive setting — primitive, no centering, no obverse/reverse
-  ambiguity, and both gemmi and refmac support it natively.  Cleanest
-  crystallographically, but the moving crystal is then in a different
-  setting from the (hexagonal) reference.
+  primitive setting via gemmi's `R 3 2:R` basisop (linear part
+  `(-y+z, x+z, -x+y+z)`) composed with the obverse↔reverse fractional
+  flip `diag(-1,-1,1)` (so the reverse-hex labels from the reindex
+  collapse correctly to integer rhomb HKLs).  Primitive, no centering,
+  no obverse/reverse ambiguity; gemmi+refmac native.  Cleanest;
+  reference must also be converted to R 3 2 :R for downstream
+  comparison (or bendfinder taught to bridge settings) since the rhomb
+  cell's gemmi-canonical cartesian frame differs from the hex frame.
+  Important: when writing the R32 MTZ, the *per-dataset* cells must
+  also be updated (not just `mtz.cell`) — CCP4 reads the dataset cell,
+  not the file-level cell, and a mismatch triggers a refmac "Large
+  differences between cells from pdb and mtz" abort even though
+  `mtz.cell` and `pdb.cell` agree.
 
-Both are valid descriptions of the same aligned moving crystal; the
-dual-solution writer in `altalign.py` is the next implementation step.
+Porin R32:R pair (May 2026): refmac rigid completes at R=0.37
+Rfree=0.24, completeness 89.9% (same as original obverse-hex data,
+since the reflection set is identical, just relabelled).  The H32
+solution still needs the CCP4 SYMM swap for refmac.
+
+**Generality (beyond R32).**  The obverse↔reverse centering flip is
+unique to R-lattice groups (R3, R-3, R32, R3m, R3c, R-3m, R-3c) in
+hexagonal H setting.  The general phenomenon — aligning op is
+metric-preserving but NOT in the SG's normalizer, so the reindexed
+moving crystal lands in a conjugate setting — is broader: it also
+occurs with centered groups (C/I/F/A) where a non-normalizer can flip
+the centering type, and with pseudo-symmetric cases (the SG point group
+< the lattice holohedry).  A pure-P1 crystal cannot hit this even with
+a pseudo-rhombohedral cell because conjugating the trivial group gives
+the trivial group.  The dual writer's `_normalizes_sg` detection and
+the explicit conjugate-group handling are general; the R 3 2 :R
+fallback is R-specific (only kicks in when `sg.ext == 'H'`).
 
 ## Cubic b-spline boundary fix (interpolate_map)
 
@@ -419,7 +446,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.048 Å | 24.1% | 18.1% | bent |
 | Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | 49.8% | 53.8% | ref |
 | Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 79.8% | ref (fill_fcalc=True) |
-| Porin 3poq→3pou | H 3 2 | 340 | — | — | — | obverse/reverse pair — altalign aligns PDB to 2.1 Å; MTZ pending dual-solution writer |
+| Porin 3poq→3pou | H 3 2 | 340 | — | — | — | obverse/reverse pair — altalign emits H32+SYMM and R32:R; R32:R refmac-runnable (R=0.37) |
 
 All "from-raw" runs in `<system>/scan_fitreso_fc/` (May 2026,
 fill_fcalc=True propagated through refmac and altindex re-refinement).

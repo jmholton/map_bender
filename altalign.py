@@ -161,32 +161,215 @@ def report(res, top_n=15):
               f"{c['rmsd_comfit']:>8.2f}  {rflat:<22s}  {tstr}")
 
 
+def _normalizes_sg(R_int, sg):
+    """Does R conjugate every SG symop back into the SG (R·g·R⁻¹ ∈ SG)?
+    Non-normalizers land the reindexed crystal in a conjugate setting (e.g.
+    obverse→reverse for rhombohedral H groups), which is the obverse/reverse
+    problem the dual writer exists to handle.
+    """
+    Ri = np.round(np.linalg.inv(R_int.astype(float))).astype(int)
+    sg_ops = []
+    sg_set = set()
+    for op in sg.operations():
+        Rg = np.round(np.array(op.rot, dtype=float) / op.DEN).astype(int)
+        tg = np.array(op.tran, dtype=float) / op.DEN
+        sg_ops.append((Rg, tg))
+        sg_set.add((tuple(Rg.flatten()), tuple(np.round(tg % 1.0, 4))))
+    for Rg, tg in sg_ops:
+        Rc = R_int @ Rg @ Ri
+        tc = R_int @ tg
+        key = (tuple(np.round(Rc).astype(int).flatten()),
+               tuple(np.round(tc % 1.0, 4)))
+        if key not in sg_set:
+            return False
+    return True
+
+
+def _hex_to_R32R_setup(cell_hex):
+    """Return (cell_rh, M_obv, sgR) — obverse-hex → R 3 2 :R basis change.
+
+    M_obv is the linear part of gemmi's basisop for R 3 2 :R; it transforms
+    fractional coords from obverse-hex into rhombohedral primitive.  No
+    translation (basisop has tran=0).  The rhombohedral cell params come
+    from the standard formula on hex (a,c).
+    """
+    a = cell_hex.a
+    c = cell_hex.c
+    a_rh = float(np.sqrt(3 * a * a + c * c) / 3.0)
+    cos_al = (2 * c * c - 3 * a * a) / (2 * (c * c + 3 * a * a))
+    al = float(np.degrees(np.arccos(cos_al)))
+    cell_rh = gemmi.UnitCell(a_rh, a_rh, a_rh, al, al, al)
+    sgR = gemmi.find_spacegroup_by_name("R 3 2:R")
+    M_obv = np.array(sgR.basisop.rot, dtype=float) / sgR.basisop.DEN
+    return cell_rh, M_obv, sgR
+
+
+def _is_rhombohedral_in_hex(sg):
+    """True for the R-lattice groups expressed in hexagonal axes (ext='H').
+    These are the only SGs where the obverse/reverse problem can arise, and
+    where R 3 2 :R-style rhombohedral primitive setting is meaningful.
+    """
+    return getattr(sg, 'ext', '') == 'H'
+
+
 def apply_and_write(res, choice, out_pdb, mov_mtz=None, out_mtz=None,
                     verbose=True):
-    """Apply `choice` (a candidate dict) to the moving PDB (and MTZ).
+    """Apply `choice` to the moving PDB (and MTZ).
 
-    The PDB gets R_cart + the exact discrete crystallographic translation
-    so it stays consistent with the altindexed MTZ; refmac can then be run
-    on the pair as usual.
+    For rhombohedral-in-hexagonal SGs (R3, R-3, R32, R3m, R3c, R-3m, R-3c
+    in ext='H' setting) where the chosen op does NOT normalize the SG —
+    i.e. it lands the moving crystal in the conjugate (reverse) setting —
+    `out_pdb` is treated as a stem and TWO solutions are written:
+
+      <stem>_H32.{pdb,mtz} — hexagonal axes preserved; atoms+data
+        reindexed by (R, t).  gemmi cannot name reverse-H so the SYMM
+        records gemmi writes for the MTZ stay obverse; the data is in the
+        conjugate setting.  Caveat printed; downstream refmac needs the
+        SYMM records swapped (e.g. via CCP4 mtzutils) for correct
+        symmetry handling.  Reference workflow unchanged.
+
+      <stem>_R32R.{pdb,mtz} — rhombohedral primitive R 3 2 :R via gemmi's
+        basisop.  Setting-unambiguous, no centering, refmac-ready.
+        Reference must also be converted to R 3 2 :R for downstream
+        comparison (or bendfinder taught to bridge the settings).
+
+    For all other cases (normalizing ops, non-rhombohedral SGs), a single
+    `out_pdb` (+ `out_mtz`) is written as before.
     """
-    O = res['O']
-    R_cart = choice['R_cart']
-    # t_apply already folds in the whole-lattice image shift; an integer
-    # part is invisible to the MTZ phases, so the same t goes to both.
+    sg = gemmi.find_spacegroup_by_name(res['sg_name'])
+    is_rhomb_hex = _is_rhombohedral_in_hex(sg)
+    is_norm = _normalizes_sg(choice['R_int'], sg)
+    emit_dual = is_rhomb_hex and not is_norm
+
+    O = res['O']; Finv = res['Finv']
+    R_int = choice['R_int']
     t_apply = choice['t_apply']
-    bf._apply_cart_transform_to_pdb(res['mov_pdb'], R_cart, O @ t_apply,
-                                    out_pdb, ref_cell=res['cell'])
+    R_cart = choice['R_cart']
+
     if verbose:
-        print(f"\n  wrote {out_pdb}")
-        print(f"    R_int = {choice['R_int'].flatten().tolist()}")
+        print(f"\n  chosen op:")
+        print(f"    R_int = {R_int.flatten().tolist()}")
         print(f"    t     = {[round(float(x),4) for x in t_apply]}")
         print(f"    residual (honest discrete CA RMSD) = "
               f"{choice['rmsd_discrete']:.2f} A")
+        print(f"    normalizes SG = {is_norm}    rhomb-in-hex SG = {is_rhomb_hex}")
+        print(f"    emitting {'dual (H32+SYMM and R32:R)' if emit_dual else 'single (op is clean)'}")
 
-    if mov_mtz is not None and out_mtz is not None:
-        bf._apply_op_to_mtz(mov_mtz, choice['R_int'], t_apply, out_mtz)
+    if not emit_dual:
+        bf._apply_cart_transform_to_pdb(res['mov_pdb'], R_cart, O @ t_apply,
+                                        out_pdb, ref_cell=res['cell'])
         if verbose:
-            print(f"  wrote {out_mtz}  (SF theorem: F'(h)=F(Rᵀh)·e^{{2πi h·t}})")
+            print(f"  wrote {out_pdb}")
+        if mov_mtz is not None and out_mtz is not None:
+            bf._apply_op_to_mtz(mov_mtz, R_int, t_apply, out_mtz)
+            if verbose:
+                print(f"  wrote {out_mtz}")
+        return
+
+    # ── dual emission ────────────────────────────────────────────────────
+    stem, ext = os.path.splitext(out_pdb)
+    H32_pdb  = f"{stem}_H32{ext}"
+    R32R_pdb = f"{stem}_R32R{ext}"
+    H32_mtz = R32R_mtz = None
+    if out_mtz is not None:
+        mstem, mext = os.path.splitext(out_mtz)
+        H32_mtz  = f"{mstem}_H32{mext}"
+        R32R_mtz = f"{mstem}_R32R{mext}"
+
+    # Solution A — H 3 2 + SYMM (reverse SYMM is *not* what gemmi writes).
+    # Same operation as the single-output case: cartesian reindex of the PDB,
+    # SF-theorem reindex of the MTZ.  Cell and SG label stay H 3 2.
+    bf._apply_cart_transform_to_pdb(res['mov_pdb'], R_cart, O @ t_apply,
+                                    H32_pdb, ref_cell=res['cell'])
+    if mov_mtz is not None and H32_mtz is not None:
+        bf._apply_op_to_mtz(mov_mtz, R_int, t_apply, H32_mtz)
+
+    # Solution B — R 3 2 :R rhombohedral primitive.
+    # Composite fractional op original-hex → aligned R 3 2 :R:
+    #   f_rh = M_rev @ (R @ f_hex + t_apply)
+    # where M_rev = M_obv @ diag(-1,-1,1) is the reverse-hex → rhomb basis
+    # change.  The diag(-1,-1,1) factor accounts for the obverse↔reverse
+    # axis flip that the non-normalizing reindex introduces — M_obv alone
+    # would mis-route reverse-setting fractional/HKLs.
+    cell_hex = res['cell']
+    cell_rh, M_obv, sgR = _hex_to_R32R_setup(cell_hex)
+    M_rev = M_obv @ np.diag([-1.0, -1.0, 1.0])
+    M_total = M_rev @ R_int.astype(float)
+    t_total = M_rev @ np.asarray(t_apply, dtype=float)
+
+    st = gemmi.read_structure(res['mov_pdb'])
+    out = st.clone()
+    out.cell = cell_rh
+    out.spacegroup_hm = "R 3 2:R"
+    for model in out:
+        for chain in model:
+            for residue in chain:
+                for atom in residue:
+                    fpos = cell_hex.fractionalize(atom.pos)
+                    f_hex = np.array([fpos.x, fpos.y, fpos.z])
+                    f_rh = M_total @ f_hex + t_total
+                    p = cell_rh.orthogonalize(gemmi.Fractional(*f_rh))
+                    atom.pos = gemmi.Position(p.x, p.y, p.z)
+    out.setup_entities()
+    out.write_pdb(R32R_pdb)
+
+    if mov_mtz is not None and R32R_mtz is not None:
+        # HKL transform: h_rh = h_hex @ M_total^-1  (row-vector convention).
+        # |det M_total| = 3 so 2/3 of input rows give non-integer h_rh —
+        # these are exactly the H-centering systematic absences in the
+        # original obverse-hex labeling (which become non-absent in the
+        # reverse-hex labeling that the reindex produces — but in the
+        # rhomb primitive description they collapse correctly).
+        mtz_in = gemmi.read_mtz_file(mov_mtz)
+        data = np.array(mtz_in.array, copy=True)
+        H_hex = data[:, :3].astype(int)
+        M_total_inv = np.linalg.inv(M_total)
+        H_rh_f = H_hex.astype(float) @ M_total_inv
+        H_rh = np.round(H_rh_f)
+        is_int = np.all(np.abs(H_rh_f - H_rh) < 1e-3, axis=1)
+        # Phase shift from the reindex step alone (R32:R basisop has no
+        # translation).  The phase shift is 360° · h_revhex · t_apply, where
+        # h_revhex = h_hex @ R_int^-1 (the HKL after just the reindex).
+        R_inv = np.round(np.linalg.inv(R_int.astype(float))).astype(int)
+        H_revhex = H_hex @ R_inv
+        delta_phi_all = (360.0 * (H_revhex.astype(np.float64)
+                                  @ np.asarray(t_apply, dtype=np.float64))
+                         ).astype(np.float32)
+
+        data_out = data[is_int].copy()
+        data_out[:, :3] = H_rh[is_int].astype(np.float32)
+        # Apply phase shifts to all PHI columns
+        cols = list(mtz_in.columns)
+        for i, c in enumerate(cols):
+            if c.type == 'P':
+                data_out[:, i] = (data_out[:, i] + delta_phi_all[is_int]) % 360.0
+
+        mtz_in.cell = cell_rh
+        mtz_in.spacegroup = sgR
+        # CCP4 reads cells from the per-dataset records, not the file-level
+        # cell; failing to update them gives refmac "Large differences
+        # between cells from pdb and mtz" even when the file-level cell is
+        # right.  Same for the file-level / per-dataset wavelength.
+        for ds in mtz_in.datasets:
+            ds.cell = cell_rh
+        mtz_in.set_data(data_out)
+        mtz_in.write_to_file(R32R_mtz)
+
+    if verbose:
+        print(f"\n  wrote H 3 2 (hex axes) solution:")
+        print(f"    PDB: {H32_pdb}")
+        if H32_mtz:
+            print(f"    MTZ: {H32_mtz}")
+            print(f"    NOTE: data is in the conjugate (reverse-H) setting; gemmi cannot")
+            print(f"          label that, so the MTZ's SYMM records remain obverse.  For")
+            print(f"          refmac on this output, swap SYMM with CCP4 mtzutils first.")
+        print(f"  wrote R 3 2 :R (rhomb primitive) solution:")
+        print(f"    PDB: {R32R_pdb}")
+        if R32R_mtz:
+            print(f"    MTZ: {R32R_mtz}")
+            print(f"    Setting-unambiguous, refmac-ready.  Reference (3pou) must also be")
+            print(f"          converted to R 3 2 :R for direct comparison, since the rhomb")
+            print(f"          cell's gemmi-canonical cartesian frame differs from the hex frame.")
 
 
 def main():
