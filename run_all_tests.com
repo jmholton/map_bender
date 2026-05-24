@@ -135,12 +135,20 @@ foreach spec ( \
         continue
     endif
     set fr5 = `grep '^    fr5' $sys/$scan/scan_fitreso.log | head -1`
+    set bst = `grep '^   best' $sys/$scan/scan_fitreso.log | head -1`
+    set dopt = `grep '# best row:' $sys/$scan/scan_fitreso.log | head -1 | sed 's/.*d_opt = //' | awk '{print $1}'`
     if ("$fr5" != "") then
         set rmsd  = `echo "$fr5" | awk '{print $2}'`
         set rbent = `echo "$fr5" | awk '{print $4}'`
-        echo "    PASS  fr5  RMSD=$rmsd  Rbent=$rbent"
+        set best_str = ""
+        if ("$bst" != "") then
+            set b_rmsd  = `echo "$bst" | awk '{print $2}'`
+            set b_rbent = `echo "$bst" | awk '{print $4}'`
+            set best_str = "  best  RMSD=$b_rmsd  Rbent=$b_rbent  d_opt=${dopt}A"
+        endif
+        echo "    PASS  fr5  RMSD=$rmsd  Rbent=$rbent$best_str"
         @ npass++
-        printf "%-30s %-7s fr5  RMSD=%s  Rbent=%s\n" "$label" PASS "$rmsd" "$rbent" >> $summary
+        printf "%-30s %-7s fr5  RMSD=%s  Rbent=%s%s\n" "$label" PASS "$rmsd" "$rbent" "$best_str" >> $summary
     else
         echo "    FAIL  no fr5 row in scan_fitreso.log (see $sys/$scan/scan_fitreso.log)"
         @ nfail++

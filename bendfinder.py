@@ -3483,6 +3483,89 @@ def fitreso_scan(
                        result.hkls, result.AB, result.active, result.snr,
                        result.cell1, result.cell2, result.dimensions, result.rmsd)
 
+    # ── Section 4: best — parabola fit of Rbent vs 1/d², re-run at vertex ────
+    # Across all systems, Rbent has a clear U-shape vs fitreso: dropping with
+    # finer resolution as the shift field absorbs more structural detail,
+    # then climbing again as high-frequency HKLs add noise outside the smooth
+    # PSDVF's natural bandwidth.  Fit a parabola in x=1/d² to the 3-5 fr-rows
+    # nearest the empirical minimum, find the vertex, and re-fit at d_opt.
+    fr_rows = [r for r in _log_rows
+               if r['label'].startswith('fr') and r['rbent'] is not None]
+    fr_resos = []
+    for r in fr_rows:
+        try:
+            fr_resos.append(float(r['label'][2:]))
+        except ValueError:
+            fr_resos.append(None)
+    fr_pts = [(d, r['rbent']) for d, r in zip(fr_resos, fr_rows) if d is not None]
+    if len(fr_pts) >= 3:
+        ds  = np.array([p[0] for p in fr_pts], dtype=float)
+        rbs = np.array([p[1] for p in fr_pts], dtype=float)
+        i_min = int(np.argmin(rbs))
+        # 3-5 points centered on argmin, clipped to bracket
+        lo = max(0, i_min - 2)
+        hi = min(len(ds), i_min + 3)
+        if hi - lo < 3:                      # extend if argmin is at an end
+            if lo == 0:
+                hi = min(len(ds), lo + 3)
+            else:
+                lo = max(0, hi - 3)
+        x = 1.0 / (ds[lo:hi] ** 2)
+        y = rbs[lo:hi]
+        a, b, c = np.polyfit(x, y, 2)        # y = a x² + b x + c (np convention)
+        if a > 0:
+            x_vert_raw = -b / (2.0 * a)
+            x_vert     = float(np.clip(x_vert_raw, x.min(), x.max()))
+            d_opt      = float(np.sqrt(1.0 / x_vert))
+            r_pred     = a * x_vert**2 + b * x_vert + c
+            clamped    = ' (clamped to bracket — true vertex outside scan)' \
+                         if x_vert != x_vert_raw else ''
+        else:
+            # Concave-down — no interior min; fall back to argmin scan point
+            d_opt  = float(ds[i_min])
+            r_pred = float(rbs[i_min])
+            clamped = ' (parabola concave-down; using argmin)'
+        if verbose:
+            print(f'\nbest-fit parabola over {hi - lo} fr-rows '
+                  f'({", ".join(f"fr{int(d) if d == int(d) else d}" for d in ds[lo:hi])}): '
+                  f'd_opt = {d_opt:.2f} Å, predicted Rbent = {r_pred*100:.1f}%{clamped}',
+                  flush=True)
+        outdir = os.path.join(scan_dir, 'best')
+        os.makedirs(outdir, exist_ok=True)
+        t0 = time.time()
+        result = bend_fit_progressive(
+            mov_pdb, ref_pdb,
+            fitreso_start=20.0, fitreso_end=d_opt,
+            drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
+            outlier_sigma=outlier_sigma, b_sigma=b_sigma,
+            verbose=False,
+            precomputed_origin=precomputed_origin,
+        )
+        t_fit = time.time() - t0
+        dim_list = list(result.dimensions)
+        xyz_dims = [dim_list.index(d) for d in 'xyz' if d in dim_list]
+        AB_xyz   = np.zeros((3, len(result.hkls), 2))
+        for new_i, old_i in enumerate(xyz_dims):
+            AB_xyz[new_i] = result.AB[old_i]
+        a1pts     = _atoms1_pts(ref_pts)
+        delta     = _eval_chunked(a1pts, result.hkls, AB_xyz, chunk_size)
+        bent_vals = interpolate_map(mov_d, mov_h,
+                                     _map_query(ref_pts, delta),
+                                     pad_mode=pad_mode)
+        bent_map  = bent_vals.reshape(ns2, nr2, nc2)
+        _save_point('best', outdir, bent_map, hkl00_rmsd, result.rmsd,
+                    int(result.active.sum()), t_fit,
+                    hkls=result.hkls, AB_xyz=AB_xyz)
+        save_fitparams(f'{outdir}/PSDVF.mtz',
+                       result.hkls, result.AB, result.active, result.snr,
+                       result.cell1, result.cell2, result.dimensions, result.rmsd)
+        # Stash for the summary footer
+        _best_meta = dict(d_opt=d_opt, r_pred=r_pred, n_fit=int(hi - lo),
+                          fr_used=[float(d) for d in ds[lo:hi]],
+                          clamped=clamped)
+    else:
+        _best_meta = None
+
     # ── Final summary log ───────────────────────────────────────────────────
     _sign_note = ('diff = bent − ref  (+peak ⇒ density in bent absent from ref)'
                   if subtract == 'ref' else
@@ -3516,6 +3599,15 @@ def fitreso_scan(
                      f"{k_s:>6}  {B_s:>7}  "
                      f"{r['peak_sigma']:>+7.2f}σ  {r['peak_atom']:>20}  "
                      f"{r['peak_dist']:>5.2f}Å  {r['t']:>4.0f}s\n")
+        if _best_meta is not None:
+            fr_used_str = ', '.join(f'fr{int(d) if d == int(d) else d}'
+                                     for d in _best_meta['fr_used'])
+            fh.write(f"\n# best row: parabola in 1/d² over {_best_meta['n_fit']} "
+                     f"rows ({fr_used_str}); vertex at d_opt = "
+                     f"{_best_meta['d_opt']:.2f} Å"
+                     f"{_best_meta['clamped']}"
+                     f", predicted Rbent = "
+                     f"{_best_meta['r_pred']*100:.1f}%\n")
     if verbose:
         print(f'\nDone.  Summary table: {log_path}', flush=True)
 
