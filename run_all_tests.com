@@ -24,6 +24,21 @@
 
 if (! $?CCP4) source /programs/ccp4-9/bin/ccp4.setup-csh
 
+# CWD sanity check — this script needs the working area (parent of
+# map_bender/), which has bendfinder.py + lyso/ + dhfr/ + ... .  If
+# invoked from inside map_bender/ (the git subdir), cd up; otherwise
+# fail loudly so we don't fake PASS off "no such file" grep output.
+if (! -e bendfinder.py || ! -e test_symm_all_sgs.py || ! -d lyso) then
+    if (-e ../bendfinder.py && -e ../test_symm_all_sgs.py && -d ../lyso) then
+        echo "(cd .. — running from working area, not map_bender/)"
+        cd ..
+    else
+        echo "ERROR: run from the working area (must contain bendfinder.py, test_symm_all_sgs.py, lyso/, dhfr/, ...)."
+        echo "       CWD=`pwd`"
+        exit 2
+    endif
+endif
+
 set ts     = `date +%Y%m%d_%H%M%S`
 set logdir = test_results_$ts
 mkdir -p $logdir
@@ -50,23 +65,29 @@ else
     printf "%-30s %-7s %s\n" "test_symm_all_sgs" FAIL "no_65/65_line" >> $summary
 endif
 
-# ── 2. magdoff Test 2 ────────────────────────────────────────────────────
+# ── 2. magdoff Tests 1 & 2 ──────────────────────────────────────────────
+# Two tests run; each prints "Constrained RMSD(CA) after fit: 0.0XXX Å ...".
+# Report Test 2 (rigid-body rotation) only — it's the canonical entry in
+# CLAUDE.md and the harder of the two.  tail -1 selects Test 2's lines.
 echo ""
 echo "==> [ 2/10] magdoff/test_magdoff.py"
-( cd magdoff && srun --job-name=magdoff ccp4-python test_magdoff.py ) >& $logdir/02_magdoff.log
-# The RMSD line is "Constrained   RMSD(CA) after fit: 0.0276 Å (91.8% ...";
-# awk position 5 is the number.  Grep specifically for "after fit:" to avoid
-# matching the later "Constrained (symm) : Riso=..." line.
-set rcon = `grep "RMSD(CA) after fit:" $logdir/02_magdoff.log | grep "Constrained" | awk '{print $5}'`
-set runc = `grep "RMSD(CA) after fit:" $logdir/02_magdoff.log | grep "Unconstrained" | awk '{print $5}'`
-if ("$rcon" != "" && "$runc" != "") then
-    echo "    PASS  constrained=$rcon  unconstrained=$runc"
-    @ npass++
-    printf "%-30s %-7s constrained=%s  unconstrained=%s\n" "magdoff" PASS "$rcon" "$runc" >> $summary
-else
-    echo "    FAIL  could not parse RMSDs from log"
+if (! -e magdoff/test_magdoff.py) then
+    echo "    FAIL  magdoff/test_magdoff.py missing"
     @ nfail++
-    printf "%-30s %-7s parse_error\n" "magdoff" FAIL >> $summary
+    printf "%-30s %-7s no_script\n" "magdoff" FAIL >> $summary
+else
+    ( cd magdoff && srun --job-name=magdoff ccp4-python test_magdoff.py ) >& $logdir/02_magdoff.log
+    set rcon = `grep "RMSD(CA) after fit:" $logdir/02_magdoff.log | grep "Constrained" | tail -1 | awk '{print $5}'`
+    set runc = `grep "RMSD(CA) after fit:" $logdir/02_magdoff.log | grep "Unconstrained" | tail -1 | awk '{print $5}'`
+    if ("$rcon" != "" && "$runc" != "") then
+        echo "    PASS  Test 2  constrained=$rcon  unconstrained=$runc"
+        @ npass++
+        printf "%-30s %-7s Test2  constrained=%s  unconstrained=%s\n" "magdoff" PASS "$rcon" "$runc" >> $summary
+    else
+        echo "    FAIL  could not parse RMSDs from log"
+        @ nfail++
+        printf "%-30s %-7s parse_error\n" "magdoff" FAIL >> $summary
+    endif
 endif
 
 # Reusable: run one fitreso_scan example.  Args via env vars (tcsh has no
@@ -76,14 +97,17 @@ endif
 # tag goes in the scan_dir name (so raddam variants don't collide).
 
 set i = 2
+# All canonical reference runs (scan_fitreso_fc/) use fill_fcalc=True because
+# the deposited reference MTZs sit below the 99% SG-ASU completeness gate
+# (lyso 3aw7 is 90.2%, etc.).  Match that here.
 foreach spec ( \
-    "lyso        lyso        3aw6.pdb 3aw7.pdb 3aw6.mtz 3aw7.mtz ref  False ''" \
-    "dhfr        dhfr        1rx2.pdb 1rx1.pdb 1rx2.mtz 1rx1.mtz ref  False ''" \
-    "raddam_5kxl raddam      5kxk.pdb 5kxl.pdb 5kxk.mtz 5kxl.mtz bent False _5kxl" \
-    "raddam_5kxm raddam      5kxk.pdb 5kxm.pdb 5kxk.mtz 5kxm.mtz bent False _5kxm" \
-    "raddam_5kxn raddam      5kxk.pdb 5kxn.pdb 5kxk.mtz 5kxn.mtz bent False _5kxn" \
-    "myoglobin   myoglobin   1mbo.pdb 1a6m.pdb 1mbo.mtz 1a6m.mtz ref  False ''" \
-    "insulin     insulin     4fg3.pdb 4e7u.pdb 4fg3.mtz 4e7u.mtz ref  True  ''" \
+    "lyso        lyso        3aw6.pdb 3aw7.pdb 3aw6.mtz 3aw7.mtz ref  True ''" \
+    "dhfr        dhfr        1rx2.pdb 1rx1.pdb 1rx2.mtz 1rx1.mtz ref  True ''" \
+    "raddam_5kxl raddam      5kxk.pdb 5kxl.pdb 5kxk.mtz 5kxl.mtz bent True _5kxl" \
+    "raddam_5kxm raddam      5kxk.pdb 5kxm.pdb 5kxk.mtz 5kxm.mtz bent True _5kxm" \
+    "raddam_5kxn raddam      5kxk.pdb 5kxn.pdb 5kxk.mtz 5kxn.mtz bent True _5kxn" \
+    "myoglobin   myoglobin   1mbo.pdb 1a6m.pdb 1mbo.mtz 1a6m.mtz ref  True ''" \
+    "insulin     insulin     4fg3.pdb 4e7u.pdb 4fg3.mtz 4e7u.mtz ref  True ''" \
 )
     set parts = ( $spec )
     set label = $parts[1]
@@ -104,7 +128,13 @@ foreach spec ( \
     echo "==> [`printf '%2d' $i`/10] $label  ($sys $movp -> $refp, fill_fcalc=$fill, subtract=$sub)"
     ( cd $sys && rm -rf $scan && srun --job-name=$label ccp4-python -c "import sys; sys.path.insert(0,'..'); from bendfinder import fitreso_scan; fitreso_scan(mov_pdb='$movp', ref_pdb='$refp', mov_mtz='$movm', ref_mtz='$refm', scan_dir='$scan', run_refinement_flag=True, refine_cycles=5, fill_fcalc=$fill, subtract='$sub')" ) >& $log
 
-    set fr5 = `grep '^    fr5' $sys/$scan/scan_fitreso.log |& head -1`
+    if (! -e $sys/$scan/scan_fitreso.log) then
+        echo "    FAIL  $sys/$scan/scan_fitreso.log not written (see $log)"
+        @ nfail++
+        printf "%-30s %-7s no_scan_log\n" "$label" FAIL >> $summary
+        continue
+    endif
+    set fr5 = `grep '^    fr5' $sys/$scan/scan_fitreso.log | head -1`
     if ("$fr5" != "") then
         set rmsd  = `echo "$fr5" | awk '{print $2}'`
         set rbent = `echo "$fr5" | awk '{print $4}'`
@@ -112,7 +142,7 @@ foreach spec ( \
         @ npass++
         printf "%-30s %-7s fr5  RMSD=%s  Rbent=%s\n" "$label" PASS "$rmsd" "$rbent" >> $summary
     else
-        echo "    FAIL  no fr5 row in scan_fitreso.log"
+        echo "    FAIL  no fr5 row in scan_fitreso.log (see $sys/$scan/scan_fitreso.log)"
         @ nfail++
         printf "%-30s %-7s no_fr5_row\n" "$label" FAIL >> $summary
     endif
@@ -127,25 +157,29 @@ set plog = $logdir/`printf "%02d" $i`_porin_altalign.log
     srun --job-name=porin_aa ccp4-python ../altalign.py 3poq.pdb 3pou.pdb \
         altalign_test/aa.pdb 3poq.mtz altalign_test/aa.mtz ) >& $plog
 
-set residual = `grep 'honest discrete CA RMSD' $plog | head -1 | awk '{print $7}'`
+set residual = ""
+if (-e $plog) set residual = `grep 'honest discrete CA RMSD' $plog | head -1 | awk '{print $7}'`
 if (-e porin/altalign_test/aa_R32R.pdb && -e porin/altalign_test/aa_R32R.mtz) then
     set rlog = $logdir/`printf "%02d" $i`_porin_refmac.log
     srun --job-name=porin_refmac ccp4-python -c "import sys; sys.path.insert(0,'.'); from bendfinder import run_refinement; run_refinement('porin/altalign_test/aa_R32R.pdb', 'porin/altalign_test/aa_R32R.mtz', outdir='porin/altalign_test/refine', n_cycles=5, fill_fcalc=True)" >& $rlog
 
-    # refmac prints BOTH "Overall weighted R factor" and "Overall weighted R2
-    # factor"; the trailing-space match keeps only the R-not-R2 line.
-    set rf = `grep 'Overall weighted R factor' porin/altalign_test/refine/*refmac.log |& tail -1 | awk '{print $6}'`
+    set rf = ""
+    if (-d porin/altalign_test/refine) then
+        # refmac prints BOTH "Overall weighted R factor" and "Overall weighted R2
+        # factor"; specifying "R factor" excludes the R2 line.
+        set rf = `grep 'Overall weighted R factor' porin/altalign_test/refine/*refmac.log | tail -1 | awk '{print $6}'`
+    endif
     if ("$rf" != "") then
-        echo "    PASS  altalign residual=$residual A   refmac R=$rf"
+        echo "    PASS  altalign residual=${residual} A   refmac R=$rf"
         @ npass++
         printf "%-30s %-7s altalign=%sA  refmac=R%s\n" "porin (altalign+R32:R)" PASS "$residual" "$rf" >> $summary
     else
-        echo "    FAIL  refmac did not produce R-factor"
+        echo "    FAIL  refmac did not produce R-factor (see $rlog)"
         @ nfail++
         printf "%-30s %-7s no_refmac_R\n" "porin (altalign+R32:R)" FAIL >> $summary
     endif
 else
-    echo "    FAIL  altalign did not write R32R outputs"
+    echo "    FAIL  altalign did not write R32R outputs (see $plog)"
     @ nfail++
     printf "%-30s %-7s no_R32R_outputs\n" "porin (altalign+R32:R)" FAIL >> $summary
 endif
