@@ -378,9 +378,10 @@ Plumbed through `fitreso_scan(..., fill_fcalc=False)` → `run_refinement`.
 
 `run_refinement` prefers `refmac5`; if missing it falls back to
 `phenix.refine`.  The phenix call uses
-`refinement.main.number_of_macro_cycles=N` (the literal parameter
-name in current phenix; earlier code passed `refinement.main.cycles=N`
-which silently no-ops and runs only the default cycle count).
+`refinement.main.number_of_macro_cycles=N` — the literal parameter
+name in current phenix.  Earlier code passed `refinement.main.cycles=N`,
+which is not a valid parameter and **causes phenix.refine to crash**
+(unknown-parameter error, not a silent no-op).
 
 Insulin 4fg3→4e7u from raw, fill_fcalc=True:
 - 4fg3: 5,487 → 5,620 (100%)
