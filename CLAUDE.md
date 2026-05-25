@@ -501,7 +501,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.048 Å | 24.1% | 17.8% | 20 Å (clamped) | bent |
 | Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | 49.8% | 49.8% | 5.5 Å | ref |
 | Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 60.5% | 5.8 Å | ref (fill_fcalc=True) |
-| Porin 3poq→3pou | H 3 2 | 340 | — | — | — | — | obverse/reverse pair — altalign emits H32+SYMM and R32:R; R32:R refmac-runnable (R=0.37) |
+| Porin 3poq→3pou | H 3 2 | 340 | 0.366 Å | 57.7% | 57.8% | 9.5 Å | ref (fill_fcalc=True) — in-bendfinder altindex resolution; obverse/reverse pair, altalign also emits H32+SYMM and R32:R (R32:R refmac-runnable, R=0.37) |
 
 The `best` row in each `scan_dir/scan_fitreso.log` is the
 parabola-vertex re-fit (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
@@ -566,3 +566,22 @@ Notes:
   displacement matches a genuine low-frequency shift between the two
   crystal forms; later iterations damp the same mode to ~1 Å as
   higher-order HKLs absorb part of the signal.
+- **Porin** end-to-end from raw inputs (`scan_test/`, May 2026): the
+  in-bendfinder altindex resolution (the basis-change enumeration in
+  [`_get_altindex_ops`](#basis-change-altindex-enumeration-_get_altindex_ops))
+  picks the obverse↔reverse 2-fold and re-refines the moving model.
+  hkl00 baseline is **3.14 Å CA RMSD / Rbent 73.6%** — the unbent
+  model after altindex resolution is still ~3 Å from 3pou because the
+  alignment also lands the crystal in the conjugate (reverse-hex)
+  setting; this is benign for the scan (both moving and reference are
+  on the same hexagonal grid post-resolve).  Active HKL count
+  saturates at **3149 by fr10** (od_margin hit; 340 ASU CAs × 6
+  proper ops = 2040 P1 atoms is the small-cell limit relative to the
+  ~120 Å hex cell), so fr8/7/6/5 are identical re-fits.  fr5
+  RMSD = 0.366 Å, Rbent = 57.7%; best (d_opt = 9.5 Å) Rbent = 57.8%.
+  Largest residual peak **+10.5σ at A/244PHE/CB(m)** (1.73 Å) —
+  side chain displacement beyond what the smooth PSDVF can follow,
+  similar in spirit to insulin's T→R limit.  Total wall time
+  ~72 min, dominated by fr12→fr10 (1.4 ks → 4.3 ks per fr-point) as
+  HKL count grows in the H 3 2 cell — see [Test gamut runner](#test-gamut-runner-run_all_testscom)
+  for tuning options (`batch_hkls`, `drop_snr`) if this matters.

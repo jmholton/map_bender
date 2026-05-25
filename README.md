@@ -68,16 +68,34 @@ All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlie
 
 ### Python version (`bendfinder.py`)
 
-| System | Datasets | Space group | CA pairs | CA RMSD | Riso (fr5) | Time |
-|--------|----------|-------------|----------|---------|-----------|------|
-| Lysozyme (same crystal, ~2.5% humidity-driven cell change) | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.047 Å** | 29.0% | 218 s |
-| DHFR | 1rx1 → 1rx2 | P2₁2₁2₁ | 636 | **0.071 Å** | 41.9% | 287 s |
-| Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.063 Å** | — | 150 s |
-| Lysozyme raddam | 5kxk → 5kxl | P4₃2₁2 | 976 | **0.082 Å** | 20.6% | 112 s |
-| Lysozyme raddam | 5kxk → 5kxm | P4₃2₁2 | 984 | **0.046 Å** | — | — |
-| Lysozyme raddam | 5kxk → 5kxn | P4₃2₁2 | ~992 | — | — | — |
+| System | Datasets | Space group | CA pairs | fr5 RMSD | fr5 Rbent | best Rbent | d_opt |
+|--------|----------|-------------|----------|----------|-----------|------------|-------|
+| Lysozyme (humidity-driven cell change) | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.033 Å** | 33.2% | 30.3% | 9.7 Å |
+| DHFR | 1rx2 → 1rx1 | P2₁2₁2₁ | 592 | **0.070 Å** | 41.5% | 37.7% | 12.6 Å |
+| Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.063 Å** | 49.8% | 49.8% | 5.5 Å |
+| Lysozyme raddam | 5kxk → 5kxl | P4₃2₁2 | 976 | **0.087 Å** | 21.9% | 11.5% | 20 Å (clamped) |
+| Lysozyme raddam | 5kxk → 5kxm | P4₃2₁2 | 984 | **0.047 Å** | 19.2% |  9.9% | 20 Å (clamped) |
+| Lysozyme raddam | 5kxk → 5kxn | P4₃2₁2 | 992 | **0.048 Å** | 24.1% | 17.8% | 20 Å (clamped) |
+| Insulin T→R | 4fg3 → 4e7u | H3 | 801 | **0.510 Å** | 60.3% | 60.5% | 5.8 Å |
+| Porin | 3poq → 3pou | H 3 2 | 340 | **0.366 Å** | 57.7% | 57.8% | 9.5 Å |
 
-Times are for the fr5 fitreso scan run (fitreso_start=20, fitreso_end=5 Å). Raddam times are faster because the Fc maps have smaller structural differences.
+`fr5 RMSD` and `fr5 Rbent` are the values at the finest resolution
+admitted (5 Å); `best Rbent` and `d_opt` come from the parabola-fit
+re-run (see [Best d_opt parabola fit](#best-d_opt-parabola-fit) below).
+Insulin requires `fill_fcalc=True` because both deposited MTZs are
+below 99% SG-ASU complete; porin runs end-to-end with the
+in-bendfinder altindex resolution (the obverse/reverse 2-fold for the
+H 3 2 pair) — see [Obverse/reverse and altalign.py](#obversereverse-and-altalignpy)
+for the dual-solution writer when you need an R 3 2:R MTZ for
+downstream refinement.
+
+The radiation-damage systems gain 8–13 Rbent points from the parabola
+because the damage signal is purely low-frequency — `d_opt` clamps to
+the coarsest scan point (20 Å) where the smooth shift field captures
+the bulk swelling and the high-frequency HKLs only add noise.
+Conversely, insulin's T→R conformational change exceeds the smooth-
+PSDVF model (LEU B6 shifts ~8 Å), so no fitreso choice helps and the
+parabola vertex collapses near fr5.
 
 ### vs prototype (tcsh + gnuplot)
 
@@ -144,7 +162,7 @@ Key functions:
 | `read_ccp4(path)` / `write_ccp4(path, data, header)` | CCP4 map I/O |
 | `read_ccp4_fullcell(path)` | Read CCP4 map and expand to full P1 unit cell via gemmi symmetry |
 | `compute_riso(ref_mtz, ref_col, test_mtz, test_col)` | Wilson isotropic B scaling + Riso; returns (riso, kF, B_iso); pure Python, no CCP4 |
-| `fitreso_scan(mov_pdb, ref_pdb, mov_map, ref_map, scan_dir, ...)` | Run full hkl00..hkl10 + fr20..fr5 scan; write bent maps, diff maps, cootme.mtz per point |
+| `fitreso_scan(mov_pdb, ref_pdb, mov_mtz, ref_mtz, scan_dir, ...)` | Run full hkl00..hkl10 + fr20..fr5 + best scan; write bent maps, diff maps, bent.mtz per point. Accepts MTZ or CCP4-map inputs; `subtract` and `fill_fcalc` arguments control diff sign and missing-HKL filling. |
 
 ## Space-group generality
 
@@ -165,6 +183,7 @@ The shift field must respect the crystallographic symmetry of the space group:
 | File | Description |
 |------|-------------|
 | `bendfinder.py` | Main Python module |
+| `altalign.py` | Standalone LSQ altindex+origin search; dual-solution writer for R-lattice non-normalizing ops (H32+SYMM and R32:R outputs) |
 | `bendfinder.com` | Prototype tcsh script (historical reference) |
 | `origins.com` | Helper: test symmetry origin choices |
 | `examples/3aw6_3aw7/` | Lysozyme canonical example data |
@@ -190,12 +209,30 @@ Three sections:
 
 For each scan point the function writes:
 
-- `cootme.mtz` — `FDM`/`PHIDM` (bent 2Fo-Fc as structure factors) plus `DELFWT`/`PHDELWT` (the difference map). **Load in Coot** via *File → Open MTZ*; `FDM`/`PHIDM` are recognised by default. Display `DELFWT`/`PHDELWT` as a difference map contoured at ±3σ.
-- `diff_norm.map` — z-scored real-space difference map (ref − bent) / σ, positive = more density in reference
+- `bent.mtz` — `FDM`/`PHIDM` (bent 2Fo-Fc as structure factors) plus `DELFWT`/`PHDELWT` (the difference map). **Load in Coot** via *File → Open MTZ*; `FDM`/`PHIDM` are recognised by default. Display `DELFWT`/`PHDELWT` as a difference map contoured at ±3σ.
+- `diff_norm.map` — z-scored real-space difference map. Sign controlled by the `subtract` parameter: `subtract='ref'` (default) → diff = bent − ref, positive peaks = density present in bent but absent in ref; `subtract='bent'` flips it (use for radiation-damage runs where you want positive = features appearing with dose).
 - `bent.map` — bent moving-crystal map resampled on the reference grid (CCP4 format)
 - `bent.pdb`, `ref.pdb`, `unbent.pdb` — coordinates for atom context in the viewer
-- `PSDVF.mtz` (fr\* points only) — fitted shift-field (h,k,l) coefficients
+- `PSDVF.mtz` (fr\* + best points) — fitted shift-field (h,k,l) coefficients. Amplitudes are in Å (= √(A²+B²) × cell_axis) — `load_fitparams` reads the unit tag from the MTZ history and converts back to fractional on load.
 
 Riso is computed by `compute_riso()`: Wilson isotropic B scaling of `F_test` to match `F_ref`, then Riso = Σ|F_ref − F_scaled| / Σ|F_ref|. No CCP4 programs needed. Because both maps include model bias and water molecules, reported Riso values should not be compared directly to crystallographic Riso from experimental data. The dominant peaks at high resolution (fr7 and finer) are typically displaced water molecules.
 
-**Raddam sign convention**: 5kxk (undamaged) is the moving model; 5kxl/5kxm/5kxn (increasing dose) are references. Positive diff peaks = features appearing with radiation dose; negative peaks = features disappearing.
+**Raddam sign convention**: 5kxk (undamaged) is the moving model; 5kxl/5kxm/5kxn (increasing dose) are references. Run with `subtract='bent'` so positive diff peaks = features appearing with radiation dose; negative peaks = features disappearing.
+
+### Best d_opt parabola fit
+
+Across every example system the Rbent-vs-fitreso curve is a clear U: it drops as the smooth PSDVF absorbs structural detail with finer resolution, then climbs again at the highest resolutions where the high-frequency HKLs add noise outside the shift field's natural bandwidth. `fitreso_scan` exploits this by fitting a parabola in **x = 1/d²** (the natural axis for R-factor-vs-resolution behaviour) to the 3–5 fr-rows centred on the empirical argmin, locating the vertex `d_opt = sqrt(1 / x_vert)` (clamping if the vertex falls outside the scan bracket), and re-running `bend_fit_progressive(fitreso_end=d_opt)` once more. The result lands in `scan_dir/best/` with the same per-point outputs as a normal fr-row. A footer in `scan_fitreso.log` records which rows were used, `d_opt`, and the parabola-predicted Rbent.
+
+Empirically (May 2026 reference runs) `d_opt` sits in the 8–13 Å band for the bend-friendly systems and collapses to the coarsest scan point for radiation-damage signal (low-frequency only).
+
+### Obverse/reverse and `altalign.py`
+
+For pairs in R-lattice space groups (R3, R32, R3m, etc., in their hexagonal H setting), the aligning altindex operation can be metric-preserving but not a normalizer of the space group — it flips obverse↔reverse centering. `bendfinder.py` handles this transparently for the scan itself (the conjugate setting is benign as long as both moving and reference end up on the same grid), but downstream refmac on the reindexed moving MTZ may need the data in rhombohedral primitive (R 3 2 :R) form.
+
+`altalign.py` is a standalone tool that does the LSQ-based altindex+origin search and, for non-normalizing R-lattice ops, writes *both* output settings: `<stem>_H32.{pdb,mtz}` (hexagonal axes preserved) and `<stem>_R32R.{pdb,mtz}` (rhombohedral primitive, gemmi+refmac native).
+
+```
+ccp4-python altalign.py mov.pdb ref.pdb [out.pdb] [mov.mtz] [out.mtz]
+```
+
+Verified on the porin 3poq→3pou pair: refmac rigid completes at R=0.37 on the R 3 2 :R output.
