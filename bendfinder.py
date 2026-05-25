@@ -3906,7 +3906,7 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
     phenix = _sh2.which('phenix.refine')
     if phenix:
         cmd = [phenix, pdb_path, mtz_path_for_refmac,
-               f'refinement.main.cycles={n_cycles}',
+               f'refinement.main.number_of_macro_cycles={n_cycles}',
                f'output.prefix={os.path.join(outdir, stem)}']
         print(f'  run_refinement: phenix.refine ({n_cycles} cycles)...', flush=True)
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=outdir)

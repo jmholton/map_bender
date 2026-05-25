@@ -376,6 +376,12 @@ chunks in Coot.
 
 Plumbed through `fitreso_scan(..., fill_fcalc=False)` → `run_refinement`.
 
+`run_refinement` prefers `refmac5`; if missing it falls back to
+`phenix.refine`.  The phenix call uses
+`refinement.main.number_of_macro_cycles=N` (the literal parameter
+name in current phenix; earlier code passed `refinement.main.cycles=N`
+which silently no-ops and runs only the default cycle count).
+
 Insulin 4fg3→4e7u from raw, fill_fcalc=True:
 - 4fg3: 5,487 → 5,620 (100%)
 - 4e7u: 23,527 → 25,285 (100%)
@@ -460,6 +466,26 @@ Rotate all atom Cartesian coordinates by 0.5° about a fixed random axis (seed 4
 | Unconstrained (201 HKLs) | 0.026 Å (92.2% recovery) | 4.3% |
 
 Both tests fit 3 progressive iterations (20→7 Å), completing in ~25 s per fit on a single CPU. Constrained and unconstrained give nearly identical recovery for P2₁ (order 2), though constrained reaches 50% more HKLs before hitting the overdetermination limit.
+
+## Test gamut runner (`run_all_tests.com`)
+
+`claude/run_all_tests.com` (tcsh) runs the full 10-test gamut and prints
+a PASS/FAIL table with per-test metrics:
+
+1. `test_symm_all_sgs.py` — 65 Sohncke SGs constraint check
+2. `magdoff/test_magdoff.py` — synthetic 0.5° rigid-body deformation
+3–9. Seven `fitreso_scan` examples (lyso, dhfr, raddam×3, myoglobin,
+   insulin) — all with `fill_fcalc=True` since the deposited reference
+   MTZs are below the 99% SG-ASU completeness gate
+10. Porin altalign + refmac on the R 3 2 :R output
+
+Each example writes to `<sys>/scan_test*/` (separate from the canonical
+`scan_fitreso_fc/` reference runs).  Per-test logs land in
+`test_results_<timestamp>/`.  Script cd's up if invoked from inside
+`map_bender/`; exits 2 if the working area can't be found, exits 1 if
+any test fails.  Latest baseline (2026-05-24): 10/10 PASS.
+
+Run as `./run_all_tests.com` from the working area.
 
 ## Empirical results (fitreso scans)
 
