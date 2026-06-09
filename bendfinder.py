@@ -2671,26 +2671,29 @@ def _mtz_completeness(mtz_path):
     """Return (n_obs, n_expected, fraction) for an MTZ.
 
     n_expected = unique SG-ASU reflections at the input's resolution limit,
-    excluding systematic absences and (0,0,0).  Counts only rows with finite
-    F (column auto-detected: FP / F / FOBS); rows with NaN F are treated as
-    missing observations even when the HKL is present.
+    excluding systematic absences and (0,0,0).  Counts only rows with a
+    finite observation in the input's amplitude or intensity column
+    (F preferred: FP / F / FOBS; falls back to I: IMEAN / I / IOBS).
+    Rows with NaN are treated as missing even when the HKL is present.
+
+    If neither F nor I is present (e.g. a post-refmac map-coef MTZ with
+    only FWT/PHWT), return (0, 0, 1.0) — refmac will reject it anyway,
+    and the completeness gate shouldn't preempt that with a confusing
+    error.
     """
     mtz = gemmi.read_mtz_file(mtz_path)
     data = np.array(mtz.array)
     lbls = mtz.column_labels()
-    F_lbl = next((l for l in ('FP', 'F', 'FOBS') if l in lbls), None)
-    if F_lbl is None:
-        # No Fobs column (already a map-coef MTZ, e.g. post-refmac with just
-        # FWT/PHWT).  Refmac will choke on this anyway; return "complete"
-        # so the completeness gate doesn't preempt that error with a
-        # confusing one.
+    obs_lbl = next((l for l in ('FP', 'F', 'FOBS', 'IMEAN', 'I', 'IOBS')
+                    if l in lbls), None)
+    if obs_lbl is None:
         return 0, 0, 1.0
-    hkls = data[:, :3].astype(int)
-    Fcol = data[:, lbls.index(F_lbl)]
+    hkls    = data[:, :3].astype(int)
+    obs_col = data[:, lbls.index(obs_lbl)]
     proper_ops = get_proper_symops(mtz.spacegroup.xhm())
     R_ints = [np.round(R).astype(int) for R, _ in proper_ops] or [np.eye(3, dtype=int)]
-    in_canon_with_F = {_canonical_hkl(tuple(int(x) for x in h), R_ints)
-                       for h, f in zip(hkls, Fcol) if np.isfinite(f)}
+    in_canon_with_obs = {_canonical_hkl(tuple(int(x) for x in h), R_ints)
+                         for h, v in zip(hkls, obs_col) if np.isfinite(v)}
     cell = mtz.cell
     d_min = float(mtz.resolution_high())
     asu = _enumerate_sg_asu_hkls(
@@ -2698,7 +2701,7 @@ def _mtz_completeness(mtz_path):
         mtz.spacegroup, d_min)
     n_expected = len(asu)
     n_obs = sum(1 for h in asu
-                if tuple(int(x) for x in h) in in_canon_with_F)
+                if tuple(int(x) for x in h) in in_canon_with_obs)
     frac = n_obs / n_expected if n_expected else 0.0
     return n_obs, n_expected, frac
 
@@ -2754,12 +2757,16 @@ def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
     if d_min is None:
         d_min = float(mtz.resolution_high())
 
-    # Identify amplitude / sigma / free columns
+    # Identify amplitude / intensity / sigma / free columns.  An MTZ may
+    # carry F (post-truncate / refined output) or I (raw deposit straight
+    # from cif2mtz) or both — we fill whichever obs column refmac will use.
     F_lbl    = next((l for l in ('FP', 'F', 'FOBS') if l in lbls), None)
     SIG_lbl  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in lbls), None)
+    I_lbl    = next((l for l in ('IMEAN', 'I', 'IOBS') if l in lbls), None)
+    SIGI_lbl = next((l for l in ('SIGIMEAN', 'SIGI', 'SIGIOBS') if l in lbls), None)
     FREE_lbl = next((l for l in ('FREE', 'RFREE', 'FreeR_flag') if l in lbls), None)
-    if F_lbl is None:
-        # Nothing to fill — input MTZ doesn't have an Fobs column refmac would use.
+    if F_lbl is None and I_lbl is None:
+        # Nothing to fill — no obs column refmac would consume.
         import shutil as _sh
         _sh.copyfile(in_mtz_path, out_mtz_path)
         return out_mtz_path
@@ -2800,19 +2807,23 @@ def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
     missing_hkl = np.array(missing, dtype=np.int32)
     fc = _fcalc_at_hkls(pdb_path, missing_hkl, d_min)
     fc_amp = np.abs(fc).astype(np.float32)
+    fc_int = (fc_amp.astype(np.float64) ** 2).astype(np.float32)
 
-    # Fill values for ancillary columns
-    F_idx = lbls.index(F_lbl)
-    sig_default = (np.float32(np.nanmedian(data[:, lbls.index(SIG_lbl)]))
-                   if SIG_lbl else np.float32(1.0))
     free_default = np.float32(0.0)   # work set
 
     new_rows = np.full((len(missing_hkl), data.shape[1]),
                        np.nan, dtype=np.float32)
     new_rows[:, :3] = missing_hkl
-    new_rows[:, F_idx] = fc_amp
-    if SIG_lbl:
-        new_rows[:, lbls.index(SIG_lbl)] = sig_default
+    if F_lbl:
+        new_rows[:, lbls.index(F_lbl)] = fc_amp
+        if SIG_lbl:
+            new_rows[:, lbls.index(SIG_lbl)] = np.float32(
+                np.nanmedian(data[:, lbls.index(SIG_lbl)]))
+    if I_lbl:
+        new_rows[:, lbls.index(I_lbl)] = fc_int
+        if SIGI_lbl:
+            new_rows[:, lbls.index(SIGI_lbl)] = np.float32(
+                np.nanmedian(data[:, lbls.index(SIGI_lbl)]))
     if FREE_lbl:
         new_rows[:, lbls.index(FREE_lbl)] = free_default
 
@@ -3872,42 +3883,90 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
         cols   = {c.label for c in mtz_in.columns}
         fp     = next((l for l in ('FP', 'F', 'FOBS')              if l in cols), None)
         sigfp  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS')     if l in cols), None)
+        i_lbl  = next((l for l in ('IMEAN', 'I', 'IOBS')           if l in cols), None)
+        sigi   = next((l for l in ('SIGIMEAN', 'SIGI', 'SIGIOBS')  if l in cols), None)
         free   = next((l for l in ('FREE', 'RFREE', 'FreeR_flag')   if l in cols), None)
-        if fp and sigfp:
-            labin  = f'FP={fp} SIGFP={sigfp}' + (f' FREE={free}' if free else '')
-            # REFI TYPE RIGID: fast, no atomic refinement, insensitive to
-            # unknown ligands (no restraints needed).  We only need refmac to
-            # produce clean FWT/PHWT/SIGFP-scaled output; the input PDB is
-            # already at the correct geometry.
-            script = (f'REFI TYPE RIGID\n'
-                      f'NCYC {n_cycles}\n'
-                      f'LABIN {labin}\n'
-                      f'END\n')
-            cmd    = [refmac, 'xyzin', pdb_path, 'xyzout', out_pdb,
-                      'hklin', mtz_path_for_refmac, 'hklout', out_mtz]
-            print(f'  run_refinement: {os.path.basename(refmac)} rigid '
-                  f'({n_cycles} cycles)...', flush=True)
-            r = subprocess.run(cmd, input=script, capture_output=True, text=True)
-            log_path = os.path.join(outdir, f'{stem}_refmac.log')
+        # I-only MTZs (e.g. RCSB raw deposits straight from cif2mtz) need
+        # an F column for REFI TYPE RIGID — refmac's intensity input path
+        # doesn't run French-Wilson in rigid mode (reports "All observed
+        # amplitudes are 0").  Auto-ctruncate to add F/SIGF, then point
+        # refmac at the truncated MTZ.
+        if not (fp and sigfp) and (i_lbl and sigi):
+            ctruncate = _sh2.which('ctruncate')
+            if not ctruncate:
+                print('ERROR: input MTZ has I but not F, and `ctruncate` is not '
+                      'on PATH.  Source the CCP4 setup, or pre-convert the MTZ.',
+                      file=sys.stderr)
+                sys.exit(1)
+            mtz_F = os.path.join(outdir, f'{stem}_truncated.mtz')
+            print(f'  ctruncate {i_lbl}/{sigi} → F/SIGF ({mtz_F})', flush=True)
+            r0 = subprocess.run(
+                [ctruncate, '-hklin', mtz_path_for_refmac, '-hklout', mtz_F,
+                 '-colin', f'/*/*/[{i_lbl},{sigi}]'],
+                capture_output=True, text=True)
+            log_path = os.path.join(outdir, f'{stem}_ctruncate.log')
             with open(log_path, 'w') as _lf:
-                _lf.write(f'# refmac5 command: {" ".join(cmd)}\n')
-                _lf.write(f'# script:\n{script}\n')
-                _lf.write(f'# returncode: {r.returncode}\n\n--- stdout ---\n')
-                _lf.write(r.stdout or '')
+                _lf.write(f'# ctruncate returncode: {r0.returncode}\n\n--- stdout ---\n')
+                _lf.write(r0.stdout or '')
                 _lf.write('\n--- stderr ---\n')
-                _lf.write(r.stderr or '')
-            if r.returncode == 0 and os.path.exists(out_mtz):
-                print(f'  refmac5 done → {out_mtz}  (log: {log_path})', flush=True)
-                return out_pdb, out_mtz
-            print(f'  refmac5 failed (rc={r.returncode}); see {log_path}',
-                  file=sys.stderr)
+                _lf.write(r0.stderr or '')
+            if r0.returncode != 0 or not os.path.exists(mtz_F):
+                print(f'  ctruncate failed (rc={r0.returncode}); see {log_path}',
+                      file=sys.stderr)
+                sys.exit(1)
+            mtz_path_for_refmac = mtz_F
+            # Re-detect F columns from the truncated MTZ.
+            mtz_in = gemmi.read_mtz_file(mtz_path_for_refmac)
+            cols   = {c.label for c in mtz_in.columns}
+            fp     = next((l for l in ('FP', 'F', 'FOBS')          if l in cols), None)
+            sigfp  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in cols), None)
+            free   = next((l for l in ('FREE', 'RFREE', 'FreeR_flag') if l in cols), None)
+        if fp and sigfp:
+            labin = f'FP={fp} SIGFP={sigfp}' + (f' FREE={free}' if free else '')
+        else:
+            print(f'ERROR: {os.path.basename(mtz_path_for_refmac)} has no usable '
+                  f'amplitude columns (looked for FP/F/FOBS+SIGFP/SIGF/SIGFOBS).  '
+                  f'Columns present: {sorted(cols)}.', file=sys.stderr)
+            sys.exit(1)
+        # REFI TYPE RIGID: fast, no atomic refinement, insensitive to
+        # unknown ligands (no restraints needed).  We only need refmac to
+        # produce clean FWT/PHWT/SIGFP-scaled output; the input PDB is
+        # already at the correct geometry.
+        script = (f'REFI TYPE RIGID\n'
+                  f'NCYC {n_cycles}\n'
+                  f'LABIN {labin}\n'
+                  f'END\n')
+        cmd    = [refmac, 'xyzin', pdb_path, 'xyzout', out_pdb,
+                  'hklin', mtz_path_for_refmac, 'hklout', out_mtz]
+        print(f'  run_refinement: {os.path.basename(refmac)} rigid '
+              f'({n_cycles} cycles)...', flush=True)
+        r = subprocess.run(cmd, input=script, capture_output=True, text=True)
+        log_path = os.path.join(outdir, f'{stem}_refmac.log')
+        with open(log_path, 'w') as _lf:
+            _lf.write(f'# refmac5 command: {" ".join(cmd)}\n')
+            _lf.write(f'# script:\n{script}\n')
+            _lf.write(f'# returncode: {r.returncode}\n\n--- stdout ---\n')
+            _lf.write(r.stdout or '')
+            _lf.write('\n--- stderr ---\n')
+            _lf.write(r.stderr or '')
+        if r.returncode == 0 and os.path.exists(out_mtz):
+            print(f'  refmac5 done → {out_mtz}  (log: {log_path})', flush=True)
+            return out_pdb, out_mtz
+        print(f'  refmac5 failed (rc={r.returncode}); see {log_path}',
+              file=sys.stderr)
 
     # ── phenix.refine ─────────────────────────────────────────────────────────
     phenix = _sh2.which('phenix.refine')
     if phenix:
-        cmd = [phenix, pdb_path, mtz_path_for_refmac,
+        # phenix runs in cwd=outdir so its scratch files stay there.  All
+        # file paths in the cmd must therefore be absolute (or resolved
+        # relative to the new cwd), otherwise phenix prints "No files
+        # found" and exits with "arguments are not recognized: <basename>".
+        abs_pdb = os.path.abspath(pdb_path)
+        abs_mtz = os.path.abspath(mtz_path_for_refmac)
+        cmd = [phenix, abs_pdb, abs_mtz,
                f'refinement.main.number_of_macro_cycles={n_cycles}',
-               f'output.prefix={os.path.join(outdir, stem)}']
+               f'output.prefix={stem}']
         print(f'  run_refinement: phenix.refine ({n_cycles} cycles)...', flush=True)
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=outdir)
         log_path = os.path.join(outdir, f'{stem}_phenix.log')
