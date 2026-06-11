@@ -1465,21 +1465,36 @@ import functools as _functools
 
 
 @_functools.lru_cache(maxsize=64)
-def _get_altindex_ops_cached(sg_name, cell_tuple, max_M, det_max):
+def _get_altindex_ops_cached(sg_name, cell_tuple, max_M, det_max, metric_tol_rel):
     """LRU-cached worker for _get_altindex_ops.  Cell is a tuple for
     hashability; cell=None is encoded as None.  ~minute-long enumeration
     runs only once per (sg, cell, max_M, det_max) within a process."""
-    return _get_altindex_ops_impl(sg_name, cell_tuple, max_M, det_max)
+    return _get_altindex_ops_impl(sg_name, cell_tuple, max_M, det_max,
+                                   metric_tol_rel)
 
 
-def _get_altindex_ops(sg_name, cell=None, max_M=1, det_max=1):
+def _get_altindex_ops(sg_name, cell=None, max_M=1, det_max=1,
+                       metric_tol_rel=1e-6):
+    """metric_tol_rel : relative tolerance for metric preservation,
+    expressed as a fraction of max(|G|).  Default 1e-6 admits only ops
+    that EXACTLY preserve the lattice metric (the rigorous altindex set).
+    A larger value (e.g. 0.05) admits ops that preserve a NEARBY
+    higher-symmetry metric — useful for pseudo-symmetric cells where
+    the deposited cell is slightly distorted from an actual orthorhombic /
+    tetragonal / etc. lattice and the natural alt-cell ops fall just
+    outside strict tolerance.  resolve_altindex uses 0.05 in the
+    cross-cell (post-stretch) branch so a 180°-about-z rotation in a
+    nearly-orthorhombic monoclinic, for example, is found and can be
+    applied as a discrete reindexing (preserving experimental Fobs)
+    rather than forcing a Fcalc-only fallback."""
     if cell is None:
         cell_tuple = None
     elif hasattr(cell, 'a'):       # gemmi.UnitCell
         cell_tuple = (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma)
     else:
         cell_tuple = tuple(cell)
-    return _get_altindex_ops_cached(sg_name, cell_tuple, max_M, det_max)
+    return _get_altindex_ops_cached(sg_name, cell_tuple, max_M, det_max,
+                                     metric_tol_rel)
 
 
 @_functools.lru_cache(maxsize=1)
@@ -1510,7 +1525,8 @@ def _catalog_ops_by_cs():
     return out
 
 
-def _get_altindex_ops_impl(sg_name, cell=None, max_M=1, det_max=1):
+def _get_altindex_ops_impl(sg_name, cell=None, max_M=1, det_max=1,
+                             metric_tol_rel=1e-6):
     """All proper-rotation (R, t) ops that preserve the cell's lattice metric
     and are NOT already in this SG.  These are the "altindex" candidates:
     rotations + translations that map the lattice to itself but aren't
@@ -1547,7 +1563,7 @@ def _get_altindex_ops_impl(sg_name, cell=None, max_M=1, det_max=1):
             sg_R.add(tuple(R.flatten()))
 
     catalog = _catalog_ops_by_cs()
-    tol_G = 1e-6 * float(np.max(np.abs(G)))
+    tol_G = float(metric_tol_rel) * float(np.max(np.abs(G)))
     all_ops = set()
 
     # Pre-filter M matrices by det in [-det_max..det_max] excluding 0.
@@ -4090,8 +4106,15 @@ def _shift_mtz_origin(mtz_in, t_frac, mtz_out):
             target = phi_cols[0][0]
         if target is None:
             continue   # no matching phase column — leave alone
-        data[:, target] = ((data[:, target] + delta_phi_deg) % 360.0
-                            ).astype(np.float32)
+        # NaN-safe phase update: leave NaN rows alone, shift the rest.
+        # NaN typically appears in missing-data rows (e.g. SIGFP=NaN in
+        # incomplete deposits); applying `%` to NaN raises a benign
+        # RuntimeWarning that clutters scan logs.
+        shifted = data[:, target] + delta_phi_deg
+        finite = np.isfinite(shifted)
+        out = data[:, target].copy()
+        out[finite] = (shifted[finite] % 360.0).astype(np.float32)
+        data[:, target] = out
     mtz.set_data(data)
     mtz.write_to_file(mtz_out)
 
@@ -4217,7 +4240,7 @@ def _apply_cart_transform_to_pdb(pdb_in, R_cart, t_cart, pdb_out, ref_cell=None)
     st.write_pdb(pdb_out)
 
 
-def _enum_alt_rot_origin_candidates(cell, sg, sg_name):
+def _enum_alt_rot_origin_candidates(cell, sg, sg_name, metric_tol_rel=1e-6):
     """Yield (R_frac, t_frac) pairs covering (altindex × symop × origin) candidates
     for resolve_altindex.  R_frac is fractional, t_frac is fractional mod 1.
 
@@ -4225,14 +4248,15 @@ def _enum_alt_rot_origin_candidates(cell, sg, sg_name):
     origin choices in _ORIGINS_TABLE.  gemmi's xhm() returns 'R 3:H' for H3 etc.,
     which doesn't match _ORIGINS_TABLE keys.
 
-    Altindex rotations come from `_get_altindex_ops(sg_name, cell)` —
+    Altindex rotations come from `_get_altindex_ops(sg_name, cell, metric_tol_rel)` —
     metric-tensor enumeration of integer proper rotations preserving the
-    cell's lattice that are NOT already in the SG.  This finds the full
-    set of valid altindex candidates (including 6-folds along c for
-    Sohncke trig/hex groups, axis permutations for orthorhombic, etc.),
-    not just a hand-coded subset."""
-    alt_ops = [(np.eye(3), np.zeros(3))] + list(_get_altindex_ops(sg_name,
-                                                                    cell=cell))
+    cell's lattice that are NOT already in the SG.  metric_tol_rel controls
+    how strictly the lattice metric must be preserved; loosening it (e.g.
+    0.05) admits ops that hold for a NEARBY higher-symmetry metric, useful
+    for pseudo-symmetric cells where the natural alt-cell ops just miss
+    strict tolerance (see _get_altindex_ops docstring)."""
+    alt_ops = [(np.eye(3), np.zeros(3))] + list(
+        _get_altindex_ops(sg_name, cell=cell, metric_tol_rel=metric_tol_rel))
     sym_ops = list(sg.operations())
     key = _sg_origins_key(sg_name)
     entries = _ORIGINS_TABLE.get(key)
@@ -4262,6 +4286,71 @@ def _no_op_resolve_result(mov_pdb, mov_mtz, drot=0.0, rmsd=0.0):
                 drot_deg=drot, rmsd_after=rmsd)
 
 
+def _cells_match(c1, c2, rtol=1e-4):
+    """True iff two gemmi.UnitCell objects agree to relative tolerance rtol
+    on all six parameters (a, b, c, α, β, γ)."""
+    p1 = np.array(c1.parameters, dtype=float)
+    p2 = np.array(c2.parameters, dtype=float)
+    return np.allclose(p1, p2, rtol=rtol, atol=0)
+
+
+def _stretch_pdb_to_cell(in_pdb, target_cell, out_pdb):
+    """Re-orthogonalize a PDB into target_cell, preserving each atom's
+    fractional coordinates.  Port of origins/claude/stretch_to_cell.py.
+
+    Use this when comparing two non-isomorphous crystals: putting the moving
+    structure into the reference's cell with fractions preserved absorbs the
+    isomorphous cell-distortion shift as a uniform elastic stretch, so the
+    remaining real-space difference is just the alt-indexing rotation +
+    translation that the discrete enumeration knows how to find."""
+    st = gemmi.read_pdb(in_pdb)
+    oc = st.cell
+    old_cell = gemmi.UnitCell(oc.a, oc.b, oc.c, oc.alpha, oc.beta, oc.gamma)
+    st.cell = target_cell
+    for model in st:
+        for chain in model:
+            for residue in chain:
+                for atom in residue:
+                    frac = old_cell.fractionalize(atom.pos)
+                    pos  = target_cell.orthogonalize(frac)
+                    atom.pos = gemmi.Position(pos.x, pos.y, pos.z)
+        break
+    st.write_pdb(out_pdb)
+
+
+def _relabel_mtz_cell(in_mtz, target_cell, out_mtz):
+    """Copy in_mtz to out_mtz with cell (file-level AND per-dataset) replaced
+    by target_cell.  HKLs and column values are unchanged.
+
+    The per-dataset cell must also be updated — CCP4 reads the dataset cell,
+    not the file-level cell, and a mismatch triggers a refmac "Large
+    differences between cells from pdb and mtz" abort even when mtz.cell
+    matches pdb.cell."""
+    mtz = gemmi.read_mtz_file(in_mtz)
+    mtz.cell = target_cell
+    for ds in mtz.datasets:
+        ds.cell = target_cell
+    mtz.write_to_file(out_mtz)
+
+
+def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
+                               fill_fcalc, drot_deg, rmsd, verbose):
+    """When cell-stretching alone aligned moving to ref (no discrete altindex
+    needed), re-refine the stretched moving model+data under the new cell so
+    FWT/PHWT are consistent with ref's cell metric.  The pre-stretch FWT/PHWT
+    were computed under moving's old cell; resolution-dependent weights
+    (sigma_a, bulk solvent) would otherwise be ~cell-mismatch off."""
+    if verbose:
+        print(f"  cell-stretch only — re-refining stretched moving model "
+              f"under ref cell ...", flush=True)
+    out_pdb, out_mtz = run_refinement(mov_pdb, mov_mtz, outdir=outdir,
+                                       n_cycles=refine_cycles,
+                                       fill_fcalc=fill_fcalc)
+    return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
+                action='cell_stretch_only', R_frac=np.eye(3),
+                t_frac=np.zeros(3), drot_deg=drot_deg, rmsd_after=rmsd)
+
+
 def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                      refine_cycles=5, improve_threshold=0.7,
                      verbose=True, fill_fcalc=False):
@@ -4285,6 +4374,34 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
     mov_st.setup_entities()
     ref_st.setup_entities()
 
+    # ── cell-stretch pre-alignment for non-isomorphous pairs ─────────────────
+    # When the two crystals have different cells (same SG, isomorphous
+    # expansion/contraction, etc.), the discrete (R_frac, t_frac) enumeration
+    # below would only ever find lattice translations as the "best" op — no
+    # purely-fractional rotation can compensate for a metric change.  Stretch
+    # the moving model+data into ref's cell first, preserving fractional
+    # coordinates; then the rest of the function runs in matched cells.
+    stretched = False
+    if not _cells_match(mov_st.cell, ref_st.cell):
+        s_pdb_stem = os.path.splitext(os.path.basename(mov_pdb))[0]
+        s_mtz_stem = os.path.splitext(os.path.basename(mov_mtz))[0]
+        s_pdb = os.path.join(outdir, f'{s_pdb_stem}_stretched.pdb')
+        s_mtz = os.path.join(outdir, f'{s_mtz_stem}_stretched.mtz')
+        if verbose:
+            print(f"resolve_altindex: cells differ — stretching moving into "
+                  f"ref cell (fractions preserved)", flush=True)
+            print(f"  moving cell:    {tuple(round(x, 3) for x in mov_st.cell.parameters)}",
+                  flush=True)
+            print(f"  ref    cell:    {tuple(round(x, 3) for x in ref_st.cell.parameters)}",
+                  flush=True)
+        _stretch_pdb_to_cell(mov_pdb, ref_st.cell, s_pdb)
+        _relabel_mtz_cell(mov_mtz, ref_st.cell, s_mtz)
+        mov_pdb = s_pdb
+        mov_mtz = s_mtz
+        mov_st = gemmi.read_pdb(mov_pdb)
+        mov_st.setup_entities()
+        stretched = True
+
     A_cart, B_cart = _collect_matched_ca(mov_st, ref_st)
     if len(A_cart) < 3:
         if verbose:
@@ -4292,12 +4409,24 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         return _no_op_resolve_result(mov_pdb, mov_mtz)
 
     rmsd_base = float(np.sqrt(np.mean(np.sum((A_cart - B_cart) ** 2, axis=1))))
-    R_lsq, _t_lsq, rmsd_lsq = _kabsch(A_cart, B_cart)
+    R_lsq, t_lsq, rmsd_lsq = _kabsch(A_cart, B_cart)
 
     if verbose:
         print(f"resolve_altindex: {len(A_cart)} CA pairs  "
               f"baseline RMSD {rmsd_base:.2f} A  LSQ {rmsd_lsq:.2f} A",
               flush=True)
+
+    # ── cross-cell: relax metric tolerance for the altindex enumeration ─────
+    # For cross-cell pairs (stretched=True), the natural alt-cell op is
+    # often metric-preserving in a HIGHER-symmetry holohedry that the
+    # deposited cell only approximates (e.g. nearly-orthorhombic monoclinic
+    # admits a 180°-about-z that holds in true orthorhombic but is off by
+    # ~few % in the actual monoclinic metric).  Strict 1e-6 tolerance
+    # misses these.  Loosening to 5% surfaces them as discrete altindex
+    # candidates — preserving experimental Fobs through the reindex+refine
+    # pathway rather than falling back to Fcalc-only.  Same-cell pairs are
+    # unaffected (their natural ops are strictly metric-preserving).
+    metric_tol_rel = 0.05 if stretched else 1e-6
 
     cell = mov_st.cell
     sg_name = mov_st.spacegroup_hm
@@ -4313,17 +4442,34 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
     A_frac = (Finv @ A_cart.T).T
     B_frac = (Finv @ B_cart.T).T
 
+    # For each discrete R candidate, evaluate the best achievable RMSD using
+    # the COM-optimal *continuous* translation (rather than ranking only
+    # discrete origin-table entries).  The previous per-atom `diff -=
+    # np.round(diff)` wrap was a stand-in for "find the best t"; that works
+    # when COM-offset is small (same-cell, aligned origins), but fails for
+    # cross-cell pairs after stretch where the COM offset is some continuous
+    # value not on the origin-table grid.  COM-optimal continuous t is what
+    # the downstream `_apply_cart_transform_to_pdb` already uses to *apply*
+    # the transform — using it for ranking too keeps rank and apply
+    # consistent, and recovers the cross-cell case.
+    #
+    # For same-cell, well-aligned pairs this collapses to t_opt ≈ 0 and the
+    # is_zero_t guard below falls through to action='none', preserving the
+    # old behaviour.  For SG-symop cases the COM-optimal continuous t lands
+    # in the same physical equivalence class as the intrinsic discrete t
+    # (mod lattice).
     best = (rmsd_base, np.eye(3), np.zeros(3))   # (rmsd, R_frac, t_frac)
-    for R_frac, t_frac in _enum_alt_rot_origin_candidates(cell, sg, sg_name):
-        if not _is_metric_preserving(R_frac, G):
+    for R_frac, _t_intrinsic in _enum_alt_rot_origin_candidates(
+            cell, sg, sg_name, metric_tol_rel=metric_tol_rel):
+        if not _is_metric_preserving(R_frac, G, atol=metric_tol_rel):
             continue
-        Af2  = (R_frac @ A_frac.T).T + t_frac
-        diff = Af2 - B_frac
-        diff -= np.round(diff)
+        A_rot_frac = (R_frac @ A_frac.T).T
+        t_opt_frac = B_frac.mean(axis=0) - A_rot_frac.mean(axis=0)
+        diff = (A_rot_frac + t_opt_frac) - B_frac
         cart_diff = (O @ diff.T).T
         rmsd_disc = float(np.sqrt(np.mean(np.sum(cart_diff**2, axis=1))))
         if rmsd_disc < best[0]:
-            best = (rmsd_disc, R_frac, t_frac)
+            best = (rmsd_disc, R_frac, t_opt_frac)
 
     rmsd_top, R_frac, t_frac = best
     R_cart = O @ R_frac @ Finv
@@ -4332,8 +4478,11 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                 if rmsd_top < rmsd_base else 0.0)
 
     is_identity_R = np.allclose(R_frac, np.eye(3), atol=1e-6)
-    t_wrapped = t_frac - np.round(t_frac)
-    is_zero_t = float(np.linalg.norm(t_wrapped)) < 0.01
+    # Check the UNWRAPPED t: a t = (1, 0, 0) (whole lattice vector) is an
+    # F-space no-op but a real-space ~|a| Å shift that must be applied to
+    # the PDB to put moving in the same image of the lattice as ref (this
+    # arises post-cell-stretch when COM offset spans a lattice vector).
+    is_zero_t = float(np.linalg.norm(t_frac)) < 0.01
 
     # Is R_frac one of the SG's own proper rotations?  If so, this isn't a
     # genuine altindex — it's just a chain re-assignment via an existing
@@ -4357,6 +4506,10 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         if verbose:
             print(f"  best discrete op: rmsd={rmsd_top:.2f} A vs baseline "
                   f"{rmsd_base:.2f} A — no improvement, skipping", flush=True)
+        if stretched:
+            return _finish_after_stretch_only(mov_pdb, mov_mtz, outdir,
+                                              refine_cycles, fill_fcalc,
+                                              drot_deg, rmsd_base, verbose)
         return _no_op_resolve_result(mov_pdb, mov_mtz,
                                      drot=drot_deg, rmsd=rmsd_base)
 
@@ -4364,6 +4517,10 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         if verbose:
             print(f"  best discrete op is identity — no transform needed",
                   flush=True)
+        if stretched:
+            return _finish_after_stretch_only(mov_pdb, mov_mtz, outdir,
+                                              refine_cycles, fill_fcalc,
+                                              drot_deg, rmsd_top, verbose)
         return _no_op_resolve_result(mov_pdb, mov_mtz,
                                      drot=drot_deg, rmsd=rmsd_top)
 
