@@ -14,7 +14,10 @@
 #   7. raddam   5kxk -> 5kxn   P4(3)2(1)2   subtract=bent
 #   8. myoglobin 1mbo -> 1a6m  P2(1)
 #   9. insulin  4fg3 -> 4e7u   H3           fill_fcalc=True
-#  10. porin    altalign 3poq->3pou + refmac on the R32:R output
+#  10. lipox    9o4s -> 9o4t   P2(1)        cross-cell (~4% expansion);
+#                                            exercises stretch + loose-tol
+#                                            altindex reindex of mov Fobs
+#  11. porin    altalign 3poq->3pou + refmac on the R32:R output
 #
 # Each test writes to test_results_<timestamp>/<name>.log and the script
 # prints a PASS/FAIL summary at the end.  Run from the working area
@@ -52,7 +55,7 @@ printf "%-30s %-7s %s\n" "------------------------------" "------" "------" >> $
 
 # ── 1. test_symm_all_sgs ─────────────────────────────────────────────────
 echo ""
-echo "==> [ 1/10] test_symm_all_sgs.py"
+echo "==> [ 1/11] test_symm_all_sgs.py"
 srun --job-name=test_symm ccp4-python test_symm_all_sgs.py >& $logdir/01_test_symm.log
 set r = `grep "Constrained fit:" $logdir/01_test_symm.log | head -1`
 if ("$r" =~ *"65/65"*) then
@@ -70,7 +73,7 @@ endif
 # Report Test 2 (rigid-body rotation) only — it's the canonical entry in
 # CLAUDE.md and the harder of the two.  tail -1 selects Test 2's lines.
 echo ""
-echo "==> [ 2/10] magdoff/test_magdoff.py"
+echo "==> [ 2/11] magdoff/test_magdoff.py"
 if (! -e magdoff/test_magdoff.py) then
     echo "    FAIL  magdoff/test_magdoff.py missing"
     @ nfail++
@@ -108,6 +111,7 @@ foreach spec ( \
     "raddam_5kxn raddam      5kxk.pdb 5kxn.pdb 5kxk.mtz 5kxn.mtz bent True _5kxn" \
     "myoglobin   myoglobin   1mbo.pdb 1a6m.pdb 1mbo.mtz 1a6m.mtz ref  True ''" \
     "insulin     insulin     4fg3.pdb 4e7u.pdb 4fg3.mtz 4e7u.mtz ref  True ''" \
+    "lipox       lipox       9o4s.pdb 9o4t.pdb 9o4s.mtz 9o4t.mtz ref  True ''" \
 )
     set parts = ( $spec )
     set label = $parts[1]
@@ -125,7 +129,7 @@ foreach spec ( \
     set log = $logdir/`printf "%02d" $i`_$label.log
 
     echo ""
-    echo "==> [`printf '%2d' $i`/10] $label  ($sys $movp -> $refp, fill_fcalc=$fill, subtract=$sub)"
+    echo "==> [`printf '%2d' $i`/11] $label  ($sys $movp -> $refp, fill_fcalc=$fill, subtract=$sub)"
     ( cd $sys && rm -rf $scan && srun --job-name=$label ccp4-python -c "import sys; sys.path.insert(0,'..'); from bendfinder import fitreso_scan; fitreso_scan(mov_pdb='$movp', ref_pdb='$refp', mov_mtz='$movm', ref_mtz='$refm', scan_dir='$scan', run_refinement_flag=True, refine_cycles=5, fill_fcalc=$fill, subtract='$sub')" ) >& $log
 
     if (! -e $sys/$scan/scan_fitreso.log) then
@@ -156,10 +160,10 @@ foreach spec ( \
     endif
 end
 
-# ── 10. porin altalign + refmac on R32:R ─────────────────────────────────
+# ── 11. porin altalign + refmac on R32:R ─────────────────────────────────
 @ i++
 echo ""
-echo "==> [`printf '%2d' $i`/10] porin  altalign 3poq->3pou + refmac on R32:R"
+echo "==> [`printf '%2d' $i`/11] porin  altalign 3poq->3pou + refmac on R32:R"
 set plog = $logdir/`printf "%02d" $i`_porin_altalign.log
 ( cd porin && rm -rf altalign_test && mkdir altalign_test && \
     srun --job-name=porin_aa ccp4-python ../altalign.py 3poq.pdb 3pou.pdb \

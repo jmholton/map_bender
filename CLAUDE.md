@@ -53,6 +53,22 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
                                  below.  The PDB side is solved
                                  (altalign aligns to ~2 Å); the moving
                                  MTZ needs the dual-solution writer.
+  lipox/                        soybean lipoxygenase-1 9o4s→9o4t (P2₁,
+    9o4s.pdb, 9o4t.pdb           ~800 CA, ~4% non-isomorphous cell
+                                 expansion — same SG, different cells
+                                 a 92.0→96.0, b 93.0→94.5, c 49.0→50.5,
+                                 β 92.7→91.2°).  Raw cif2mtz outputs
+                                 are I-only and < 99% SG-ASU complete,
+                                 so `fill_fcalc=True` is required and
+                                 `run_refinement` auto-ctruncates I→F
+                                 before refmac.  The mov→ref relation
+                                 is a non-crystallographic ~180°
+                                 rotation about Cartesian z, but the
+                                 monoclinic cell is *nearly*
+                                 orthorhombic so a 5%-loose metric
+                                 tolerance surfaces the alt-cell 2-fold
+                                 as a discrete altindex op — see
+                                 "Cross-cell pairs" section below.
   lyso_test_031419/             gold-standard reference run (old prototype, RMSD=0.209 Å)
   magdoff/                      Magdoff synthetic deformation validation tests
     test_magdoff.py             test script (7rsa, P2₁, 248 CA)
@@ -204,6 +220,65 @@ preserves both rotations *and* centering) reindexes the moving MTZ
 cleanly: `R·SG·R⁻¹ = SG`.  A **non-normalizing** metric-preserving op
 does not — it lands the moving data in a conjugate setting (see porin
 below).  For H 3 2, 44 of the 75 enumerated ops normalize.
+
+## Cross-cell pairs (`resolve_altindex` cell stretch + loose-tolerance altindex)
+
+When mov.cell ≠ ref.cell (same SG, different cells — e.g. lipox
+9o4s/9o4t with ~4% isomorphous expansion), the strict discrete
+`(R_frac, t_frac)` enumeration in `resolve_altindex` can only ever
+return lattice translations as the "best" op: no purely-fractional
+rotation compensates for a metric change.  Three coupled mechanisms
+recover the cross-cell case while keeping mov's experimental Fobs
+intact through the entire pipeline:
+
+1. **Cell stretch pre-alignment.**  When `_cells_match(mov, ref)` is
+   False, `_stretch_pdb_to_cell` re-orthogonalizes the moving model
+   into ref's cell preserving each atom's fractional coordinates, and
+   `_relabel_mtz_cell` updates both the file-level and per-dataset
+   cell records on the moving MTZ (HKLs and column values untouched).
+   The isomorphous distortion is absorbed as a uniform elastic
+   stretch; the remaining real-space difference is the genuine
+   alt-indexing rotation + translation that the discrete enumeration
+   knows how to find.  Port of `~/projects/origins/claude/stretch_to_cell.py`.
+
+2. **COM-optimal continuous translation.**  Discrete origin-table
+   entries don't generally contain the continuous COM offset between
+   two cross-cell deposits.  For each candidate R, `resolve_altindex`
+   now evaluates the RMSD using
+   `t_opt = mean(B_frac) − mean(R·A_frac)` (LSQ-optimal continuous t)
+   rather than the per-atom-wrap stand-in.  The reported `is_zero_t`
+   check is on the UNWRAPPED t so a lattice-vector shift (F-space
+   no-op, real-space ~|a| Å translation) actually gets applied to
+   the PDB.
+
+3. **Loose metric tolerance.**  `_get_altindex_ops` and
+   `_enum_alt_rot_origin_candidates` accept a `metric_tol_rel`
+   parameter (default `1e-6` keeps existing same-cell callers
+   identical).  `resolve_altindex` sets it to `0.05` when
+   stretched=True, which surfaces ops that are metric-preserving in a
+   NEARBY higher-symmetry holohedry the deposited cell only
+   approximates.  Lipox example: monoclinic P2₁ with a/b within 1.6%
+   and β within 1.3° of orthorhombic admits the alt-cell 180°-about-z
+   (`R = diag(−1,−1,+1)`) at drot=0.00° from the Kabsch LSQ rotation;
+   strict 1e-6 tolerance would reject this op.  The existing
+   `altindex_refine` branch then reindexes mov's experimental Fobs by
+   R and re-refines; **no Fcalc substitution ever happens — mov's
+   experimental data is preserved through the entire pipeline**.
+
+Cross-cell outcome for lipox 9o4s→9o4t:
+`action=altindex_refine`, R=diag(−1,−1,+1), drot=0.00°,
+rmsd_after=1.43 Å (vs LSQ 1.16 Å), refmac R=0.254 after
+reindex+rigid-body.  bend_fit's smooth shift field absorbs the
+remaining ~1 Å rigid-body residual + ~5% metric stretch.
+
+Same-cell pairs (lyso, dhfr, etc.) are unaffected by the loose
+tolerance default — `_cells_match` returns True and the strict-1e-6
+enumeration runs as before.  When cells differ even slightly (lyso
+3aw6 vs 3aw7 are ~1.5% off), the new path activates: stretch +
+origin_only (R=identity, small continuous t).  Lyso regression
+confirmed: fr7 RMSD 0.044 Å matches canonical fr5 0.033 Å within
+scan-grid noise; d_opt=9.72 Å matches canonical 9.7 Å; predicted
+best Rbent 30.2% matches canonical 30.3%.
 
 ## altalign.py and the porin obverse/reverse problem
 
@@ -470,21 +545,23 @@ Both tests fit 3 progressive iterations (20→7 Å), completing in ~25 s per fit
 
 ## Test gamut runner (`run_all_tests.com`)
 
-`claude/run_all_tests.com` (tcsh) runs the full 10-test gamut and prints
+`claude/run_all_tests.com` (tcsh) runs the full 11-test gamut and prints
 a PASS/FAIL table with per-test metrics:
 
 1. `test_symm_all_sgs.py` — 65 Sohncke SGs constraint check
 2. `magdoff/test_magdoff.py` — synthetic 0.5° rigid-body deformation
-3–9. Seven `fitreso_scan` examples (lyso, dhfr, raddam×3, myoglobin,
-   insulin) — all with `fill_fcalc=True` since the deposited reference
-   MTZs are below the 99% SG-ASU completeness gate
-10. Porin altalign + refmac on the R 3 2 :R output
+3–10. Eight `fitreso_scan` examples (lyso, dhfr, raddam×3, myoglobin,
+   insulin, lipox) — all with `fill_fcalc=True` since the deposited
+   reference MTZs are below the 99% SG-ASU completeness gate.  Lipox
+   additionally exercises the cross-cell pipeline (cell stretch +
+   loose-tol altindex; see "Cross-cell pairs" section above).
+11. Porin altalign + refmac on the R 3 2 :R output
 
 Each example writes to `<sys>/scan_test*/` (separate from the canonical
 `scan_fitreso_fc/` reference runs).  Per-test logs land in
 `test_results_<timestamp>/`.  Script cd's up if invoked from inside
 `map_bender/`; exits 2 if the working area can't be found, exits 1 if
-any test fails.  Latest baseline (2026-05-24): 10/10 PASS.
+any test fails.
 
 Run as `./run_all_tests.com` from the working area.
 
@@ -502,6 +579,12 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | 49.8% | 49.8% | 5.5 Å | ref |
 | Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 60.5% | 5.8 Å | ref (fill_fcalc=True) |
 | Porin 3poq→3pou | H 3 2 | 340 | 0.366 Å | 57.7% | 57.8% | 9.5 Å | ref (fill_fcalc=True) — in-bendfinder altindex resolution; obverse/reverse pair, altalign also emits H32+SYMM and R32:R (R32:R refmac-runnable, R=0.37) |
+| Lipox 9o4s→9o4t | P2₁ | 795 | 0.283 Å (fr12)¹ | 53.2% (fr12) | 53.2% | 12 Å (clamped) | ref (fill_fcalc=True) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z (drot=0.00° from LSQ) in nearly-orthorhombic monoclinic; refmac R=0.254 after reindex+rigid-body |
+
+¹ Lipox numbers are fr12, not fr5 — finer scan points blow up in
+wall-time at this molecule size (~6700 P1 atoms × many HKLs).  fr12
+already takes ~8 minutes; fr5 would extrapolate to ~hours.  The full
+fr5 row will be filled in once the canonical reference run completes.
 
 The `best` row in each `scan_dir/scan_fitreso.log` is the
 parabola-vertex re-fit (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
@@ -585,3 +668,18 @@ Notes:
   ~72 min, dominated by fr12→fr10 (1.4 ks → 4.3 ks per fr-point) as
   HKL count grows in the H 3 2 cell — see [Test gamut runner](#test-gamut-runner-run_all_testscom)
   for tuning options (`batch_hkls`, `drop_snr`) if this matters.
+- **Lipox** (soybean lipoxygenase-1 9o4s→9o4t, XFEL room-temperature
+  data at 1.95 Å) is the canonical **cross-cell** test case (~4% cell
+  expansion, P2₁ pseudo-orthorhombic).  Pipeline path:
+  `resolve_altindex` detects cells differ → stretches mov into ref's
+  cell (fractions preserved) → loose-tol (`metric_tol_rel=0.05`)
+  altindex enumeration surfaces `R=diag(−1,−1,+1)` at drot=0.00°
+  from the Kabsch LSQ rotation → `altindex_refine` reindexes mov's
+  experimental Fobs by R, re-refines to refmac R=0.254.  Scan:
+  hkl00 baseline RMSD 1.33 Å / Rbent 64.9% → fr20 0.345 Å / 53.7%
+  → fr12 0.283 Å / 53.2%; parabola d_opt clamps to fr12 (true
+  vertex finer than 12 Å but not yet measured).  Persistent
+  −8 to −9σ peak at A/350MET/SD(r) is a sulfur not in mov.
+  Mov's experimental Fobs is preserved end-to-end — no Fcalc
+  substitution.  See [Cross-cell pairs](#cross-cell-pairs-resolve_altindex-cell-stretch--loose-tolerance-altindex)
+  section above for the mechanism.
