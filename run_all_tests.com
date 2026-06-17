@@ -27,6 +27,16 @@
 
 if (! $?CCP4) source /programs/ccp4-9/bin/ccp4.setup-csh
 
+# CCP4-9 ships single-threaded blas/cblas/lapack — SVDs in bend_fit are 5-10x
+# slower than they need to be.  LD_PRELOAD the pthreaded openblas bundled
+# with phenix (libopenblasp 0.3.25).  Pair with `srun -c $SLURM_CPUS` below
+# so OPENBLAS_NUM_THREADS actually sees the cores (default srun gives 1).
+set NCPUS = 64
+if (-e /programs/phenix-2.1rc2-6037/lib/libopenblas.so.0) then
+    setenv LD_PRELOAD /programs/phenix-2.1rc2-6037/lib/libopenblas.so.0
+    setenv OPENBLAS_NUM_THREADS $NCPUS
+endif
+
 # CWD sanity check — this script needs the working area (parent of
 # map_bender/), which has bendfinder.py + lyso/ + dhfr/ + ... .  If
 # invoked from inside map_bender/ (the git subdir), cd up; otherwise
@@ -56,7 +66,7 @@ printf "%-30s %-7s %s\n" "------------------------------" "------" "------" >> $
 # ── 1. test_symm_all_sgs ─────────────────────────────────────────────────
 echo ""
 echo "==> [ 1/11] test_symm_all_sgs.py"
-srun --job-name=test_symm ccp4-python test_symm_all_sgs.py >& $logdir/01_test_symm.log
+srun -c $NCPUS --job-name=test_symm ccp4-python test_symm_all_sgs.py >& $logdir/01_test_symm.log
 set r = `grep "Constrained fit:" $logdir/01_test_symm.log | head -1`
 if ("$r" =~ *"65/65"*) then
     echo "    PASS  $r"
@@ -79,7 +89,7 @@ if (! -e magdoff/test_magdoff.py) then
     @ nfail++
     printf "%-30s %-7s no_script\n" "magdoff" FAIL >> $summary
 else
-    ( cd magdoff && srun --job-name=magdoff ccp4-python test_magdoff.py ) >& $logdir/02_magdoff.log
+    ( cd magdoff && srun -c $NCPUS --job-name=magdoff ccp4-python test_magdoff.py ) >& $logdir/02_magdoff.log
     set rcon = `grep "RMSD(CA) after fit:" $logdir/02_magdoff.log | grep "Constrained" | tail -1 | awk '{print $5}'`
     set runc = `grep "RMSD(CA) after fit:" $logdir/02_magdoff.log | grep "Unconstrained" | tail -1 | awk '{print $5}'`
     if ("$rcon" != "" && "$runc" != "") then
@@ -130,7 +140,7 @@ foreach spec ( \
 
     echo ""
     echo "==> [`printf '%2d' $i`/11] $label  ($sys $movp -> $refp, fill_fcalc=$fill, subtract=$sub)"
-    ( cd $sys && rm -rf $scan && srun --job-name=$label ccp4-python -c "import sys; sys.path.insert(0,'..'); from bendfinder import fitreso_scan; fitreso_scan(mov_pdb='$movp', ref_pdb='$refp', mov_mtz='$movm', ref_mtz='$refm', scan_dir='$scan', run_refinement_flag=True, refine_cycles=5, fill_fcalc=$fill, subtract='$sub')" ) >& $log
+    ( cd $sys && rm -rf $scan && srun -c $NCPUS --job-name=$label ccp4-python -c "import sys; sys.path.insert(0,'..'); from bendfinder import fitreso_scan; fitreso_scan(mov_pdb='$movp', ref_pdb='$refp', mov_mtz='$movm', ref_mtz='$refm', scan_dir='$scan', run_refinement_flag=True, refine_cycles=5, fill_fcalc=$fill, subtract='$sub')" ) >& $log
 
     if (! -e $sys/$scan/scan_fitreso.log) then
         echo "    FAIL  $sys/$scan/scan_fitreso.log not written (see $log)"
@@ -166,14 +176,14 @@ echo ""
 echo "==> [`printf '%2d' $i`/11] porin  altalign 3poq->3pou + refmac on R32:R"
 set plog = $logdir/`printf "%02d" $i`_porin_altalign.log
 ( cd porin && rm -rf altalign_test && mkdir altalign_test && \
-    srun --job-name=porin_aa ccp4-python ../altalign.py 3poq.pdb 3pou.pdb \
+    srun -c $NCPUS --job-name=porin_aa ccp4-python ../altalign.py 3poq.pdb 3pou.pdb \
         altalign_test/aa.pdb 3poq.mtz altalign_test/aa.mtz ) >& $plog
 
 set residual = ""
 if (-e $plog) set residual = `grep 'honest discrete CA RMSD' $plog | head -1 | awk '{print $7}'`
 if (-e porin/altalign_test/aa_R32R.pdb && -e porin/altalign_test/aa_R32R.mtz) then
     set rlog = $logdir/`printf "%02d" $i`_porin_refmac.log
-    srun --job-name=porin_refmac ccp4-python -c "import sys; sys.path.insert(0,'.'); from bendfinder import run_refinement; run_refinement('porin/altalign_test/aa_R32R.pdb', 'porin/altalign_test/aa_R32R.mtz', outdir='porin/altalign_test/refine', n_cycles=5, fill_fcalc=True)" >& $rlog
+    srun -c $NCPUS --job-name=porin_refmac ccp4-python -c "import sys; sys.path.insert(0,'.'); from bendfinder import run_refinement; run_refinement('porin/altalign_test/aa_R32R.pdb', 'porin/altalign_test/aa_R32R.mtz', outdir='porin/altalign_test/refine', n_cycles=5, fill_fcalc=True)" >& $rlog
 
     set rf = ""
     if (-d porin/altalign_test/refine) then

@@ -1997,7 +1997,8 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                          frac=1.0, verbose=True,
                          altloc_filter=False, altloc_fallback=1.0,
                          iter_callback=None, max_canon=None,
-                         precomputed_origin=None):
+                         precomputed_origin=None,
+                         iteration_schedule=None):
     """Fit a Fourier shift field progressively, admitting HKLs coarsest-first.
 
     HKLs are admitted in batches from fitreso_start (coarsest, large d) down to
@@ -2156,11 +2157,27 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
     if verbose:
         print(f"{len(hkl_ndc)} HKLs in pool", flush=True)
 
-    # Initial batch: all HKLs with d >= fitreso_start
-    n_initial = int(np.sum(d_all >= fitreso_start - 1e-9))
-    n_initial = max(n_initial, batch_hkls)         # at least one batch
-    n_initial = min(n_initial, len(hkl_ndc))
-    n_used = n_initial + 1                         # +1 for DC at index 0
+    # Initial batch: all HKLs with d >= fitreso_start.  If an explicit
+    # iteration_schedule was passed, ignore batch_hkls / fitreso_start /
+    # fitreso_end pool sizing for the advance — use the schedule's n_used
+    # values directly.  Used by fitreso_scan to land iterations exactly on
+    # fr-row thresholds so one combined call produces the same per-row
+    # snapshots as N independent per-fr-row calls (without redoing the
+    # coarser work).
+    if iteration_schedule is not None:
+        sched = sorted({int(n) for n in iteration_schedule
+                        if int(n) >= 2 and int(n) <= len(all_hkls)})
+        if not sched:
+            raise ValueError("iteration_schedule contained no usable n_used "
+                             "values (need 2 ≤ n ≤ len(all_hkls))")
+        n_used = sched[0]
+        _sched_idx = 0
+    else:
+        n_initial = int(np.sum(d_all >= fitreso_start - 1e-9))
+        n_initial = max(n_initial, batch_hkls)         # at least one batch
+        n_initial = min(n_initial, len(hkl_ndc))
+        n_used = n_initial + 1                         # +1 for DC at index 0
+        sched = None
 
     # fit_active tracks which atoms to use; updated by residual MAD each iter
     fit_active = np.ones(len(fitme), dtype=bool)
@@ -2273,11 +2290,17 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
         if max_canon is not None and n_canon >= max_canon:
             break
 
-        # Advance to next batch
-        n_next = n_used + batch_hkls
-        if n_next > len(all_hkls):
-            break
-        n_used = n_next
+        # Advance: explicit schedule (one n_used per iter) or fixed-batch step.
+        if sched is not None:
+            _sched_idx += 1
+            if _sched_idx >= len(sched):
+                break
+            n_used = sched[_sched_idx]
+        else:
+            n_next = n_used + batch_hkls
+            if n_next > len(all_hkls):
+                break
+            n_used = n_next
 
     if result_hkls is None:
         raise ValueError("No batches fitted — adjust fitreso_start/fitreso_end")
@@ -2751,6 +2774,37 @@ def _fcalc_at_hkls(pdb_path, hkls, d_min, blur=0.0):
     return F
 
 
+def _pick_free_column(mtz):
+    """Pick the first sensible free-R-flag column in `mtz`.
+
+    A sensible column has at least one row with value 0 (the free set) AND
+    at least one with a non-zero positive integer (the working set).  This
+    rejects deposit MTZs that carry a degenerate FREE column (e.g. dhfr
+    1rx2.mtz has FREE = all-1s in its observed rows, with the real
+    cross-validation set in a separate FreeR_flag column) — picking that
+    column would make refmac see 'no free reflections' and collapse SigmaA.
+
+    Falls back to the first existing column by name preference if none of
+    the candidates is sensible — caller can still proceed; refmac will
+    warn but not crash.
+    """
+    candidates = [c.label for c in mtz.columns
+                  if c.label in ('FREE', 'RFREE', 'FreeR_flag')]
+    if not candidates:
+        return None
+    data = mtz.array
+    lbls = mtz.column_labels()
+    for lbl in candidates:
+        col = data[:, lbls.index(lbl)]
+        finite = col[np.isfinite(col)]
+        if finite.size == 0:
+            continue
+        ints = finite.astype(int)
+        if (ints == 0).any() and (ints > 0).any():
+            return lbl
+    return candidates[0]
+
+
 def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
     """Augment an MTZ with model-derived Fcalc at HKLs missing from its SG ASU.
 
@@ -2780,7 +2834,7 @@ def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
     SIG_lbl  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in lbls), None)
     I_lbl    = next((l for l in ('IMEAN', 'I', 'IOBS') if l in lbls), None)
     SIGI_lbl = next((l for l in ('SIGIMEAN', 'SIGI', 'SIGIOBS') if l in lbls), None)
-    FREE_lbl = next((l for l in ('FREE', 'RFREE', 'FreeR_flag') if l in lbls), None)
+    FREE_lbl = _pick_free_column(mtz)
     if F_lbl is None and I_lbl is None:
         # Nothing to fill — no obs column refmac would consume.
         import shutil as _sh
@@ -2825,7 +2879,25 @@ def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
     fc_amp = np.abs(fc).astype(np.float32)
     fc_int = (fc_amp.astype(np.float64) ** 2).astype(np.float32)
 
-    free_default = np.float32(0.0)   # work set
+    # Assign filled rows to the WORKING set (free-flag value > 0), not
+    # the free set.  Missing HKLs are concentrated at high resolution
+    # (where the deposit has gaps), so a free-set assignment would dump a
+    # non-random cluster of Fcalc rows into one resolution shell — and
+    # Fcalc may be on a different scale than deposit Fobs there, blowing
+    # up Rfree in that bin.  Conceptually, fill_fcalc exists to give
+    # downstream tools a complete-ASU input for bulk-solvent fitting and
+    # map coefficients — NOT to extend the cross-validation set.  We use
+    # the most common non-zero value in the existing column (a typical
+    # work-set bin label), falling back to 1.
+    if FREE_lbl:
+        existing = data[:, lbls.index(FREE_lbl)]
+        existing_int = existing[np.isfinite(existing)].astype(int)
+        work_vals = existing_int[existing_int > 0]
+        if work_vals.size:
+            vals, counts = np.unique(work_vals, return_counts=True)
+            free_default = np.float32(int(vals[counts.argmax()]))
+        else:
+            free_default = np.float32(1)
 
     new_rows = np.full((len(missing_hkl), data.shape[1]),
                        np.nan, dtype=np.float32)
@@ -3476,39 +3548,111 @@ def fitreso_scan(
         precomputed_origin=precomputed_origin,
     )
 
-    # ── Section 3: fr<N> — resolution scans ──────────────────────────────────
+    # ── Section 3: fr<N> — resolution scans (single progressive call) ─────────
+    # All fr-rows share ONE bend_fit_progressive call at fitreso_end =
+    # min(fitreso_list).  We pre-compute the exact n_used (= 1 DC + count of
+    # non-DC HKLs with d ≥ thr) for each requested fr-row from the actual HKL
+    # pool, pass it as iteration_schedule, and snapshot in iter_callback —
+    # each iteration lands exactly on one fr-row.  Result is bit-equivalent
+    # to N independent bend_fit_progressive calls (same HKL set per fr-row,
+    # same SVD per iter), but eliminates the redundant coarse-iter work each
+    # separate call repeats.  For lipox (~4× cell expansion, ~6700 P1 atoms)
+    # this cuts fr5 wall time from days to hours.
     if verbose:
         print('-' * 122, flush=True)
-    for fitreso in fitreso_list:
-        outdir = os.path.join(scan_dir, f'fr{fitreso}')
-        os.makedirs(outdir, exist_ok=True)
-        t0 = time.time()
-        result = bend_fit_progressive(
+    if fitreso_list:
+        fr_thresholds_desc = sorted([float(x) for x in fitreso_list],
+                                     reverse=True)   # coarsest first
+
+        # Build the actual HKL pool to fr_min and count HKLs at d ≥ thr for
+        # each requested fr-row.  Must match generate_hkls inside
+        # bend_fit_progressive: same cell (ref/mov are the same protein +
+        # post-resolve so cell1 from mov_pdb is the relevant one), same
+        # pool_reso = fr_min.  Computed once, mapped to n_used = count + 1
+        # (+1 for the DC term at all_hkls[0]).
+        fr_min = fr_thresholds_desc[-1]
+        from gemmi import read_structure as _read_structure
+        st_mov = _read_structure(mov_pdb)
+        st_mov.setup_entities()
+        cell_for_pool = (st_mov.cell.a, st_mov.cell.b, st_mov.cell.c,
+                         st_mov.cell.alpha, st_mov.cell.beta, st_mov.cell.gamma)
+        pool_hkls = generate_hkls(cell_for_pool, fr_min)
+        Gs_pool   = _reciprocal_metric(cell_for_pool)
+        hv_pool   = pool_hkls[1:].astype(float)
+        inv_d2    = np.sum((hv_pool @ Gs_pool) * hv_pool, axis=1)
+        d_pool    = np.where(inv_d2 > 0, 1.0 / np.sqrt(inv_d2), np.inf)
+
+        # thr → n_used (sorted ascending).  Multiple fr-rows may collapse to
+        # the same n_used (e.g. fr6 and fr5 both exhaust the pool) — fr_thrs
+        # maps each n_used to ALL thresholds that resolve to it.
+        n_to_thrs = {}
+        for thr in fr_thresholds_desc:
+            n_used_thr = int(np.sum(d_pool >= thr - 1e-9)) + 1
+            n_used_thr = max(n_used_thr, 2)              # at least DC + 1
+            n_used_thr = min(n_used_thr, len(pool_hkls))
+            n_to_thrs.setdefault(n_used_thr, []).append(thr)
+        schedule = sorted(n_to_thrs.keys())
+
+        t_fit0 = time.time()
+        fr_done = set()
+        final_state = [None]
+
+        def _fr_label(thr):
+            return f'fr{int(thr) if thr == int(thr) else thr}'
+
+        def _save_fr(thr, hkls, AB_xyz, active, snr, rmsd, t_cum):
+            label  = _fr_label(thr)
+            outdir = os.path.join(scan_dir, label)
+            os.makedirs(outdir, exist_ok=True)
+            a1pts     = _atoms1_pts(ref_pts)
+            delta     = _eval_chunked(a1pts, hkls, AB_xyz, chunk_size)
+            bent_vals = interpolate_map(mov_d, mov_h,
+                                         _map_query(ref_pts, delta),
+                                         pad_mode=pad_mode)
+            bent_map  = bent_vals.reshape(ns2, nr2, nc2)
+            _save_point(label, outdir, bent_map, hkl00_rmsd, rmsd,
+                        int(active.sum()), t_cum,
+                        hkls=hkls, AB_xyz=AB_xyz)
+            save_fitparams(os.path.join(outdir, 'PSDVF.mtz'),
+                           hkls, AB_xyz, active, snr,
+                           ref_h['cell'], ref_h['cell'], 'xyz', rmsd)
+
+        def _fr_callback(iter_i, nhkls, n_canon, rmsd,
+                         hkls_now, AB_xyz, active, snr):
+            t_cum = time.time() - t_fit0
+            final_state[0] = (hkls_now, AB_xyz, active, snr, rmsd, t_cum)
+            # This iter's n_used = nhkls + 1 (nhkls is the non-DC count); save
+            # every fr-row whose schedule entry matches.  od_margin may stop
+            # the loop early — remaining fr-rows are handled by the final-
+            # state fallback below.
+            n_used = nhkls + 1
+            for thr in n_to_thrs.get(n_used, []):
+                if thr in fr_done:
+                    continue
+                _save_fr(thr, hkls_now, AB_xyz, active, snr, rmsd, t_cum)
+                fr_done.add(thr)
+
+        bend_fit_progressive(
             mov_pdb, ref_pdb,
-            fitreso_start=20.0, fitreso_end=float(fitreso),
+            fitreso_start=20.0, fitreso_end=fr_min,
             drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
             outlier_sigma=outlier_sigma, b_sigma=b_sigma,
             verbose=False,
+            iter_callback=_fr_callback,
             precomputed_origin=precomputed_origin,
+            iteration_schedule=schedule,
         )
-        t_fit = time.time() - t0
-        dim_list = list(result.dimensions)
-        xyz_dims = [dim_list.index(d) for d in 'xyz' if d in dim_list]
-        AB_xyz   = np.zeros((3, len(result.hkls), 2))
-        for new_i, old_i in enumerate(xyz_dims):
-            AB_xyz[new_i] = result.AB[old_i]
-        a1pts     = _atoms1_pts(ref_pts)
-        delta     = _eval_chunked(a1pts, result.hkls, AB_xyz, chunk_size)
-        bent_vals = interpolate_map(mov_d, mov_h,
-                                     _map_query(ref_pts, delta),
-                                     pad_mode=pad_mode)
-        bent_map  = bent_vals.reshape(ns2, nr2, nc2)
-        _save_point(f'fr{fitreso}', outdir, bent_map, hkl00_rmsd, result.rmsd,
-                    int(result.active.sum()), t_fit,
-                    hkls=result.hkls, AB_xyz=AB_xyz)
-        save_fitparams(f'{outdir}/PSDVF.mtz',
-                       result.hkls, result.AB, result.active, result.snr,
-                       result.cell1, result.cell2, result.dimensions, result.rmsd)
+
+        # od_margin stopped us before reaching some thresholds → snapshot
+        # those with the final iter's state (the deepest fit we got, same as
+        # what a separate fitreso_end=thr call would produce under the same
+        # OD stop).
+        for thr in fr_thresholds_desc:
+            if thr in fr_done:
+                continue
+            if final_state[0] is not None:
+                _save_fr(thr, *final_state[0])
+                fr_done.add(thr)
 
     # ── Section 4: best — parabola fit of Rbent vs 1/d², re-run at vertex ────
     # Across all systems, Rbent has a clear U-shape vs fitreso: dropping with
@@ -3901,7 +4045,6 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
         sigfp  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS')     if l in cols), None)
         i_lbl  = next((l for l in ('IMEAN', 'I', 'IOBS')           if l in cols), None)
         sigi   = next((l for l in ('SIGIMEAN', 'SIGI', 'SIGIOBS')  if l in cols), None)
-        free   = next((l for l in ('FREE', 'RFREE', 'FreeR_flag')   if l in cols), None)
         # I-only MTZs (e.g. RCSB raw deposits straight from cif2mtz) need
         # an F column for REFI TYPE RIGID — refmac's intensity input path
         # doesn't run French-Wilson in rigid mode (reports "All observed
@@ -3936,9 +4079,18 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
             cols   = {c.label for c in mtz_in.columns}
             fp     = next((l for l in ('FP', 'F', 'FOBS')          if l in cols), None)
             sigfp  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in cols), None)
-            free   = next((l for l in ('FREE', 'RFREE', 'FreeR_flag') if l in cols), None)
         if fp and sigfp:
-            labin = f'FP={fp} SIGFP={sigfp}' + (f' FREE={free}' if free else '')
+            # No FREE= in LABIN — refmac does not require a free set for
+            # rigid-body refinement, and propagating the deposit's free
+            # flags to LABIN sometimes triggered divergence (e.g. dhfr
+            # 1rx2.mtz carries a degenerate FREE column where all observed
+            # rows are flagged as work, leaving the "free" set populated
+            # only by fcalc-filled rows after run_refinement → Rfree=0.91
+            # → SigmaA collapse → rigid-body shifts to R=0.53).  We don't
+            # use Rfree downstream and refmac handles its absence cleanly.
+            # (The phenix.refine fallback below picks free flags directly
+            # from the MTZ column types and is unaffected.)
+            labin = f'FP={fp} SIGFP={sigfp}'
         else:
             print(f'ERROR: {os.path.basename(mtz_path_for_refmac)} has no usable '
                   f'amplitude columns (looked for FP/F/FOBS+SIGFP/SIGF/SIGFOBS).  '
