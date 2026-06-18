@@ -6,7 +6,7 @@
 #   1. test_symm_all_sgs.py     — 65 Sohncke SGs symmetry constraint check
 #   2. magdoff/test_magdoff.py  — synthetic 0.5deg deformation recovery
 #
-# Examples (fitreso_scan from raw, scan_test/ subdir per system):
+# Examples (fitreso_scan from raw, scan_fitreso_test/ subdir per system):
 #   3. lyso     3aw6 -> 3aw7   P4(3)2(1)2
 #   4. dhfr     1rx2 -> 1rx1   P2(1)2(1)2(1)
 #   5. raddam   5kxk -> 5kxl   P4(3)2(1)2   subtract=bent
@@ -14,7 +14,8 @@
 #   7. raddam   5kxk -> 5kxn   P4(3)2(1)2   subtract=bent
 #   8. myoglobin 1mbo -> 1a6m  P2(1)
 #   9. insulin  4fg3 -> 4e7u   H3           fill_fcalc=True
-#  10. lipox    9o4s -> 9o4t   P2(1)        cross-cell (~4% expansion);
+#  10. lipox    9o4s -> 9o4t   P2(1)        same crystal, just distorted
+#                                            (~4% metric drift in a/b/c);
 #                                            exercises stretch + loose-tol
 #                                            altindex reindex of mov Fobs
 #  11. porin    altalign 3poq->3pou + refmac on the R32:R output
@@ -134,7 +135,7 @@ foreach spec ( \
     set fill  = $parts[8]
     set tag   = $parts[9]
     if ("$tag" == "''") set tag = ""
-    set scan = scan_test$tag
+    set scan = scan_fitreso_test$tag
     @ i++
     set log = $logdir/`printf "%02d" $i`_$label.log
 
