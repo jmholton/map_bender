@@ -66,62 +66,69 @@ print(f"CA RMSD: {result.rmsd:.3f} Å")
 
 All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`).
 
-### Python version (`bendfinder.py`)
+### Latest version (`bendfinder.py`)
 
-| System | Datasets | Space group | CA pairs | fr5 RMSD | fr5 Rbent | best Rbent | d_opt |
-|--------|----------|-------------|----------|----------|-----------|------------|-------|
-| Lysozyme (humidity-driven cell change) | 3aw6 → 3aw7 | P4₃2₁2 | 1008 | **0.033 Å** | 33.2% | 30.3% | 9.7 Å |
-| DHFR | 1rx2 → 1rx1 | P2₁2₁2₁ | 592 | **0.070 Å** | 41.5% | 37.7% | 12.6 Å |
-| Myoglobin | 1mbo → 1a6m | P2₁ | 294 | **0.063 Å** | 49.8% | 49.8% | 5.5 Å |
-| Lysozyme raddam | 5kxk → 5kxl | P4₃2₁2 | 976 | **0.087 Å** | 21.9% | 11.5% | 20 Å (clamped) |
-| Lysozyme raddam | 5kxk → 5kxm | P4₃2₁2 | 984 | **0.047 Å** | 19.2% |  9.9% | 20 Å (clamped) |
-| Lysozyme raddam | 5kxk → 5kxn | P4₃2₁2 | 992 | **0.048 Å** | 24.1% | 17.8% | 20 Å (clamped) |
-| Insulin T→R | 4fg3 → 4e7u | H3 | 801 | **0.510 Å** | 60.3% | 60.5% | 5.8 Å |
-| Porin | 3poq → 3pou | H 3 2 | 340 | **0.366 Å** | 57.7% | 57.8% | 9.5 Å |
+Numbers below come from the 2026-06-16 full-gamut run on one octamus1 node
+(`./run_all_tests.com` with 64-CPU pthreaded OpenBLAS for the SVDs).
+Pre-bend RMSD/Rfac are the `hkl00` baseline (no shift field applied,
+moving map resampled onto reference grid only). Best RMSD/Rbent and the
+top revealed peak are from the parabola-vertex re-fit at `d_opt`.
 
-`fr5 RMSD` and `fr5 Rbent` are the values at the finest resolution
-admitted (5 Å); `best Rbent` and `d_opt` come from the parabola-fit
-re-run (see [Best d_opt parabola fit](#best-d_opt-parabola-fit) below).
-Insulin requires `fill_fcalc=True` because both deposited MTZs are
-below 99% SG-ASU complete; porin runs end-to-end with the
-in-bendfinder altindex resolution (the obverse/reverse 2-fold for the
-H 3 2 pair) — see [Obverse/reverse and altalign.py](#obversereverse-and-altalignpy)
-for the dual-solution writer when you need an R 3 2:R MTZ for
-downstream refinement.
+| System | Datasets | Pre-bend RMSD | Pre-bend Rfac | Best RMSD | Best Rbent | Top peak revealed | Wall |
+|--------|----------|---------------|---------------|-----------|------------|-------------------|------|
+| Lysozyme (humidity) | 3aw6 → 3aw7 | 0.76 Å | 53.3% | **0.071 Å** | **30.2%** | −4.1σ A/24SER/N (surface water) | 26 min |
+| DHFR | 1rx2 → 1rx1 | 0.45 Å | 43.1% | **0.176 Å** | **37.8%** | −8.2σ A/357HOH/O (water) | 4 min |
+| Myoglobin | 1mbo → 1a6m | 0.31 Å | 55.7% | **0.062 Å** | **50.0%** | −39.4σ A/154HEM/FE (heme iron) | 6 min |
+| Lysozyme raddam | 5kxk → 5kxl | 0.12 Å | 11.0% | **0.114 Å** | **11.5%** | −11.1σ A/115CYS/SG (disulfide damage) | 18 min |
+| Lysozyme raddam | 5kxk → 5kxm | 0.08 Å | 9.4%  | **0.080 Å** | **9.9%**  | +5.5σ A/105MET/SD (Met oxidation) | 19 min |
+| Lysozyme raddam | 5kxk → 5kxn | 0.11 Å | 18.1% | **0.099 Å** | **17.7%** | −14.7σ A/94CYS/SG (disulfide damage) | 26 min |
+| Insulin T→R | 4fg3 → 4e7u | 2.31 Å | 85.5% | **0.678 Å** | **64.4%** | −46.7σ D/101ZN/ZN (T→R Zn shift) | 16 min |
+| Lipoxygenase (cross-cell) | 9o4s → 9o4t | 1.08 Å | 63.6% | **0.206 Å** | **55.0%** | +7.4σ A/91MET/CG (Met sidechain) | ~1 h¹ |
+| Porin | 3poq → 3pou | 3.14 Å | 73.6% | **0.369 Å** | **57.8%** | +10.3σ A/244PHE/CB (Phe sidechain) | ~72 min |
 
-The radiation-damage systems gain 8–13 Rbent points from the parabola
-because the damage signal is purely low-frequency — `d_opt` clamps to
-the coarsest scan point (20 Å) where the smooth shift field captures
-the bulk swelling and the high-frequency HKLs only add noise.
-Conversely, insulin's T→R conformational change exceeds the smooth-
-PSDVF model (LEU B6 shifts ~8 Å), so no fitreso choice helps and the
-parabola vertex collapses near fr5.
+¹ Lipoxygenase took ~3.5 h in the 2026-06-16 gamut because the cluster
+was contended overnight; a standalone run on a quiet node lands near
+the 1 h mark. The other systems are within the ~5-minute variability you
+get from scheduler jitter on the shared node.
 
-### vs prototype (tcsh + gnuplot)
+What the columns mean:
 
-| System | Prototype RMSD | Prototype time | Python RMSD | Python time | Speedup |
-|--------|---------------|----------------|-------------|-------------|---------|
-| Lysozyme 3aw6/3aw7 | 0.209 Å | 2938 s | 0.033 Å | 118 s | **25×** |
-| Myoglobin 1mbo/1a6m | 0.229 Å | 237 s | 0.060 Å | 106 s | **2×** |
-| Raddam 5kxk→5kxl | 0.177 Å | 643 s | 0.082 Å | ~550 s | **same speed, 2× better** |
-| Raddam 5kxk→5kxm | 0.165 Å | 506 s | 0.046 Å | ~575 s | **3.6× better** |
-| Raddam 5kxk→5kxn | 0.220 Å | 558 s | 0.055 Å | ~580 s | **4× better** |
+- **Pre-bend**: the moving map resampled onto the reference grid with
+  zero shift (`hkl00` row of the scan). This is the baseline that
+  bendfinder has to improve on.
+- **Best**: the result of the parabola-vertex re-fit at the optimal
+  fitting resolution `d_opt` (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
+  below). Inside the scan log this is the `best` row, computed by
+  fitting `Rbent` vs `1/d²` across the `fr20`…`fr5` rows and re-running
+  `bend_fit_progressive` at the vertex.
+- **Top peak revealed**: largest |σ| feature in the post-bend
+  difference map at the best scan point. Sign convention is
+  `subtract='ref'` by default (positive σ = density present in bent
+  but absent from ref); raddam runs use `subtract='bent'` (positive =
+  density appearing with dose).
+- **Wall**: total time for that test's slot in the gamut, measured
+  between successive log file mtimes.
 
-The lysozyme comparison is against the gold-standard prototype run (order 5, 91 HKLs, 71.9% vs 84.2% relative humidity causing ~2.5% cell contraction). The Python version achieves 6× better RMSD in 1/25th the time, primarily because:
-- Linear (A, B) parameterisation allows all HKLs to be fitted simultaneously via SVD
-- Space-group symmetry constraints reduce free parameters ~8× for P4₃2₁2
-- No incremental gnuplot fitting loop required
+Read each row as "after bending, how close did we get and what was the
+first thing the difference map could no longer hide". The radiation-
+damage systems clamp at `d_opt = 20 Å` (the coarsest scan point) — the
+damage signal is purely low-frequency, so finer HKLs only add noise.
+Insulin's T→R transition exceeds the smooth-PSDVF model (LEU B6 shifts
+~8 Å between T and R), so no fitreso choice helps and the residual is
+honestly the T→R Zn site. Lipoxygenase is the canonical cross-cell test
+(same SG, ~4 % cell expansion); the pipeline stretches the moving cell
+into the reference, picks up an alt-index 180°-about-z, and rigid-body
+re-refines before bending. Porin is the obverse↔reverse R-lattice case;
+the in-bendfinder altindex pass picks the right 2-fold and the scan
+runs cleanly afterwards.
 
-The myoglobin prototype used nhkls=100; the Python version naturally fits more HKLs (401) before the overdetermination ratio stops it, contributing to the lower RMSD.
-
-### Prototype convergence (lysozyme 3aw6/3aw7, for reference)
-
-| HKLs fitted | RMSD(CA) | Time  | Old approach equivalent        |
-|-------------|----------|-------|-------------------------------|
-| 5           | 0.327 Å  | 9 s   | Order 2 (19 HKLs)             |
-| 20          | 0.245 Å  | 580 s | Order 3 (37 HKLs)             |
-| 26          | 0.215 Å  | 1070 s| Order 4 (61 HKLs)             |
-| 30          | 0.211 Å  | 1503 s| Order 5 (91 HKLs, 2938 s)    |
+Insulin, lipoxygenase, and porin all need `fill_fcalc=True` because
+their deposited MTZs are below 99 % SG-ASU complete; without it
+refmac inherits the gaps and `bent.mtz` shows missing-HKL chunks in
+Coot. For porin you can also run `altalign.py` directly to get a
+refmac-ready R 3 2 :R output — see
+[Obverse/reverse and altalign.py](#obversereverse-and-altalignpy)
+below.
 
 ## Synthetic validation (Magdoff tests)
 
@@ -184,7 +191,7 @@ The shift field must respect the crystallographic symmetry of the space group:
 |------|-------------|
 | `bendfinder.py` | Main Python module |
 | `altalign.py` | Standalone LSQ altindex+origin search; dual-solution writer for R-lattice non-normalizing ops (H32+SYMM and R32:R outputs) |
-| `bendfinder.com` | Prototype tcsh script (historical reference) |
+| `run_all_tests.com` | Full 11-test gamut runner (test_symm + magdoff + 8 example scans + porin altalign+refmac) |
 | `origins.com` | Helper: test symmetry origin choices |
 | `examples/3aw6_3aw7/` | Lysozyme canonical example data |
 | `LICENSE` | License |
@@ -225,14 +232,104 @@ Across every example system the Rbent-vs-fitreso curve is a clear U: it drops as
 
 Empirically (May 2026 reference runs) `d_opt` sits in the 8–13 Å band for the bend-friendly systems and collapses to the coarsest scan point for radiation-damage signal (low-frequency only).
 
-### Obverse/reverse and `altalign.py`
+## Altindex and origin search
 
-For pairs in R-lattice space groups (R3, R32, R3m, etc., in their hexagonal H setting), the aligning altindex operation can be metric-preserving but not a normalizer of the space group — it flips obverse↔reverse centering. `bendfinder.py` handles this transparently for the scan itself (the conjugate setting is benign as long as both moving and reference end up on the same grid), but downstream refmac on the reindexed moving MTZ may need the data in rhombohedral primitive (R 3 2 :R) form.
+Before the shift field can do anything useful, the two crystals have to
+be put in the same setting: same fractional origin, same point-group
+orbit, and (if the cells differ even slightly) the same metric. PDB
+deposits routinely violate all three. The same protein, redetermined in
+the same crystal habit, can land at a different cell-origin choice, a
+chain-letter swap that's actually just an in-SG symop, an alternate
+indexing choice that picks one Laue mate over another, or a few-percent
+cell rescaling that makes two near-isomorphous datasets look like
+different forms. Bendfinder ships an internal `resolve_altindex` step
+that handles all four; `altalign.py` is the standalone equivalent.
 
-`altalign.py` is a standalone tool that does the LSQ-based altindex+origin search and, for non-normalizing R-lattice ops, writes *both* output settings: `<stem>_H32.{pdb,mtz}` (hexagonal axes preserved) and `<stem>_R32R.{pdb,mtz}` (rhombohedral primitive, gemmi+refmac native).
+### Algorithm
+
+Both paths share the same enumeration kernel
+(`_enum_alt_rot_origin_candidates` in `bendfinder.py`):
+
+1. Match CA atoms by (chain, residue, atom name) → arrays `A`
+   (moving) and `B` (reference); compute pre-fit RMSD and the Kabsch
+   LSQ rigid-body floor as cross-checks.
+2. Enumerate every integer basis-change matrix `M` (entries in
+   `{−1, 0, 1}`, `|det M| ≤ 1`), build the alt-cell metric
+   `G_alt = M G Mᵀ`, look up catalog space groups of that crystal
+   system, and conjugate each catalog op back to the original frame as
+   `R = Mᵀ R_alt M⁻ᵀ`, `t = Mᵀ t_alt`. Keep only candidates whose
+   `R` is integer in `{−1, 0, 1}` with denominators in `{1, 2, 3}` for
+   `t`, and whose `R` preserves the cell metric.
+3. Rank each candidate by post-transform CA RMSD.
+
+`resolve_altindex` then picks one of four actions on the rank-1 op:
+
+| Action | Trigger | What it does |
+|--------|---------|--------------|
+| `none` | no candidate beats `0.7 × baseline` | leaves mov as-is |
+| `origin_only` | `R = I` and \|t\| > 0.01 | translates PDB; phase-shifts MTZ by `exp(−2πi h·t)` (no re-refinement) |
+| `sg_op_origin` | `R` is already a symop of the SG | applies `(R, t)` to PDB cartesian and to MTZ via the SF theorem `F'(h) = F(R^T h)·exp(2πi h·t)` (no re-refinement; \|F\| is SG-symmetric so the lookup is a no-op on amplitudes) |
+| `altindex_refine` | `R ≠ I` and `R ∉ SG` | applies `R, t_cart_opt` to PDB cartesian; reindexes MTZ Fobs by `R`; re-refines with refmac to regenerate map coefficients |
+
+Two extensions matter for non-trivial pairs:
+
+- **Cell-stretch pre-step.** When the moving and reference cells
+  don't match (`_cells_match` returns False), `resolve_altindex` first
+  re-orthogonalizes the moving model into the reference cell —
+  fractional coordinates preserved — and relabels the moving MTZ's
+  cell record. The isomorphous distortion is absorbed as a uniform
+  elastic stretch, leaving only the genuine alt-indexing rotation +
+  origin difference for the enumerator. The moving experimental Fobs
+  is preserved through this step.
+- **Loose metric tolerance for stretched pairs.** Same-cell pairs
+  enumerate with `metric_tol_rel = 1e-6`. After a cell stretch the
+  tolerance loosens to 5 %, surfacing operations that are
+  metric-preserving in a nearby higher-symmetry holohedry the
+  deposited cell only approximates. For lipoxygenase this is exactly
+  the alt-cell 180°-about-z that the strict 1e-6 tolerance would
+  reject.
+
+### What the gamut pairs actually need
+
+For most pairs the answer is trivial — the deposits are already
+aligned. For four of the nine they aren't:
+
+| Pair | SG | Action | Op chosen | What was hiding |
+|------|----|--------|-----------|-----------------|
+| Lysozyme 3aw6 → 3aw7 | P 4₃2₁2 | `origin_only` | `t = (−0.007, −0.003, +0.007)` | Sub-cell origin offset from a humidity-driven 2.5 % cell contraction. |
+| Insulin 4fg3 → 4e7u | H 3 | `sg_op_origin` | `R ∈ H 3 symops`, `t ≈ (0.02, 0.006, ⅓)` | The two deposits chose different H 3-equivalent ASUs along the 3-fold axis. SF theorem applies the (R, t) cleanly without re-refining. |
+| Porin 3poq → 3pou | H 3 2 | `altindex_refine` | `R = [[0,−1,0],[−1,0,0],[0,0,−1]]`, `t = (⅓, −⅓, 0)` | The obverse↔reverse 2-fold. Metric-preserving but **not** a normalizer of H 3 2, so the reindexed moving crystal lands in the conjugate (reverse-H) setting — benign for the scan but awkward for refmac. See "altalign.py and the dual-solution writer" below. |
+| Lipoxygenase 9o4s → 9o4t | P 2₁ | cell-stretch + `altindex_refine` | `R = diag(−1, −1, +1)`, `drot ≈ 0.00°` from LSQ | This pair is **not** different crystal forms — it's the same crystal habit (same SG, same general cell layout) at such extreme non-isomorphism (a 92.0→96.0, b 93.0→94.5, c 49.0→50.5, β 92.7→91.2°) that the deposited cells look like a form change. The monoclinic cell is nearly orthorhombic, so the alt-cell 180°-about-z is metric-preserving only at 5 % tolerance; once stretched, that op aligns mov to ref at drot=0.00°. Moving Fobs is preserved through the reindex + refmac rigid-body step. |
+
+For DHFR, the three radiation-damage pairs, and myoglobin the search
+ran but found no candidate that beats 0.7 × baseline (DHFR / raddam:
+already aligned, action `none`), or returned identity (myoglobin: cells
+differ slightly but no rotation or translation needed beyond the
+stretch).
+
+### `altalign.py` — standalone diagnostic and dual-solution writer
+
+`altalign.py` runs the same enumeration kernel as a standalone tool
+and prints the top-N ranked candidate list, the LSQ floor, the
+chosen op, and (for non-normalizing R-lattice ops) writes dual outputs.
 
 ```
 ccp4-python altalign.py mov.pdb ref.pdb [out.pdb] [mov.mtz] [out.mtz]
 ```
 
-Verified on the porin 3poq→3pou pair: refmac rigid completes at R=0.37 on the R 3 2 :R output.
+Use it when you want a diagnostic view of the candidate ranking
+(altalign emits the full top-15 with discrete RMSD, drot vs LSQ, and
+comfit RMSD per candidate) or when you need the dual-solution writer
+for R-lattice non-normalizing ops. For porin and similar
+obverse/reverse cases, altalign emits both `<stem>_H32.{pdb,mtz}`
+(hexagonal axes preserved; data is in the conjugate reverse-H setting,
+needs `mtzutils` to swap SYMM records before refmac) and
+`<stem>_R32R.{pdb,mtz}` (rhombohedral primitive, gemmi + refmac
+native — setting-unambiguous). Refmac rigid completes at R=0.37 on
+the porin R 3 2 :R output.
+
+For cross-pair near-isomorphism (lipox-style), `altalign.py` does
+**not** do the cell-stretch pre-step or relax metric tolerance, so it
+will miss the alt-cell op that `resolve_altindex` finds. If you're
+diagnosing a same-habit non-isomorphous pair, run `fitreso_scan`
+directly and read the `resolve_altindex:` block in `scan_fitreso.log`.
