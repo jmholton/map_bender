@@ -3,34 +3,45 @@
 """altalign.py - standalone alternate-indexing + origin search.
 
 Finds the crystallographic (altindex x symop x origin) transformation that
-best aligns a moving crystal onto a reference crystal, using an LSQ-based
-solver:
+best aligns a moving crystal onto a reference crystal.  Mirrors the same
+pipeline bendfinder's internal `resolve_altindex` uses, so a standalone
+altalign run picks the same op the full fitreso_scan would have picked:
 
-  1. Kabsch rigid-body fit of matched CA atoms -> continuous R_lsq, t_lsq.
-  2. Enumerate discrete (altindex x symop x origin) candidates via
-     bendfinder's basis-change altindex enumeration (_get_altindex_ops)
-     + the SG's own symops + an origin grid.
-  3. Score every candidate two ways, both in honest cartesian RMSD (no
-     per-atom fractional wrapping):
-       - discrete:  apply R_cart + the exact crystallographic t.
-       - comfit:    apply R_cart + the COM-optimal continuous t (= the
-                    best rigid placement for that fixed rotation).
-  4. Rank by rotational deviation from R_lsq; among the rotation-matched
-     candidates, the comfit RMSD is the residual the bender must absorb,
-     and the discrete RMSD tells you whether the exact crystallographic
-     op alone is good enough to hand straight to refmac.
-
-The point of keeping this standalone: iterate on the altindex/origin
-search without running a full fitreso scan each time.
+  1. Cell-stretch pre-step.  If the moving and reference cells differ at
+     all, re-orthogonalize the moving model into the reference cell with
+     fractional coordinates preserved (and relabel the MTZ cell to match).
+     This absorbs the isomorphous distortion as a uniform elastic stretch
+     so the discrete enumeration sees a metric-matched pair.
+  2. Kabsch rigid-body fit of matched CA atoms -> continuous R_lsq.
+  3. Enumerate discrete (altindex x symop x origin) candidates via the
+     basis-change altindex enumeration (_get_altindex_ops) + the SG's own
+     symops + an origin grid.  Strict 1e-6 metric-preservation tolerance
+     for same-cell pairs; loose 5% tolerance after a cell stretch to
+     surface ops that hold in a nearby higher-symmetry holohedry the
+     deposited cell only approximates.
+  4. Score every candidate two ways, both in honest cartesian RMSD:
+       - continuous: COM-optimal continuous t (the theoretical floor for
+                     that rotation).  This is what bendfinder ranks by.
+       - discrete:   the exact crystallographic translation.  Carried as
+                     a diagnostic — if the discrete RMSD is close to the
+                     continuous floor, the op is clean as-is; if not, the
+                     remaining offset is sub-cell continuous and bendfinder
+                     would absorb it via the COM-optimal t_cart_opt.
+  5. Action gate on the rank-1 candidate (matches resolve_altindex):
+       - none           : no candidate beats 0.7 x baseline
+       - origin_only    : R = I, |t| > 0.01 (PDB translate + MTZ phase shift)
+       - sg_op_origin   : R is in the SG (PDB+MTZ via SF theorem; no refmac)
+       - altindex_refine: R != I and R not in SG (PDB cartesian transform
+                          + MTZ reindex by R; --refine optionally chains
+                          run_refinement; for non-normalizing R-lattice
+                          ops also emits R32:R dual output)
 
 Usage:
     ccp4-python altalign.py <moving.pdb> <reference.pdb> \
-        [out.pdb] [moving.mtz] [out.mtz]
+        [out.pdb] [moving.mtz] [out.mtz] [--refine] [--outdir DIR]
 
-If moving.mtz is given, the chosen discrete altindex op is applied to it
-via the structure-factor transformation theorem (F'(h) = F(Rᵀh)·e^{2πi h·t})
-so that the moving PDB and MTZ stay mutually consistent and refmac can be
-run on the pair as usual.
+If moving.mtz is given, the chosen op is applied to it so the PDB and MTZ
+stay mutually consistent.  --refine chains refmac5 after altindex_refine.
 """
 import os
 import sys
@@ -48,15 +59,49 @@ def _rot_angle_deg(R):
     return float(np.degrees(np.arccos(cos_t)))
 
 
-def search(mov_pdb, ref_pdb, max_M=1, det_max=1, verbose=True):
+def search(mov_pdb, ref_pdb, mov_mtz=None, outdir='.',
+           max_M=1, det_max=1, verbose=True):
     """Run the LSQ-based altindex+origin search.
 
+    Mirrors bendfinder's resolve_altindex enumeration semantics: cells
+    are matched via a stretch pre-step when they differ, and the metric
+    tolerance is loosened from 1e-6 to 5% post-stretch so the
+    same-habit-distorted-cell case (lipox-style) surfaces alt-cell ops
+    that strict tolerance would reject.
+
     Returns a dict with the LSQ baseline and a ranked candidate list.
-    Each candidate is a dict: R_frac, t_frac, R_cart, drot, rmsd_discrete,
-    rmsd_comfit, t_comfit_cart.
+    Each candidate is a dict: R_frac, t_frac, t_apply, t_opt_frac,
+    R_int, t_mod, R_cart, drot, rmsd_discrete, rmsd_continuous.
+
+    If a cell stretch was applied, `mov_pdb` and `mov_mtz` in the
+    returned dict point at the stretched copies in `outdir`; downstream
+    apply steps consume those rather than the originals.
     """
+    mov_st0 = gemmi.read_structure(mov_pdb)
+    ref_st  = gemmi.read_structure(ref_pdb)
+
+    # ── cell-stretch pre-step ─────────────────────────────────────────
+    stretched = False
+    if not bf._cells_match(mov_st0.cell, ref_st.cell):
+        os.makedirs(outdir, exist_ok=True)
+        s_pdb_stem = os.path.splitext(os.path.basename(mov_pdb))[0]
+        s_pdb = os.path.join(outdir, f'{s_pdb_stem}_stretched.pdb')
+        if verbose:
+            print(f"altalign: cells differ — stretching moving into "
+                  f"ref cell (fractions preserved)", flush=True)
+            print(f"  moving cell : {tuple(round(x, 3) for x in mov_st0.cell.parameters)}")
+            print(f"  ref    cell : {tuple(round(x, 3) for x in ref_st.cell.parameters)}",
+                  flush=True)
+        bf._stretch_pdb_to_cell(mov_pdb, ref_st.cell, s_pdb)
+        mov_pdb = s_pdb
+        if mov_mtz is not None:
+            s_mtz_stem = os.path.splitext(os.path.basename(mov_mtz))[0]
+            s_mtz = os.path.join(outdir, f'{s_mtz_stem}_stretched.mtz')
+            bf._relabel_mtz_cell(mov_mtz, ref_st.cell, s_mtz)
+            mov_mtz = s_mtz
+        stretched = True
+
     mov_st = gemmi.read_structure(mov_pdb)
-    ref_st = gemmi.read_structure(ref_pdb)
     A, B = bf._collect_matched_ca(mov_st, ref_st)
     if len(A) < 3:
         raise SystemExit(f"altalign: <3 matched CA between {mov_pdb} and {ref_pdb}")
@@ -69,6 +114,9 @@ def search(mov_pdb, ref_pdb, max_M=1, det_max=1, verbose=True):
     sg_name = mov_st.spacegroup_hm
     O, Finv = bf._ortho_pair(cell)
     G = O.T @ O
+    A_frac = (Finv @ A.T).T
+    B_frac = (Finv @ B.T).T
+    metric_tol_rel = 0.05 if stretched else 1e-6
 
     if verbose:
         print(f"altalign: {mov_pdb}  ->  {ref_pdb}")
@@ -76,10 +124,8 @@ def search(mov_pdb, ref_pdb, max_M=1, det_max=1, verbose=True):
         print(f"  RMSD before fit : {rmsd_before:.2f} A")
         print(f"  LSQ rigid fit   : {rmsd_lsq:.2f} A   "
               f"(rotation {_rot_angle_deg(R_lsq):.1f} deg)")
-        rc = (mov_st.cell.parameters, ref_st.cell.parameters)
-        if not np.allclose(rc[0], rc[1], atol=1e-2):
-            print(f"  NOTE cells differ: mov {tuple(round(x,2) for x in rc[0])}")
-            print(f"                     ref {tuple(round(x,2) for x in rc[1])}")
+        print(f"  metric tol      : {metric_tol_rel:g} "
+              f"({'loose post-stretch' if stretched else 'strict same-cell'})")
         print(f"  enumerating altindex x symop x origin "
               f"(max_M={max_M}, det_max={det_max}) ...", flush=True)
 
@@ -87,8 +133,9 @@ def search(mov_pdb, ref_pdb, max_M=1, det_max=1, verbose=True):
     seen = set()
     cands = []
     B_com = B.mean(axis=0)
-    for R_frac, t_frac in bf._enum_alt_rot_origin_candidates(cell, sg, sg_name):
-        if not bf._is_metric_preserving(R_frac, G):
+    for R_frac, t_frac in bf._enum_alt_rot_origin_candidates(
+            cell, sg, sg_name, metric_tol_rel=metric_tol_rel):
+        if not bf._is_metric_preserving(R_frac, G, atol=metric_tol_rel):
             continue
         R_int = np.round(R_frac).astype(int)
         t_mod = np.round(np.asarray(t_frac) % 1.0, 6)
@@ -114,33 +161,35 @@ def search(mov_pdb, ref_pdb, max_M=1, det_max=1, verbose=True):
         fit_disc = A_rot + O @ t_apply
         rmsd_disc = float(np.sqrt(np.mean(np.sum((fit_disc - B) ** 2, axis=1))))
 
-        # COM-optimal continuous translation for this fixed rotation —
-        # the theoretical floor (best placement for that rotation).
-        t_comfit = B_com - A_rot.mean(axis=0)
-        fit_com  = A_rot + t_comfit
-        rmsd_com = float(np.sqrt(np.mean(np.sum((fit_com - B) ** 2, axis=1))))
+        # COM-optimal continuous translation in fractional space (the
+        # quantity bendfinder ranks on and applies as t_cart_opt).  This
+        # is the theoretical floor for the given rotation.
+        A_rot_frac = (R_frac @ A_frac.T).T
+        t_opt_frac = B_frac.mean(axis=0) - A_rot_frac.mean(axis=0)
+        diff_frac  = (A_rot_frac + t_opt_frac) - B_frac
+        cart_diff  = (O @ diff_frac.T).T
+        rmsd_cont  = float(np.sqrt(np.mean(np.sum(cart_diff ** 2, axis=1))))
 
         drot = bf._rot_deviation_deg(R_lsq, R_cart)
         cands.append(dict(R_frac=R_frac, t_frac=t_arr, t_apply=t_apply,
-                          R_int=R_int, t_mod=t_mod, R_cart=R_cart,
-                          drot=drot, rmsd_discrete=rmsd_disc,
-                          rmsd_comfit=rmsd_com, t_comfit_cart=t_comfit))
+                          t_opt_frac=t_opt_frac, R_int=R_int, t_mod=t_mod,
+                          R_cart=R_cart, drot=drot,
+                          rmsd_discrete=rmsd_disc,
+                          rmsd_continuous=rmsd_cont))
 
-    # Rank: the LSQ fit anchors which rotation is correct (drot), but the
-    # quantity we actually need small is the honest *discrete* RMSD — the
-    # residual after applying the exact crystallographic op.  Only an op
-    # with a small discrete RMSD can be applied verbatim to both the PDB
-    # and the MTZ (SF theorem) and then handed to refmac as usual.
-    # comfit RMSD is the theoretical floor (best placement for that fixed
-    # rotation) and is reported for context only.
-    #
-    # Sort primarily by discrete RMSD; a genuinely wrong rotation cannot
-    # produce a small discrete RMSD (no single whole-lattice shift can
-    # collapse a mis-rotated atom cloud), so the LSQ rotation is implicitly
-    # enforced.  drot is carried for cross-checking against the LSQ answer.
-    cands.sort(key=lambda c: (c['rmsd_discrete'], round(c['drot'], 3)))
+    # Rank by the COM-optimal continuous RMSD — same metric bendfinder's
+    # resolve_altindex picks on, so a standalone altalign run lands on
+    # the same candidate the full fitreso_scan would.  Discrete RMSD is
+    # carried as a diagnostic: if it's close to the continuous floor the
+    # op is clean as-is; if not, the extra offset is sub-cell continuous
+    # and gets folded into t_cart_opt at apply time.  drot vs the LSQ
+    # rigid-body answer is a cross-check; an op with the wrong rotation
+    # can't reach a small continuous RMSD anyway, so drot is mostly
+    # informative not gating.
+    cands.sort(key=lambda c: (c['rmsd_continuous'], round(c['drot'], 3)))
 
-    return dict(mov_pdb=mov_pdb, ref_pdb=ref_pdb, n_ca=len(A),
+    return dict(mov_pdb=mov_pdb, mov_mtz=mov_mtz, ref_pdb=ref_pdb,
+                stretched=stretched, n_ca=len(A),
                 rmsd_before=rmsd_before, rmsd_lsq=rmsd_lsq,
                 R_lsq=R_lsq, t_lsq=t_lsq, cell=cell, sg_name=sg_name,
                 O=O, Finv=Finv, candidates=cands)
@@ -149,16 +198,17 @@ def search(mov_pdb, ref_pdb, max_M=1, det_max=1, verbose=True):
 def report(res, top_n=15):
     cands = res['candidates']
     print(f"\n  {len(cands)} unique (altindex x symop x origin) candidates")
-    print(f"  top {top_n} ranked by honest discrete RMSD "
+    print(f"  top {top_n} ranked by COM-optimal continuous RMSD "
           f"(LSQ floor = {res['rmsd_lsq']:.2f} A):")
-    print(f"  {'rank':>4} {'discrete':>9} {'drot':>7} {'comfit':>8}  "
+    print(f"  {'rank':>4} {'cont':>8} {'discrete':>9} {'drot':>7}  "
           f"R (flat)                t (frac)")
     print("  " + "-" * 78)
     for i, c in enumerate(cands[:top_n], 1):
         rflat = ','.join(str(int(x)) for x in c['R_int'].flatten())
         tstr  = ','.join(f"{x:.3f}" for x in c['t_mod'])
-        print(f"  {i:>4} {c['rmsd_discrete']:>9.2f} {c['drot']:>7.2f} "
-              f"{c['rmsd_comfit']:>8.2f}  {rflat:<22s}  {tstr}")
+        print(f"  {i:>4} {c['rmsd_continuous']:>8.2f} "
+              f"{c['rmsd_discrete']:>9.2f} {c['drot']:>7.2f}  "
+              f"{rflat:<22s}  {tstr}")
 
 
 def _normalizes_sg(R_int, sg):
@@ -212,61 +262,27 @@ def _is_rhombohedral_in_hex(sg):
     return getattr(sg, 'ext', '') == 'H'
 
 
-def apply_and_write(res, choice, out_pdb, mov_mtz=None, out_mtz=None,
-                    verbose=True):
-    """Apply `choice` to the moving PDB (and MTZ).
+def _dual_write_R32R(res, choice, t_apply, out_pdb, mov_mtz, out_mtz, verbose):
+    """Emit dual H32+R32R outputs for non-normalizing R-lattice altindex ops.
 
-    For rhombohedral-in-hexagonal SGs (R3, R-3, R32, R3m, R3c, R-3m, R-3c
-    in ext='H' setting) where the chosen op does NOT normalize the SG —
-    i.e. it lands the moving crystal in the conjugate (reverse) setting —
-    `out_pdb` is treated as a stem and TWO solutions are written:
+    See the obverse/reverse discussion in CLAUDE.md / README.  Stem-name
+    convention: out_pdb -> <stem>_H32.{pdb} + <stem>_R32R.{pdb}; same for
+    MTZ.  Both outputs apply (R, t_apply) by the SF theorem so PDB+MTZ
+    stay mutually consistent without needing refmac.
 
-      <stem>_H32.{pdb,mtz} — hexagonal axes preserved; atoms+data
-        reindexed by (R, t).  gemmi cannot name reverse-H so the SYMM
-        records gemmi writes for the MTZ stay obverse; the data is in the
-        conjugate setting.  Caveat printed; downstream refmac needs the
-        SYMM records swapped (e.g. via CCP4 mtzutils) for correct
-        symmetry handling.  Reference workflow unchanged.
+    `t_apply` is supplied by the caller (typically the COM-optimal
+    continuous t_frac picked by resolve()) — the SF theorem accepts any
+    real t.  Post-stretch the discrete-grid entries from the enumerator
+    are off by sub-cell amounts, so using the continuous t keeps the
+    H32 and R32:R outputs self-consistent with the PDB.
 
-      <stem>_R32R.{pdb,mtz} — rhombohedral primitive R 3 2 :R via gemmi's
-        basisop.  Setting-unambiguous, no centering, refmac-ready.
-        Reference must also be converted to R 3 2 :R for downstream
-        comparison (or bendfinder taught to bridge the settings).
-
-    For all other cases (normalizing ops, non-rhombohedral SGs), a single
-    `out_pdb` (+ `out_mtz`) is written as before.
+    Caller is responsible for checking that the chosen op is in fact
+    non-normalizing in an R-lattice (ext='H') SG before invoking this.
     """
-    sg = gemmi.find_spacegroup_by_name(res['sg_name'])
-    is_rhomb_hex = _is_rhombohedral_in_hex(sg)
-    is_norm = _normalizes_sg(choice['R_int'], sg)
-    emit_dual = is_rhomb_hex and not is_norm
-
-    O = res['O']; Finv = res['Finv']
+    O = res['O']
     R_int = choice['R_int']
-    t_apply = choice['t_apply']
     R_cart = choice['R_cart']
 
-    if verbose:
-        print(f"\n  chosen op:")
-        print(f"    R_int = {R_int.flatten().tolist()}")
-        print(f"    t     = {[round(float(x),4) for x in t_apply]}")
-        print(f"    residual (honest discrete CA RMSD) = "
-              f"{choice['rmsd_discrete']:.2f} A")
-        print(f"    normalizes SG = {is_norm}    rhomb-in-hex SG = {is_rhomb_hex}")
-        print(f"    emitting {'dual (H32+SYMM and R32:R)' if emit_dual else 'single (op is clean)'}")
-
-    if not emit_dual:
-        bf._apply_cart_transform_to_pdb(res['mov_pdb'], R_cart, O @ t_apply,
-                                        out_pdb, ref_cell=res['cell'])
-        if verbose:
-            print(f"  wrote {out_pdb}")
-        if mov_mtz is not None and out_mtz is not None:
-            bf._apply_op_to_mtz(mov_mtz, R_int, t_apply, out_mtz)
-            if verbose:
-                print(f"  wrote {out_mtz}")
-        return
-
-    # ── dual emission ────────────────────────────────────────────────────
     stem, ext = os.path.splitext(out_pdb)
     H32_pdb  = f"{stem}_H32{ext}"
     R32R_pdb = f"{stem}_R32R{ext}"
@@ -277,8 +293,8 @@ def apply_and_write(res, choice, out_pdb, mov_mtz=None, out_mtz=None,
         R32R_mtz = f"{mstem}_R32R{mext}"
 
     # Solution A — H 3 2 + SYMM (reverse SYMM is *not* what gemmi writes).
-    # Same operation as the single-output case: cartesian reindex of the PDB,
-    # SF-theorem reindex of the MTZ.  Cell and SG label stay H 3 2.
+    # Cartesian reindex of the PDB, SF-theorem reindex of the MTZ.  Cell
+    # and SG label stay H 3 2.
     bf._apply_cart_transform_to_pdb(res['mov_pdb'], R_cart, O @ t_apply,
                                     H32_pdb, ref_cell=res['cell'])
     if mov_mtz is not None and H32_mtz is not None:
@@ -372,24 +388,194 @@ def apply_and_write(res, choice, out_pdb, mov_mtz=None, out_mtz=None,
             print(f"          cell's gemmi-canonical cartesian frame differs from the hex frame.")
 
 
+def resolve(res, out_pdb, out_mtz=None, outdir='.', refine=False,
+            refine_cycles=5, fill_fcalc=False, improve_threshold=0.7,
+            verbose=True):
+    """Apply the rank-1 candidate using bendfinder's 4-action gate.
+
+    Returns a dict with action ('none' / 'origin_only' / 'sg_op_origin'
+    / 'altindex_refine'), the chosen op, and the output file paths
+    that were written (or None for action='none').
+
+    For non-normalizing R-lattice (ext='H') altindex_refine ops, also
+    emits dual H32+R32R outputs (file paths returned in `dual_outputs`).
+
+    If `refine` is True and the action is altindex_refine, chain
+    bendfinder.run_refinement on the reindexed pair.
+    """
+    mov_pdb = res['mov_pdb']
+    mov_mtz = res['mov_mtz']
+    choice  = res['candidates'][0]
+    cell    = res['cell']
+    sg      = gemmi.find_spacegroup_by_name(res['sg_name'])
+    O       = res['O']
+    R_frac  = choice['R_frac']
+    R_int   = choice['R_int']
+    R_cart  = choice['R_cart']
+    t_frac  = choice['t_opt_frac']        # COM-optimal continuous t (bendfinder's pick)
+    t_disc  = choice['t_apply']           # exact crystallographic t (carried for dual writer)
+    rmsd_top  = choice['rmsd_continuous']
+    rmsd_base = res['rmsd_before']
+
+    # Action gate (same conditions as bendfinder.resolve_altindex).
+    is_identity_R = np.allclose(R_frac, np.eye(3), atol=1e-6)
+    is_zero_t     = float(np.linalg.norm(t_frac)) < 0.01
+    R_in_sg = False
+    if np.allclose(R_frac, R_int, atol=1e-4):
+        for op in sg.operations():
+            sg_R = (np.array(op.rot, dtype=int) // op.DEN)
+            if np.array_equal(sg_R, R_int):
+                R_in_sg = True
+                break
+
+    def _say(*a, **k):
+        if verbose: print(*a, **k, flush=True)
+
+    _say(f"\n  chosen op (rank 1):")
+    _say(f"    R_int   = {R_int.flatten().tolist()}")
+    _say(f"    t_cont  = {[round(float(x),4) for x in t_frac]}  (COM-optimal continuous)")
+    _say(f"    t_disc  = {[round(float(x),4) for x in t_disc]}  (exact crystallographic)")
+    _say(f"    rmsd    = {rmsd_top:.2f} A continuous  ({choice['rmsd_discrete']:.2f} A discrete)")
+    _say(f"    baseline= {rmsd_base:.2f} A  (LSQ floor {res['rmsd_lsq']:.2f} A)")
+
+    if rmsd_top >= improve_threshold * rmsd_base:
+        _say(f"  action=none — rank-1 op fails to beat {improve_threshold:g}x baseline")
+        _say(f"  (no output written; moving model already aligned within scope of discrete search)")
+        return dict(action='none', choice=choice, out_pdb=None, out_mtz=None,
+                    dual_outputs=None)
+
+    if is_identity_R and is_zero_t:
+        _say(f"  action=none — best op is identity, no transform needed")
+        return dict(action='none', choice=choice, out_pdb=None, out_mtz=None,
+                    dual_outputs=None)
+
+    # ── sg_op_origin: R is already a symop of the SG ─────────────────────
+    if R_in_sg and not is_identity_R:
+        _say(f"  action=sg_op_origin  (R is an in-SG symop; full SF theorem on MTZ)")
+        bf._apply_cart_transform_to_pdb(mov_pdb, R_cart, O @ t_frac,
+                                        out_pdb, ref_cell=cell)
+        _say(f"    wrote {out_pdb}")
+        if mov_mtz is not None and out_mtz is not None:
+            bf._apply_op_to_mtz(mov_mtz, R_int, t_frac, out_mtz)
+            _say(f"    wrote {out_mtz}")
+        return dict(action='sg_op_origin', choice=choice,
+                    out_pdb=out_pdb, out_mtz=out_mtz, dual_outputs=None)
+
+    # ── origin_only: R = I, translate PDB and phase-shift MTZ ────────────
+    if is_identity_R:
+        _say(f"  action=origin_only  (R = I; phase shift on MTZ, no reindex)")
+        bf._apply_cart_transform_to_pdb(mov_pdb, R_cart, O @ t_frac,
+                                        out_pdb, ref_cell=cell)
+        _say(f"    wrote {out_pdb}")
+        if mov_mtz is not None and out_mtz is not None:
+            bf._shift_mtz_origin(mov_mtz, t_frac, out_mtz)
+            _say(f"    wrote {out_mtz}")
+        return dict(action='origin_only', choice=choice,
+                    out_pdb=out_pdb, out_mtz=out_mtz, dual_outputs=None)
+
+    # ── altindex_refine: R != I and R not in SG ──────────────────────────
+    is_rhomb_hex = _is_rhombohedral_in_hex(sg)
+    is_norm      = _normalizes_sg(R_int, sg)
+    emit_dual    = is_rhomb_hex and not is_norm
+    _say(f"  action=altindex_refine  (R is genuine altindex op)")
+    _say(f"    normalizes SG = {is_norm}    rhomb-in-hex SG = {is_rhomb_hex}")
+
+    # PDB: apply cartesian R + continuous t_cart_opt (matches bendfinder).
+    # MTZ: full SF theorem with the same continuous t — keeps PDB+MTZ
+    # mutually consistent without re-refinement.  bendfinder.resolve_altindex
+    # uses reindex-only on the MTZ and relies on a subsequent refmac call
+    # to regenerate map coefficients; altalign does not assume refmac will
+    # follow so the phase shift is applied here.  Post-stretch the discrete
+    # enumerator t entries are sub-cell off from the COM-optimal continuous
+    # answer, so using the continuous t avoids landing the MTZ at a
+    # different sub-cell origin than the PDB.  If --refine is on the
+    # SF-theorem MTZ becomes the refmac input; rigid-body cycles absorb
+    # any small residual.
+    bf._apply_cart_transform_to_pdb(mov_pdb, R_cart, O @ t_frac,
+                                    out_pdb, ref_cell=cell)
+    if mov_mtz is not None and out_mtz is not None:
+        bf._apply_op_to_mtz(mov_mtz, R_int, t_frac, out_mtz)
+
+    dual_outputs = None
+    if emit_dual:
+        _say(f"    emitting dual (H32+SYMM and R32:R) — obverse/reverse case")
+        _dual_write_R32R(res, choice, t_frac, out_pdb, mov_mtz, out_mtz,
+                         verbose=verbose)
+        stem, ext = os.path.splitext(out_pdb)
+        dual_outputs = dict(H32_pdb=f"{stem}_H32{ext}",
+                            R32R_pdb=f"{stem}_R32R{ext}")
+        if out_mtz is not None:
+            mstem, mext = os.path.splitext(out_mtz)
+            dual_outputs['H32_mtz']  = f"{mstem}_H32{mext}"
+            dual_outputs['R32R_mtz'] = f"{mstem}_R32R{mext}"
+    else:
+        _say(f"    wrote {out_pdb}")
+        if out_mtz is not None:
+            _say(f"    wrote {out_mtz}")
+
+    refined = None
+    if refine and out_mtz is not None:
+        _say(f"  --refine: chaining refmac5 rigid-body ({refine_cycles} cycles)...")
+        refined_pdb, refined_mtz = bf.run_refinement(
+            out_pdb, out_mtz, outdir=outdir,
+            n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
+        refined = dict(pdb=refined_pdb, mtz=refined_mtz)
+        _say(f"    refined PDB: {refined_pdb}")
+        _say(f"    refined MTZ: {refined_mtz}")
+
+    return dict(action='altindex_refine', choice=choice,
+                out_pdb=out_pdb, out_mtz=out_mtz,
+                dual_outputs=dual_outputs, refined=refined)
+
+
+def _parse_args(argv):
+    """Minimal CLI parser: positional args (mov, ref, out_pdb, mov_mtz,
+    out_mtz) + --refine, --outdir, --no-fill-fcalc flags."""
+    pos = []
+    refine = False
+    outdir = '.'
+    fill_fcalc = True
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--refine':
+            refine = True
+        elif a == '--no-refine':
+            refine = False
+        elif a == '--outdir':
+            outdir = argv[i+1]; i += 1
+        elif a == '--no-fill-fcalc':
+            fill_fcalc = False
+        elif a == '--fill-fcalc':
+            fill_fcalc = True
+        elif a in ('-h', '--help'):
+            sys.exit(__doc__)
+        else:
+            pos.append(a)
+        i += 1
+    return pos, refine, outdir, fill_fcalc
+
+
 def main():
-    if len(sys.argv) < 3:
+    pos, refine, outdir, fill_fcalc = _parse_args(sys.argv[1:])
+    if len(pos) < 2:
         sys.exit(__doc__)
-    mov_pdb = sys.argv[1]
-    ref_pdb = sys.argv[2]
-    out_pdb = sys.argv[3] if len(sys.argv) > 3 else \
+    mov_pdb = pos[0]
+    ref_pdb = pos[1]
+    out_pdb = pos[2] if len(pos) > 2 else \
         os.path.splitext(os.path.basename(mov_pdb))[0] + '_altaligned.pdb'
-    mov_mtz = sys.argv[4] if len(sys.argv) > 4 else None
-    out_mtz = sys.argv[5] if len(sys.argv) > 5 else (
+    mov_mtz = pos[3] if len(pos) > 3 else None
+    out_mtz = pos[4] if len(pos) > 4 else (
         os.path.splitext(os.path.basename(mov_mtz))[0] + '_altaligned.mtz'
         if mov_mtz else None)
 
-    res = search(mov_pdb, ref_pdb)
+    # search() may write stretched copies into outdir; out_pdb/out_mtz from
+    # the user describe where the *final* aligned outputs go (resolve()
+    # applies the chosen op to the post-stretch model and writes to those).
+    res = search(mov_pdb, ref_pdb, mov_mtz=mov_mtz, outdir=outdir)
     report(res)
-
-    # Default choice: rank-1 by (drot, comfit).  This is the LSQ-based pick.
-    choice = res['candidates'][0]
-    apply_and_write(res, choice, out_pdb, mov_mtz, out_mtz)
+    resolve(res, out_pdb, out_mtz=out_mtz, outdir=outdir,
+            refine=refine, fill_fcalc=fill_fcalc)
 
 
 if __name__ == '__main__':
