@@ -124,23 +124,7 @@ The scan logic is implemented as `fitreso_scan()` directly in `bendfinder.py`. E
 
 **Section 2 — hkl01..hkl10**: single `bend_fit_progressive` call with `batch_hkls=1, max_canon=11, fitreso_start=100`. The `iter_callback` fires once per canonical HKL added (n_non_dc = n_canon − 1). Efficient: only one initialization (atom matching, outlier rejection) for all 10 checkpoints.
 
-**Section 3 — fr20..fr5**: ONE `bend_fit_progressive` call covering all
-fr-rows via an explicit `iteration_schedule` (one `n_used` per fr-row,
-pre-computed from `count(d≥thr)+1` on the actual HKL pool — i.e. fr10
-uses *exactly* the HKLs at d ≥ 10 Å, fr8 *exactly* those at d ≥ 8 Å,
-etc.).  Each per-iter SVD runs exactly once; on lipox this cuts wall
-time roughly 2× over the old approach.  iter_callback snapshots the
-state when each scheduled `n_used` is hit and writes the per-fr-row
-`bent.mtz` / `PSDVF.mtz`; fr-rows beyond the od_margin cutoff fall back
-to the final iter's state.  Pre-patch (May 2026 reference runs) the
-fr-row n_used was floored at `max(N_start, batch_hkls=100)` — fr10 was
-always 101 HKLs regardless of how many actually had d ≥ 10 Å, which
-was an artifact of the per-call cold-start, not the intended semantic.
-The new schedule gives the resolution-truthful count.  Numerical
-differences between pre- and post-patch fr-row results are real but
-small (fractional-percent on Rbent, ~10–30 % on HKL count for fr10/8
-where the floor was biting); the new numbers should be treated as the
-reference going forward.
+**Section 3 — fr20..fr5**: separate `bend_fit_progressive` calls with `fitreso_end` in [20,15,12,10,8,7,6,5] Å.
 
 **Section 4 — best**: parabolic fit of Rbent vs 1/d² across the fr-rows; one final `bend_fit_progressive` at the vertex `d_opt`. See [Best d_opt parabola fit](#best-d_opt-parabola-fit) below.
 
@@ -445,7 +429,7 @@ The enumerator `_enumerate_sg_asu_hkls(cell, sg, d_min)`:
 Result matches CCP4 `unique` to within rounding (insulin H 3 at 1.23 Å:
 25,283 vs uniqueify's 25,291; at 2.0 Å: 5,620 vs 5,620).
 
-## Incomplete input MTZs → opt-in Fcalc-fill before refmac
+## Incomplete input MTZs → opt-in row-fill before refinement
 
 Refmac writes FWT/PHWT only for HKLs present in its input MTZ.  PDB-
 deposited datasets are routinely incomplete (4e7u: 93%; 4fg3: 97.6%),
@@ -454,16 +438,38 @@ chunks in Coot.
 
 `run_refinement` now:
 1. Measures SG-ASU completeness of its input MTZ
-   (`_mtz_completeness` returns n_obs / n_expected).
+   (`_mtz_completeness` returns n_obs / n_expected — Fobs-finite rows
+   only; rows with HKL+FreeR but no F don't count).
 2. Refuses to proceed below 99% unless caller passes `fill_fcalc=True`
-   (CLI: `--fill-fcalc`).
+   (CLI: `--fill-fcalc`).  The name is historical; see below.
 3. When set, calls `_fill_missing_with_fcalc(in, pdb, out)` which:
    - Strips any pre-existing systematic absences from input rows
      (they're zero by symmetry and confuse downstream tools).
-   - Adds rows for missing SG-ASU HKLs with F=Fcalc (computed via
-     `gemmi.DensityCalculatorX` + the same numpy FFT lookup),
-     SIGFP=median(observed), FREE=0.
+   - Adds rows for missing SG-ASU HKLs with HKL + work-set
+     `FreeR_flag` only — `FP`, `SIGFP`, `IMEAN`, `SIGIMEAN` stay NaN.
    - Original observation rows and free-R flags are untouched.
+
+The empty-Fobs rows pass through refmac the same way it already
+handles natively-empty rows in some deposits (e.g. lyso 3aw7 ships
+with 683 rows that have a FreeR flag but no measured F): refmac emits
+`FC`, `FC_ALL`, `FWT` and `PHWT` for them as model-only.  Output FWT/PHWT
+coverage = 100% of input rows = 100% of SG-ASU after fill.  phenix.refine
+likewise fills its `2FOFCWT`/`PH2FOFCWT` model coefficients across all
+input rows.
+
+**Why no longer Fcalc values?**  An earlier version injected raw
+`gemmi.DensityCalculatorX` Fcalc into the FP column.  This is on the
+absolute electron scale, which **does not match** the deposit's chosen
+Fobs scale in general.  DHFR 1rx1/1rx2 carry FP at ~1/18 of the
+absolute scale — the filled rows looked like Fobs an order of magnitude
+too large, refmac's single bulk-solvent + scale model couldn't span
+both populations, and rigid-body diverged (translated the model ~3.7 Å,
+DHFR Rbent at fr5 climbed to 127.9% vs canonical 41.5%).  Letting
+refmac/phenix generate model density themselves keeps everything on the
+target scale and never introduces a second Fobs population.
+
+`pdb_path` is still accepted by `_fill_missing_with_fcalc` for caller
+stability but is unused inside.
 
 Plumbed through `fitreso_scan(..., fill_fcalc=False)` → `run_refinement`.
 
@@ -573,7 +579,7 @@ a PASS/FAIL table with per-test metrics:
    loose-tol altindex; see "Cross-cell pairs" section above).
 11. Porin altalign + refmac on the R 3 2 :R output
 
-Each example writes to `<sys>/scan_test*/` (separate from the
+Each example writes to `<sys>/scan_test*/` (separate from the canonical
 `scan_fitreso_fc/` reference runs).  Per-test logs land in
 `test_results_<timestamp>/`.  Script cd's up if invoked from inside
 `map_bender/`; exits 2 if the working area can't be found, exits 1 if
@@ -581,65 +587,26 @@ any test fails.
 
 Run as `./run_all_tests.com` from the working area.
 
-### BLAS threading + slurm cores
-
-CCP4-9 ships single-threaded blas/cblas/lapack — bend_fit's SVDs run
-5–10× slower than they need to.  The wrapper LD_PRELOADs the pthreaded
-OpenBLAS that comes with phenix (`/programs/phenix-2.1rc2-6037/lib/
-libopenblas.so.0`, libopenblasp v0.3.25) and sets
-`OPENBLAS_NUM_THREADS=$NCPUS` (default `NCPUS=64`).
-
-The matching half of this is `srun -c $NCPUS` on every job — **default
-srun gives only 1 CPU**, so without `-c` the OpenBLAS thread pool sees
-1 core regardless of what `OPENBLAS_NUM_THREADS` says.  octamus1 has
-448 cores so 64 is comfortable; bump or shrink `NCPUS` in the wrapper
-header to scale.
-
-LD_PRELOAD propagates through srun by default (srun inherits the
-parent shell env), so the same env that prints
-`CPUs available: 64, OPENBLAS_NUM_THREADS=64` inside the wrapper also
-arrives in each ccp4-python subprocess.
-
-Empirical effect (gamut, lipox): 18 iters at fr8 dropped from 2396 s
-(single-thread) → 657 s (OpenBLAS+64).  Scaling is sublinear (~3.6×,
-not 64×) because chunked map evaluation in `_save_fr` is
-non-BLAS-bound numpy element-wise work — that's the next bottleneck
-on big systems.
-
 ## Empirical results (fitreso scans)
 
 All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `batch_hkls=100`).
-Numbers are from the 2026-06-16 gamut run (resolution-truthful
-`iteration_schedule`; OpenBLAS + `-c 64`; see [Fitreso scan §Section 3](#fitreso-scan)).
 
 | System | Space group | CA pairs | fr5 RMSD | fr5 Rbent | best Rbent | d_opt | subtract |
 |--------|------------|----------|----------|-----------|------------|-------|----------|
-| Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.031 Å | 31.8% | 30.2% | 10.6 Å | ref |
-| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 592 | 0.070 Å | 42.3% | 37.8% | 14.1 Å | ref |
-| Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.075 Å | 20.7% | 11.5% | 20 Å (clamped) | bent |
-| Raddam 5kxk→5kxm | P4₃2₁2 | 984 | 0.047 Å | 16.8% |  9.9% | 20 Å (clamped) | bent |
-| Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.051 Å | 22.9% | 17.7% | 20 Å (clamped) | bent |
-| Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.064 Å | 51.2% | 50.0% | 5.65 Å | ref |
-| Insulin 4fg3→4e7u | H3 | 801 | 0.785 Å | 64.4% | 64.4% | 8.12 Å | ref (fill_fcalc=True) |
+| Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.033 Å | 33.2% | 30.3% | 9.7 Å | ref |
+| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 592 | 0.070 Å | 41.5% | 37.7% | 12.6 Å | ref |
+| Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.087 Å | 21.9% | 11.5% | 20 Å (clamped) | bent |
+| Raddam 5kxk→5kxm | P4₃2₁2 | 984 | 0.047 Å | 19.2% |  9.9% | 20 Å (clamped) | bent |
+| Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.048 Å | 24.1% | 17.8% | 20 Å (clamped) | bent |
+| Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | 49.8% | 49.8% | 5.5 Å | ref |
+| Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 60.5% | 5.8 Å | ref (fill_fcalc=True) |
 | Porin 3poq→3pou | H 3 2 | 340 | 0.366 Å | 57.7% | 57.8% | 9.5 Å | ref (fill_fcalc=True) — in-bendfinder altindex resolution; obverse/reverse pair, altalign also emits H32+SYMM and R32:R (R32:R refmac-runnable, R=0.37) |
-| Lipox 9o4s→9o4t | P2₁ | 795 | 0.636 Å¹ | 59.9%¹ | 55.0% | 13.1 Å | ref (fill_fcalc=True) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z (drot=0.00° from LSQ) in nearly-orthorhombic monoclinic; refmac R=0.254 after reindex+rigid-body |
+| Lipox 9o4s→9o4t | P2₁ | 795 | 0.283 Å (fr12)¹ | 53.2% (fr12) | 53.2% | 12 Å (clamped) | ref (fill_fcalc=True) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z (drot=0.00° from LSQ) in nearly-orthorhombic monoclinic; refmac R=0.254 after reindex+rigid-body |
 
-¹ Lipox fr5 (3022 HKLs, 60 min wall on 64 cores) — the *fit* runs past
-the bandwidth where the PSDVF can absorb signal, so RMSD/Rbent rise
-again from their fr10 minimum (0.159 Å / 55.9 %).  The "best" row
-(d_opt = 13.1 Å, RMSD 0.206 Å, Rbent 55.0 %) is the parabola-vertex
-re-fit and is the more honest summary for this system.
-
-Pre-patch (May 2026) numbers for comparison: lyso 0.033/33.2 %; DHFR
-0.070/41.5 %; raddam 0.087/21.9 %, 0.047/19.2 %, 0.048/24.1 %; myo
-0.063/49.8 %; insulin 0.510/60.3 %; lipox 0.283/53.2 % (fr12 only —
-fr5 was never reached pre-patch).  Differences are mostly the
-resolution-truthful HKL counts replacing the `batch_hkls`-floored
-counts, plus minor SVD-rounding drift; the new numbers are the
-reference going forward.  Insulin drifted further than the rest
-(0.510→0.785 Å, 60.3→64.4 %) — at this system the smooth shift field
-already saturates against the T→R conformational change, so different
-HKL inclusions can land on noticeably different local minima.
+¹ Lipox numbers are fr12, not fr5 — finer scan points blow up in
+wall-time at this molecule size (~6700 P1 atoms × many HKLs).  fr12
+already takes ~8 minutes; fr5 would extrapolate to ~hours.  The full
+fr5 row will be filled in once the canonical reference run completes.
 
 The `best` row in each `scan_dir/scan_fitreso.log` is the
 parabola-vertex re-fit (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
@@ -730,16 +697,11 @@ Notes:
   cell (fractions preserved) → loose-tol (`metric_tol_rel=0.05`)
   altindex enumeration surfaces `R=diag(−1,−1,+1)` at drot=0.00°
   from the Kabsch LSQ rotation → `altindex_refine` reindexes mov's
-  experimental Fobs by R, re-refines to refmac R=0.254.  Scan
-  (post-section3-patch, OpenBLAS + 64 cores): hkl00 baseline
-  RMSD 1.08 Å / Rbent 63.6 % → fr12 0.191 Å / 55.0 % → fr10
-  0.159 Å / 55.9 % (RMSD minimum) → fr8 0.165 Å / 58.0 % → fr5
-  0.636 Å / 59.9 % (the fit runs past the PSDVF bandwidth, where
-  the model can't absorb more signal and noise dominates).  The
-  parabola identifies d_opt = 13.1 Å cleanly (best row 0.206 Å /
-  55.0 %).  Persistent −7 to −8σ peak at A/350MET/SD(r) is a
-  sulfur not in mov.  Mov's experimental Fobs is preserved
-  end-to-end — no Fcalc substitution.  Wall time ~3.5 h on the
-  gamut node (cluster-contended); standalone same-config run lands
-  closer to 1 h.  See [Cross-cell pairs](#cross-cell-pairs-resolve_altindex-cell-stretch--loose-tolerance-altindex)
-  section above for the alignment mechanism.
+  experimental Fobs by R, re-refines to refmac R=0.254.  Scan:
+  hkl00 baseline RMSD 1.33 Å / Rbent 64.9% → fr20 0.345 Å / 53.7%
+  → fr12 0.283 Å / 53.2%; parabola d_opt clamps to fr12 (true
+  vertex finer than 12 Å but not yet measured).  Persistent
+  −8 to −9σ peak at A/350MET/SD(r) is a sulfur not in mov.
+  Mov's experimental Fobs is preserved end-to-end — no Fcalc
+  substitution.  See [Cross-cell pairs](#cross-cell-pairs-resolve_altindex-cell-stretch--loose-tolerance-altindex)
+  section above for the mechanism.

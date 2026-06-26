@@ -2546,6 +2546,9 @@ def _scan_nearest_atom(frac, atoms, M):
 
 
 def _scan_find_peaks(data, hdr, atoms, M, fp=5):
+    """Return {'pos': (sigma, atom, dist, idx), 'neg': (sigma, atom, dist, idx)}
+    where idx is the (i,j,k) voxel index of the peak in `data`.  Callers that
+    used 3-tuple unpacking should be updated to ignore or use the idx."""
     sigma = data.std()
     fp3   = np.ones((fp,)*3)
     out   = {}
@@ -2563,9 +2566,9 @@ def _scan_find_peaks(data, hdr, atoms, M, fp=5):
         if peaks:
             val, idx = peaks[0]
             a, dist  = _scan_nearest_atom(_scan_voxel_to_frac(idx, hdr), atoms, M)
-            out[lbl] = (val, a, dist)
+            out[lbl] = (val, a, dist, tuple(int(i) for i in idx))
         else:
-            out[lbl] = (0., _dummy, 0.)
+            out[lbl] = (0., _dummy, 0., None)
     return out
 
 
@@ -2806,16 +2809,27 @@ def _pick_free_column(mtz):
 
 
 def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
-    """Augment an MTZ with model-derived Fcalc at HKLs missing from its SG ASU.
+    """Augment an MTZ with empty rows for HKLs missing from its SG ASU.
 
     Used by `run_refinement` to give refmac a complete-ASU input so its
-    FWT/PHWT output has no missing-data gaps.  Lighter than uniqueify in
-    that it preserves the input column layout exactly and assigns FREE=0
-    (work set) to filled rows without touching existing free-R flags.
+    FWT/PHWT/FC_ALL output covers every SG-ASU HKL — refmac's output
+    rowcount equals its input rowcount, so any HKL missing from the
+    input becomes a hole in the downstream bent map.
 
-    For filled rows the F column gets Fcalc and SIGFP gets the median of
-    observed SIGFP (so refmac sees a finite weight).  If the input has no
-    F/SIGFP column, returns the input path unchanged.
+    Added rows carry HKL + a work-set FreeR_flag and leave F/SIGF/I/SIGI
+    NaN.  Refmac handles missing Fobs natively (FC, FC_ALL, FWT come
+    out model-only for those rows), the same way it already processes
+    natively-empty rows in some deposits (e.g. lyso 3aw7 ships with
+    683 rows that have a FreeR flag but no measured F).
+
+    The historical version of this function wrote raw Fcalc into the F
+    column, which fails when Fobs is on an unusual scale (DHFR 1rx1/2
+    deposit FP at ~1/18 of the absolute electron scale): refmac sees
+    the filled rows as Fobs an order of magnitude too large and
+    translates the model many Å trying to fit one bulk-solvent model
+    across both.  `pdb_path` is now ignored; kept for caller stability.
+
+    If the input has no F or I column, returns the input path unchanged.
     """
     mtz = gemmi.read_mtz_file(in_mtz_path)
     cell = mtz.cell
@@ -2875,20 +2889,12 @@ def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
         return out_mtz_path
 
     missing_hkl = np.array(missing, dtype=np.int32)
-    fc = _fcalc_at_hkls(pdb_path, missing_hkl, d_min)
-    fc_amp = np.abs(fc).astype(np.float32)
-    fc_int = (fc_amp.astype(np.float64) ** 2).astype(np.float32)
 
-    # Assign filled rows to the WORKING set (free-flag value > 0), not
-    # the free set.  Missing HKLs are concentrated at high resolution
-    # (where the deposit has gaps), so a free-set assignment would dump a
-    # non-random cluster of Fcalc rows into one resolution shell — and
-    # Fcalc may be on a different scale than deposit Fobs there, blowing
-    # up Rfree in that bin.  Conceptually, fill_fcalc exists to give
-    # downstream tools a complete-ASU input for bulk-solvent fitting and
-    # map coefficients — NOT to extend the cross-validation set.  We use
-    # the most common non-zero value in the existing column (a typical
-    # work-set bin label), falling back to 1.
+    # Filled rows go in the working set (free-flag > 0), not the free set.
+    # Missing HKLs cluster at high resolution and assigning them as free
+    # reflections would dump a non-random shell into the cross-validation
+    # set.  Use the most common positive value in the existing column,
+    # falling back to 1.
     if FREE_lbl:
         existing = data[:, lbls.index(FREE_lbl)]
         existing_int = existing[np.isfinite(existing)].astype(int)
@@ -2902,16 +2908,6 @@ def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
     new_rows = np.full((len(missing_hkl), data.shape[1]),
                        np.nan, dtype=np.float32)
     new_rows[:, :3] = missing_hkl
-    if F_lbl:
-        new_rows[:, lbls.index(F_lbl)] = fc_amp
-        if SIG_lbl:
-            new_rows[:, lbls.index(SIG_lbl)] = np.float32(
-                np.nanmedian(data[:, lbls.index(SIG_lbl)]))
-    if I_lbl:
-        new_rows[:, lbls.index(I_lbl)] = fc_int
-        if SIGI_lbl:
-            new_rows[:, lbls.index(SIGI_lbl)] = np.float32(
-                np.nanmedian(data[:, lbls.index(SIGI_lbl)]))
     if FREE_lbl:
         new_rows[:, lbls.index(FREE_lbl)] = free_default
 
@@ -3220,6 +3216,16 @@ def fitreso_scan(
 
     os.makedirs(scan_dir, exist_ok=True)
 
+    # ── snapshot the truly-raw inputs (used by the pre/ section below) ───────
+    # pre/ shows the "old-fashioned" diff map: mov sampled on ref's grid with
+    # NO resolve_altindex / origin transformation.  ref is fine to take post-
+    # refmac (refinement settles atoms by <0.1 Å vs deposited); mov MUST stay
+    # pre-resolve so the pre row honestly reports what the unaligned mov would
+    # look like.  If the raw mov MTZ lacks FWT/PHWT we refmac it once below so
+    # pre/ has phases to FFT, but the pdb+frame stay unchanged.
+    raw_mov_pdb_in = mov_pdb
+    raw_mov_mtz_in = mov_mtz
+
     # ── optional refinement ───────────────────────────────────────────────────
     # Refmac can drop disordered atoms during the run, so subsequent steps
     # (altindex resolution + re-refinement, write_bent_pdb, peak hunting)
@@ -3228,6 +3234,21 @@ def fitreso_scan(
         ref_pdb, ref_mtz = run_refinement(
             ref_pdb, ref_mtz,
             outdir=os.path.join(scan_dir, 'refine_ref'),
+            n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
+
+    # ── pre/ refmac on raw mov, if needed for phases ──────────────────────────
+    # The pre section FFTs raw_mov_mtz to a map.  If FWT/PHWT aren't present
+    # (deposited Fobs-only inputs), refmac one pass on the raw mov against its
+    # own data — same idea as the post-resolve mov refmac below, but starting
+    # from the un-transformed mov so pre/ reflects the un-aligned state.
+    pre_mov_pdb = raw_mov_pdb_in
+    pre_mov_mtz = raw_mov_mtz_in
+    if (run_refinement_flag and pre_mov_mtz.lower().endswith('.mtz')
+            and 'FWT' not in {c.label
+                              for c in gemmi.read_mtz_file(pre_mov_mtz).columns}):
+        pre_mov_pdb, pre_mov_mtz = run_refinement(
+            pre_mov_pdb, pre_mov_mtz,
+            outdir=os.path.join(scan_dir, 'refine_mov_raw'),
             n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
 
     # ── altindex / origin resolution ──────────────────────────────────────────
@@ -3291,6 +3312,20 @@ def fitreso_scan(
     mov_d, mov_h, mov_mtz_resolved, mov_f_col = _load(mov_mtz, 'mov',
                                                         fullcell=mov_fullcell)
     ref_d, ref_h, ref_mtz_resolved, ref_f_col = _load(ref_mtz, 'ref')
+    # pre/ section uses the un-transformed mov.  Load with the same
+    # fullcell/pad rules as the post-resolve mov so interpolation behaves
+    # the same way.  If pre_mov_mtz IS raw_mov_mtz_in and raw_mov_mtz_in
+    # is also the post-resolve mov_mtz (the resolve_altindex action='none'
+    # case), this re-FFT is redundant — re-use mov_d to avoid the cost.
+    pre_mov_fullcell = (pre_mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc')))
+    if os.path.abspath(pre_mov_mtz) == os.path.abspath(mov_mtz):
+        pre_mov_d, pre_mov_h = mov_d, mov_h
+        pre_mov_pad_mode = pad_mode
+    else:
+        pre_mov_d, pre_mov_h, _, _ = _load(pre_mov_mtz, 'pre_mov',
+                                            fullcell=pre_mov_fullcell)
+        pre_mov_pad_mode = ('wrap' if pre_mov_mtz.lower().endswith('.mtz')
+                                       or pre_mov_fullcell else 'reflect')
 
     col_suffix = ('' if (mov_f_col is None or mov_f_col in _CANONICAL_F)
                   else f'_{mov_f_col}')
@@ -3320,6 +3355,15 @@ def fitreso_scan(
     atoms     = (_scan_read_pdb_atoms_p1(ref_pdb, src='ref',
                                           cell_override=_ref_cell)
                  + _scan_read_pdb_atoms_p1(mov_pdb, src='mov',
+                                            cell_override=_ref_cell))
+    # Pre/ uses the un-transformed mov pdb (resolve_altindex hasn't run on it).
+    # For cross-cell pairs (lipox, porin) the raw mov atoms are NOT in ref's
+    # frame — peak labelling for pre will pick whatever ref or raw-mov atom
+    # happens to land closest in fractional space, which is the honest "what
+    # would the un-aligned diff map look like?" answer.
+    pre_atoms = (_scan_read_pdb_atoms_p1(ref_pdb, src='ref',
+                                          cell_override=_ref_cell)
+                 + _scan_read_pdb_atoms_p1(pre_mov_pdb, src='mov',
                                             cell_override=_ref_cell))
 
     # ── ref MTZ for Riso (FT of reference density map) ────────────────────────
@@ -3352,8 +3396,13 @@ def fitreso_scan(
     _AB0 = np.zeros((3, 0, 2))
 
     # ── compute pre-origin (raw) RMSD ────────────────────────────────────────
+    # Use the *truly raw* mov pdb (pre-resolve_altindex) so this number really
+    # is "what you'd see if you just downloaded the two structures and
+    # subtracted."  For systems where resolve_altindex took action='none' this
+    # equals hkl00_rmsd; for systems where it applied an origin/SG/altindex
+    # op, raw_rmsd will be substantially larger.
     with open(os.devnull, 'w') as _dev, _contextlib.redirect_stdout(_dev):
-        _a1, _cell1, _ = expand_to_p1(mov_pdb)
+        _a1, _cell1, _ = expand_to_p1(pre_mov_pdb)
         _a2, _cell2, _ = expand_to_p1(ref_pdb)
         _fm, _ca, _uid, _bf = match_atoms(_a1, _a2)
         _fm, _ca, _, _, _ = reject_outliers(_fm, _ca, _uid, _cell1,
@@ -3388,9 +3437,6 @@ def fitreso_scan(
               f"{'Rbent':>6}  {'Rbend':>6}  "
               f"{'peak':>7}  {'atom':>20}", flush=True)
         print('-' * 80, flush=True)
-        print(f"{'pre':>7}  {raw_rmsd:>6.3f}  {0:>6d}  "
-              f"{'   ---':>6}  {'   ---':>6}  "
-              f"{'      ':>7}  (pre-origin alignment)", flush=True)
 
     # The PSDVF maps every fractional point in the moving cell to its
     # corresponding fractional point in the reference cell.  For PSDVF=0
@@ -3474,10 +3520,67 @@ def fitreso_scan(
         _log_rows.append(dict(label=label, rmsd=rmsd_after, n_active=n_active,
                               rbent=riso, rbend=rbend, k=kF, B=B,
                               peak_sigma=p_top[0], peak_atom=atom_str,
-                              peak_dist=p_top[2], t=t_elapsed,
-                              row_str=row_str))
+                              peak_dist=p_top[2], peak_idx=p_top[3],
+                              t=t_elapsed, row_str=row_str))
         if verbose:
             print(row_str, flush=True)
+
+    # ── Section 0: pre — raw mov vs ref, NO resolve_altindex, no shift field ─
+    # The "old-fashioned" difference map.  hkl00 below is the same idea after
+    # resolve_altindex has aligned mov to ref (origin shift / SG op / cell
+    # stretch / altindex).  For systems where resolve_altindex took
+    # action='none' (lyso, dhfr, myo, raddam — already aligned), pre ≈ hkl00.
+    # For systems with action != 'none' (insulin sg_op_origin, porin altindex,
+    # lipox altindex+stretch), pre vs hkl00 quantifies the value of the
+    # alignment step alone (before any bending).
+    outdir_pre = os.path.join(scan_dir, 'pre')
+    os.makedirs(outdir_pre, exist_ok=True)
+    t_pre = time.time()
+    pre_bent_vals = interpolate_map(pre_mov_d, pre_mov_h, ref_pts,
+                                     pad_mode=pre_mov_pad_mode)
+    pre_bent_map  = pre_bent_vals.reshape(ns2, nr2, nc2)
+    pre_bent_map_name = f'bent{col_suffix}.map'
+    pre_diff_name     = f'diff_norm{col_suffix}.map'
+    pre_bent_mtz_name = f'bent{col_suffix}.mtz'
+    write_ccp4(f'{outdir_pre}/{pre_bent_map_name}', pre_bent_map, ref_h)
+    # bent.pdb / unbent.pdb / unbent.mtz in pre/ all point to the RAW mov.
+    # ref.pdb / ref.mtz still come from the (possibly refmac'd) ref.
+    _relsymlink_dir(os.path.abspath(pre_mov_pdb), f'{outdir_pre}/bent.pdb')
+    _relsymlink_dir(os.path.abspath(ref_pdb),     f'{outdir_pre}/ref.pdb')
+    _relsymlink_dir(os.path.abspath(pre_mov_pdb), f'{outdir_pre}/unbent.pdb')
+    _relsymlink_dir(os.path.abspath(riso_ref_mtz),f'{outdir_pre}/ref.mtz')
+    _relsymlink_dir(os.path.abspath(pre_mov_mtz), f'{outdir_pre}/unbent.mtz')
+    pre_bent_mtz_path = f'{outdir_pre}/{pre_bent_mtz_name}'
+    pre_diff, pre_riso, pre_kF, pre_B = _fspace_scale_and_diff(
+        pre_bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
+        pre_bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract)
+    if pre_diff is None:
+        ref_n  = (ref_d        - ref_d.mean())        / ref_d.std()
+        bent_n = (pre_bent_map - pre_bent_map.mean()) / pre_bent_map.std()
+        pre_diff = (bent_n - ref_n) if subtract == 'ref' else (ref_n - bent_n)
+        _write_scan_mtz(pre_bent_map, pre_diff, ref_h, pre_bent_mtz_path)
+        pre_riso, pre_kF, pre_B = compute_riso(
+            riso_ref_mtz, riso_ref_col, pre_bent_mtz_path, 'FDM',
+            n_cycles=riso_n_cycles, sigma_cut=riso_sigma_cut)
+    pre_diff_norm = pre_diff / pre_diff.std()
+    write_ccp4(f'{outdir_pre}/{pre_diff_name}', pre_diff_norm, ref_h)
+    pre_peaks  = _scan_find_peaks(pre_diff_norm, ref_h, pre_atoms, M)
+    pre_p_top  = (pre_peaks['pos'] if abs(pre_peaks['pos'][0]) >= abs(pre_peaks['neg'][0])
+                  else pre_peaks['neg'])
+    pre_atom_s = _atom_label(pre_p_top[1])
+    pre_t_el   = time.time() - t_pre
+    pre_rbent_str = f'{pre_riso*100:.1f}%' if pre_riso is not None else '  N/A'
+    pre_row_str = (f"{'pre':>7}  {raw_rmsd:>6.3f}  {0:>6d}  "
+                   f"{pre_rbent_str:>6}  {'  ---':>6}  "
+                   f"{pre_p_top[0]:>+7.2f}σ  {pre_atom_s:>20} {pre_p_top[2]:.2f}Å  "
+                   f"[{pre_t_el:.0f}s]")
+    _log_rows.append(dict(label='pre', rmsd=raw_rmsd, n_active=0,
+                          rbent=pre_riso, rbend=None, k=pre_kF, B=pre_B,
+                          peak_sigma=pre_p_top[0], peak_atom=pre_atom_s,
+                          peak_dist=pre_p_top[2], peak_idx=pre_p_top[3],
+                          t=pre_t_el, row_str=pre_row_str))
+    if verbose:
+        print(pre_row_str, flush=True)
 
     # ── Section 1: hkl00 — zero shift field (post-resolve baseline) ──────────
     outdir0 = os.path.join(scan_dir, 'hkl00')
@@ -3734,6 +3837,22 @@ def fitreso_scan(
         _best_meta = dict(d_opt=d_opt, r_pred=r_pred, n_fit=int(hi - lo),
                           fr_used=[float(d) for d in ds[lo:hi]],
                           clamped=clamped)
+        # ── pre-σ at best-peak location ──────────────────────────────────────
+        # Same ref grid → voxel indices are 1:1.  Sample pre's normalised diff
+        # map at best's top-peak voxel to quantify how visible the revealed
+        # feature was *before* alignment + bending.  A small |pre_at_best|
+        # confirms that the post-bend peak is genuinely revealed by the
+        # alignment + shift-field, not just sharpened from something already
+        # visible in the raw subtraction.
+        best_row = _log_rows[-1]
+        if best_row.get('peak_idx') is not None:
+            i, j, k = best_row['peak_idx']
+            best_row['pre_at_best_sigma'] = float(pre_diff_norm[i, j, k])
+            if verbose:
+                print(f"  pre diff-map σ at best-peak voxel: "
+                      f"{best_row['pre_at_best_sigma']:+.2f}σ "
+                      f"(best peak: {best_row['peak_sigma']:+.2f}σ at "
+                      f"{best_row['peak_atom']})", flush=True)
     else:
         _best_meta = None
 
@@ -3752,11 +3871,14 @@ def fitreso_scan(
         fh.write(f"# sign    : {_sign_note}\n")
         fh.write(f"# Rbent   : Rfac after F-space (k+B) scaling of bent → ref\n")
         fh.write(f"# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)\n")
-        fh.write(f"# k, B    : F-space scale + isotropic B (Å²) used for Rbent\n\n")
+        fh.write(f"# k, B    : F-space scale + isotropic B (Å²) used for Rbent\n")
+        fh.write(f"# pre@best: σ in pre/diff_norm.map at the voxel of best row's top peak\n")
+        fh.write(f"#           (small |pre@best| ⇒ feature genuinely revealed by alignment+bending)\n\n")
         hdr = (f"{'label':>7}  {'RMSD':>6}  {'active':>6}  "
                f"{'Rbent':>6}  {'Rbend':>6}  "
                f"{'k':>6}  {'B(Å²)':>7}  "
-               f"{'peak':>7}  {'atom':>20}  {'dist':>6}  {'t(s)':>5}\n")
+               f"{'peak':>7}  {'atom':>20}  {'dist':>6}  "
+               f"{'pre@best':>9}  {'t(s)':>5}\n")
         fh.write(hdr)
         fh.write('-' * (len(hdr) - 1) + '\n')
         for r in _log_rows:
@@ -3765,11 +3887,14 @@ def fitreso_scan(
             rbd_s  = f"{r['rbend']*100:.1f}%" if r['rbend'] is not None else '  N/A'
             k_s    = f"{r['k']:.3f}"   if r['k'] is not None else '  N/A'
             B_s    = f"{r['B']:+6.2f}" if r['B'] is not None else '   N/A'
+            pab    = r.get('pre_at_best_sigma')
+            pab_s  = f"{pab:>+7.2f}σ" if pab is not None else f"{'—':>9}"
             fh.write(f"{r['label']:>7}  {rmsd_s:>6}  {r['n_active']:>6d}  "
                      f"{rbe_s:>6}  {rbd_s:>6}  "
                      f"{k_s:>6}  {B_s:>7}  "
                      f"{r['peak_sigma']:>+7.2f}σ  {r['peak_atom']:>20}  "
-                     f"{r['peak_dist']:>5.2f}Å  {r['t']:>4.0f}s\n")
+                     f"{r['peak_dist']:>5.2f}Å  "
+                     f"{pab_s:>9}  {r['t']:>4.0f}s\n")
         if _best_meta is not None:
             fr_used_str = ', '.join(f'fr{int(d) if d == int(d) else d}'
                                      for d in _best_meta['fr_used'])
@@ -4018,17 +4143,24 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
             print(f'ERROR: {os.path.basename(mtz_path)} is {100*frac:.1f}% '
                   f'complete (< {100*completeness_threshold:.0f}% threshold).\n'
                   f'  Re-run with fill_fcalc=True (or pass --fill-fcalc on CLI) '
-                  f'to fill missing SG-ASU HKLs with model-derived Fcalc.\n'
-                  f'  This is required so refmac writes FWT for every SG-ASU '
-                  f'HKL and the downstream scan map is complete.',
+                  f'to extend the input MTZ to full SG-ASU coverage so refmac '
+                  f'writes FWT/FC_ALL for every HKL (added rows carry only HKL '
+                  f'+ FreeR; the refinement target sees only deposited Fobs).',
                   file=sys.stderr)
             sys.exit(1)
         mtz_filled = os.path.join(outdir, f'{stem}_filled.mtz')
         try:
             _fill_missing_with_fcalc(mtz_path, pdb_path, mtz_filled)
-            n2, e2, f2 = _mtz_completeness(mtz_filled)
-            print(f'  filled with Fcalc → {n2}/{e2} = {100*f2:.1f}% complete',
-                  flush=True)
+            # Report row-count change, not Fobs completeness: the filled rows
+            # carry only HKL + FreeR (FP/SIGFP stay NaN by design — refmac /
+            # phenix generate Fcalc/FWT/2FOFCWT for them).  _mtz_completeness
+            # measures Fobs completeness so it would still print the input's
+            # ~90% post-fill and read like the fill silently no-op'd.
+            n_in_rows  = len(gemmi.read_mtz_file(mtz_path).array)
+            n_out_rows = len(gemmi.read_mtz_file(mtz_filled).array)
+            print(f'  filled {n_out_rows - n_in_rows} missing SG-ASU rows '
+                  f'(empty FP, work-set FreeR) → {n_out_rows} total rows '
+                  f'for refinement', flush=True)
             mtz_path_for_refmac = mtz_filled
         except Exception as e:
             print(f'  _fill_missing_with_fcalc failed ({e!r}); aborting',
@@ -4132,6 +4264,9 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
         # found" and exits with "arguments are not recognized: <basename>".
         abs_pdb = os.path.abspath(pdb_path)
         abs_mtz = os.path.abspath(mtz_path_for_refmac)
+        # output.prefix=<stem> makes phenix write <stem>_001.{pdb,mtz}; default
+        # prefix would produce <stem>_refine_001.* which clutters downstream
+        # filename matching.  We then look for the _001 suffix below.
         cmd = [phenix, abs_pdb, abs_mtz,
                f'refinement.main.number_of_macro_cycles={n_cycles}',
                f'output.prefix={stem}']
@@ -4145,8 +4280,8 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
             _lf.write(r.stdout or '')
             _lf.write('\n--- stderr ---\n')
             _lf.write(r.stderr or '')
-        candidate_mtz = os.path.join(outdir, f'{stem}_refine_001.mtz')
-        candidate_pdb = os.path.join(outdir, f'{stem}_refine_001.pdb')
+        candidate_mtz = os.path.join(outdir, f'{stem}_001.mtz')
+        candidate_pdb = os.path.join(outdir, f'{stem}_001.pdb')
         if r.returncode == 0 and os.path.exists(candidate_mtz):
             print(f'  phenix.refine done → {candidate_mtz}  (log: {log_path})',
                   flush=True)
