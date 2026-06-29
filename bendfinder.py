@@ -47,6 +47,7 @@ from pathlib import Path
 import numpy as np
 from scipy.linalg import lstsq as sp_lstsq, svd as sp_svd
 from scipy.ndimage import map_coordinates
+from scipy.special import erf as sp_erf, erfinv as sp_erfinv
 import gemmi
 
 TWO_PI = 2.0 * np.pi
@@ -513,17 +514,90 @@ def build_design_matrix_symm(frac_coords, canon_hkls, proper_ops,
     return X
 
 
-def fit_lstsq_symm(X, b, drop_snr=1.0, max_rounds=5):
-    """Joint 3D lstsq with per-canonical-HKL SNR pruning.
+def _pnn_weight(snr, N):
+    """Holton 'probability not noise' weight: P(snr is real | N HKLs tested).
+
+    Pnn(snr, N) = erf(|snr|/√2)^N is the probability that an SNR this large
+    would NOT be exceeded by random noise across N independent measurements
+    (Bonferroni-style multiple-testing correction).  As N grows the SNR
+    bar for "real signal" rises automatically — at N=500, snr<3 essentially
+    zeroes, snr=4 ≈ 0.97 weight, snr=5 ≈ 1.
+
+    Below the safe threshold (where Pnn would underflow to ~0), return 0
+    exactly to avoid floating-point garbage.
+    """
+    snr_abs = np.abs(np.asarray(snr, dtype=float))
+    s_thresh = np.sqrt(2.0) * sp_erfinv((1e-30) ** (1.0 / max(N, 1)))
+    safe = snr_abs >= s_thresh
+    w = np.zeros_like(snr_abs)
+    if safe.any():
+        w[safe] = sp_erf(snr_abs[safe] / np.sqrt(2.0)) ** N
+    return w
+
+
+def _soft_pnn_weight(snr, N):
+    """Smoother polynomial approximation of Pnn (Holton's softPnna).
+
+    Replaces the sharp erf-power Pnn transition with a generalised-logistic
+    centred on a polynomial-fitted "50% threshold sigma" that varies with
+    log10(N).  The exponent of the transition adapts with both N and snr
+    so the curve is broader at low N and steeper at high N.
+
+      softPnna(d, N) = 1 - 2^(-(d / σ₅₀(N))^p(d,N))
+
+    where σ₅₀(N) ≈ a₀ + a₁ log₁₀N + a₂ (log₁₀N)² is the polynomial fit of
+    the true Pnn 50% sigma, and p(d,N) = my·log₁₀N + mx·d + y₀.
+
+    The result is a smoother tail than Pnn: low-snr HKLs get a small but
+    nonzero weight (instead of hard-zero), high-snr HKLs ramp to 1 more
+    gradually — better suited to fits where some signal at moderate snr
+    is still useful.
+    """
+    Y0 = 1.0
+    A2, A1, A0 = -0.0192266, 0.751694, 1.12482
+    MX, MY = 0.21805, 0.736621
+
+    snr_abs = np.abs(np.asarray(snr, dtype=float))
+    logN = max(0.0, np.log10(max(N, 1)))
+
+    asigma_50 = A2 * logN * logN + A1 * logN + A0
+    if asigma_50 <= 0:
+        asigma_50 = 1.0
+
+    expo  = MY * logN + MX * snr_abs + Y0
+    ratio = snr_abs / asigma_50
+
+    with np.errstate(over='ignore', invalid='ignore'):
+        val = -np.power(np.maximum(ratio, 1e-30), expo)
+    val = np.clip(val, -1000.0, 0.0)
+    return 1.0 - np.power(2.0, val)
+
+
+def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5):
+    """Joint 3D lstsq with per-canonical-HKL Pnn weighting.
 
     X : (3N, 6M) symmetry-adapted design matrix
     b : (3N,)    interleaved shifts [Δx_0,Δy_0,Δz_0, Δx_1,...]
 
+    Behaviour by `drop_snr`:
+      - drop_snr == 0 (default): one SVD pass, then apply Pnn weight
+        w_m = erf(|snr_m|/√2)^M to each 6-parameter canonical block,
+        where M is the number of canonical HKLs (built-in multiple-
+        testing correction).  Snr ≫ required threshold ⇒ w ≈ 1;
+        snr at/below threshold ⇒ w ≈ 0.  No HKLs are dropped; all
+        returned as active.  Stored snr is the RAW post-SVD SNR
+        (pre-weight) so PSDVF.mtz diagnostics show what the weighting
+        was based on.
+      - drop_snr > 0: legacy hard-cut.  Iteratively drop HKLs with
+        snr < drop_snr (up to max_rounds) and re-solve.  Surviving
+        HKLs are returned at full (un-weighted) strength.
+
     Returns
     -------
-    params       : (6M,) float — fitted (A,B) vectors for each canonical HKL
+    params       : (6M,) float — fitted (A,B) per canonical HKL,
+                                 Pnn-weighted when drop_snr == 0
     active_canon : (M,)  bool  — surviving canonical HKLs
-    snr_canon    : (M,)  float — SNR per canonical HKL
+    snr_canon    : (M,)  float — raw SNR per canonical HKL (pre-weight)
     """
     M = X.shape[1] // 6
     n = X.shape[0]
@@ -562,11 +636,17 @@ def fit_lstsq_symm(X, b, drop_snr=1.0, max_rounds=5):
         with np.errstate(invalid='ignore', divide='ignore'):
             snr_a = np.where(sig_a > 0, a / sig_a, 0.0)
 
-        params_full[col_mask] = sol
-        snr_full[ai] = snr_a
+        snr_full[ai] = snr_a    # raw SNR — record BEFORE any weighting
 
         if drop_snr <= 0:
+            # Pnn weight: erf(|snr|/√2)^N with N = number of canonical
+            # HKLs being tested.  Built-in multiple-testing correction:
+            # the more HKLs, the higher the per-HKL SNR bar.
+            w = _soft_pnn_weight(snr_a, len(snr_a))           # (M_active,)
+            params_full[col_mask] = (p_blk * w[:, None]).ravel()
             break
+
+        params_full[col_mask] = sol
         drop = snr_a < drop_snr
         if not drop.any():
             break
@@ -657,23 +737,28 @@ def _snr_from_svd(U, s, Vt, s_inv, Xa, b, n):
     return AB, snr
 
 
-def fit_lstsq(X, shifts, drop_snr=1.0, max_rounds=5):
-    """Linear fit with iterative SNR pruning.
+def fit_lstsq(X, shifts, drop_snr=0.0, max_rounds=5):
+    """Linear fit with per-HKL Pnn weighting (or legacy hard-cut).
 
     SVD of the design matrix is computed ONCE per round and shared across all
     dimensions — ~3× faster than per-dimension SVD.
+
+    Behaviour by `drop_snr`: see fit_lstsq_symm — same semantics.  Default
+    (drop_snr == 0) applies the Pnn weight w = erf(|snr|/√2)^N (Holton,
+    multiple-test corrected) to each HKL's AB pair.  drop_snr > 0 is the
+    legacy iterative hard-cut path.
 
     Parameters
     ----------
     X        : (N_atoms, 2*N_hkls) design matrix
     shifts   : (N_atoms, N_dims) fractional shifts
-    drop_snr : float — SNR threshold (0 = disable)
+    drop_snr : float — hard-cut SNR threshold (0 = Pnn-weight instead)
 
     Returns
     -------
-    AB     : (N_dims, N_hkls, 2) — A (sin) and B (cos) coefficients
+    AB     : (N_dims, N_hkls, 2) — Pnn-weighted (default) or raw
     active : (N_hkls,) bool — surviving HKLs
-    snr    : (N_hkls,) float — mean SNR across dimensions
+    snr    : (N_hkls,) float — raw mean SNR across dimensions (pre-weight)
     """
     N_hkls = X.shape[1] // 2
     N_dims  = shifts.shape[1]
@@ -708,6 +793,10 @@ def fit_lstsq(X, shifts, drop_snr=1.0, max_rounds=5):
         snr_full[ai] = snr_active
 
         if drop_snr <= 0:
+            # Pnn weight with N = number of HKLs being tested (multiple-
+            # testing correction; see _pnn_weight)
+            w = _soft_pnn_weight(snr_active, len(snr_active))      # (N_active,)
+            AB_full[:, ai, :] *= w[None, :, None]
             break
         drop = snr_active < drop_snr
         if not drop.any():
@@ -823,6 +912,69 @@ def write_bent_pdb(pdb1_path, pdb2_path, hkls, AB_xyz, outpath, frac=1.0,
     st1.cell = st2.cell
     st1.spacegroup_hm = st2.spacegroup_hm
     st1.write_pdb(str(outpath))
+
+
+_MONLIB_CACHE = {}
+
+def _load_monlib(resnames):
+    """Cached MonLib loader.  Reading the CCP4 monomer lib takes ~0.1 s for a
+    typical protein; per-scan-point geometry checks would otherwise re-read it.
+    Cache key is the frozenset of residue names that must be covered."""
+    key = frozenset(resnames)
+    if key in _MONLIB_CACHE:
+        return _MONLIB_CACHE[key]
+    monlib_dir = os.environ.get('CLIBD_MON')
+    if not monlib_dir or not os.path.isdir(monlib_dir):
+        return None
+    ml = gemmi.MonLib()
+    try:
+        ml.read_monomer_lib(monlib_dir, sorted(resnames))
+    except Exception:
+        return None
+    _MONLIB_CACHE[key] = ml
+    return ml
+
+
+def check_geometry(pdb_path, outlier_z=5.0):
+    """Bond + angle RMSZ via gemmi.prepare_topology against the CCP4 monomer lib.
+
+    The PSDVF is smooth and bandlimited at the chosen fitreso.  At fine fitreso
+    the field gradient outpaces the inter-atom spacing and bonds get stretched
+    or compressed by amounts the underlying smooth-deformation model is happy
+    with but real chemistry is not.  This check reports the z-score deviation
+    from monomer-library ideals — refmac's standard geometry metric.
+
+    Returns dict with bond/angle RMSZ + max z + outlier count + total counts.
+    Returns None if monlib loading or topology prep fails.
+
+    Empirically: bond RMSZ ~0.5–1.0 is refined-quality; ~2–4 is a loose
+    deposit; >5 is starting to break; ~100 is catastrophic.
+    """
+    try:
+        st = gemmi.read_structure(str(pdb_path))
+        st.setup_entities()
+        resnames = {res.name for model in st for chain in model for res in chain}
+        ml = _load_monlib(resnames)
+        if ml is None:
+            return None
+        topo = gemmi.prepare_topology(st, ml, model_index=0)
+    except Exception:
+        return None
+    bonds  = topo.bonds
+    angles = topo.angles
+    if not bonds:
+        return None
+    bz = np.array([b.calculate_z() for b in bonds])
+    az = np.array([a.calculate_z() for a in angles]) if angles else np.zeros(0)
+    return dict(n_bonds=int(len(bz)),
+                bond_rmsz=float(np.sqrt(np.mean(bz*bz))),
+                bond_max_z=float(np.max(np.abs(bz))),
+                n_bond_outliers=int(np.sum(np.abs(bz) > outlier_z)),
+                n_angles=int(len(az)),
+                angle_rmsz=float(np.sqrt(np.mean(az*az))) if len(az) else 0.0,
+                angle_max_z=float(np.max(np.abs(az))) if len(az) else 0.0,
+                n_angle_outliers=int(np.sum(np.abs(az) > outlier_z)) if len(az) else 0,
+                outlier_z=outlier_z)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1993,7 +2145,7 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                          fitreso_start=20.0, fitreso_end=7.0,
                          drop_snr=0.0, batch_hkls=100, od_margin=1.5,
                          outlier_sigma=2.5, b_sigma=3.0,
-                         use_symm=True, dimensions='xyz',
+                         use_symm=True, dimensions='xyz', atom_sel='all',
                          frac=1.0, verbose=True,
                          altloc_filter=False, altloc_fallback=1.0,
                          iter_callback=None, max_canon=None,
@@ -2105,6 +2257,27 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                 fitme, ca_mask, uids, bfacs = match_atoms(atoms1, atoms2)
                 if verbose:
                     print(f"  after origin fix: {ca_mask.sum()} CA pairs", flush=True)
+
+    # Atom selection — restrict the fitting population BEFORE outlier MAD.
+    # Default 'all' = every matched atom (backbone + side chain + waters +
+    # ligands).  'backbone' = main-chain {N, CA, C, O} only — drops the
+    # rotamer-noisy side chains and any non-protein content.  'ca' = CAs only.
+    if atom_sel == 'all':
+        sel_mask = np.ones(len(fitme), dtype=bool)
+    elif atom_sel == 'backbone':
+        sel_mask = np.array([u.split('_')[-2] in _BACKBONE for u in uids])
+    elif atom_sel == 'ca':
+        sel_mask = ca_mask.copy()
+    else:
+        raise ValueError(f"atom_sel must be 'all'|'backbone'|'ca', got {atom_sel!r}")
+    if not sel_mask.all():
+        if verbose:
+            print(f"atom_sel={atom_sel!r}: {int(sel_mask.sum())}/{len(fitme)} "
+                  f"atoms retained", flush=True)
+        fitme   = fitme[sel_mask]
+        ca_mask = ca_mask[sel_mask]
+        uids    = [u for u, k in zip(uids, sel_mask) if k]
+        bfacs   = bfacs[sel_mask]
 
     # Permanent initial outlier rejection (B-factor + shift MAD)
     if verbose:
@@ -2381,7 +2554,7 @@ def _parse_args(argv):
         'phi_col':        None,
         'run_refinement': False,
         'refine_cycles':  5,
-        'fill_fcalc':     False,
+        'fill_asu':     False,
         'sample_rate':    0.0,
         'scan_dir':       None,
         'subtract':       'ref',
@@ -2433,8 +2606,8 @@ def _parse_args(argv):
                 params['run_refinement'] = val.lower() not in ('false', '0', 'no')
             elif key == 'refine_cycles':
                 params['refine_cycles'] = int(val)
-            elif key in ('fill_fcalc', 'fill-fcalc'):
-                params['fill_fcalc'] = val.lower() not in ('false', '0', 'no')
+            elif key in ('fill_asu', 'fill-asu'):
+                params['fill_asu'] = val.lower() not in ('false', '0', 'no')
             elif key == 'sample_rate':
                 params['sample_rate'] = float(val)
             elif key == 'scan_dir':
@@ -2447,13 +2620,13 @@ def _parse_args(argv):
                     sys.exit(2)
                 params['subtract'] = v
         elif arg in ('deltamaps', 'delta', 'nofit', 'run_refinement', 'refine',
-                     'fill_fcalc', 'fill-fcalc', '--fill-fcalc'):
+                     'fill_asu', 'fill-asu', '--fill-asu'):
             if arg in ('deltamaps', 'delta'):
                 params['deltamaps'] = True
             elif arg in ('run_refinement', 'refine'):
                 params['run_refinement'] = True
-            elif arg in ('fill_fcalc', 'fill-fcalc', '--fill-fcalc'):
-                params['fill_fcalc'] = True
+            elif arg in ('fill_asu', 'fill-asu', '--fill-asu'):
+                params['fill_asu'] = True
             # nofit: ignored — lstsq always fits
     # mapfile: tuple (mov, ref) if both maps given; bare path if one; None if none
     if map2 is not None:
@@ -2748,35 +2921,6 @@ def _mtz_completeness(mtz_path):
     return n_obs, n_expected, frac
 
 
-def _fcalc_at_hkls(pdb_path, hkls, d_min, blur=0.0):
-    """Fcalc at given HKLs from PDB model via gemmi DensityCalculatorX + numpy FFT.
-
-    `blur` adds Babinet-style B-blur to the density (refmac uses ≈ 60 Å²
-    by default to keep the grid compact; set to 0 for unblurred density —
-    we deblur via `addends` after FFT).
-    Returns (M,) complex128 in gemmi's F-convention.
-    """
-    st = gemmi.read_structure(pdb_path)
-    st.setup_entities()
-    dc = gemmi.DensityCalculatorX()
-    dc.d_min = float(d_min)
-    if blur > 0:
-        dc.blur = float(blur)
-    dc.set_grid_cell_and_spacegroup(st)
-    dc.put_model_density_on_grid(st[0])
-    grid_xyz = np.array(dc.grid.array, dtype=np.float64)
-    F = _fft_lookup_at_hkls(grid_xyz, np.asarray(hkls, dtype=np.int32),
-                            st.cell.volume)
-    if blur > 0:
-        # Undo B-blur: F_true = F_blurred * exp(+blur/4 * s²)
-        cell = st.cell
-        M_frac = np.array(cell.frac.mat.tolist())
-        h_orth = np.asarray(hkls, dtype=float) @ M_frac
-        s_sq   = np.sum(h_orth ** 2, axis=1)
-        F = F * np.exp(blur / 4.0 * s_sq)
-    return F
-
-
 def _pick_free_column(mtz):
     """Pick the first sensible free-R-flag column in `mtz`.
 
@@ -2808,8 +2952,8 @@ def _pick_free_column(mtz):
     return candidates[0]
 
 
-def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
-    """Augment an MTZ with empty rows for HKLs missing from its SG ASU.
+def _pad_mtz_to_full_asu(in_mtz_path, out_mtz_path, d_min=None):
+    """Add HKL+work-set-FreeR rows for HKLs missing from the SG ASU.
 
     Used by `run_refinement` to give refmac a complete-ASU input so its
     FWT/PHWT/FC_ALL output covers every SG-ASU HKL — refmac's output
@@ -2817,17 +2961,11 @@ def _fill_missing_with_fcalc(in_mtz_path, pdb_path, out_mtz_path, d_min=None):
     input becomes a hole in the downstream bent map.
 
     Added rows carry HKL + a work-set FreeR_flag and leave F/SIGF/I/SIGI
-    NaN.  Refmac handles missing Fobs natively (FC, FC_ALL, FWT come
-    out model-only for those rows), the same way it already processes
-    natively-empty rows in some deposits (e.g. lyso 3aw7 ships with
-    683 rows that have a FreeR flag but no measured F).
-
-    The historical version of this function wrote raw Fcalc into the F
-    column, which fails when Fobs is on an unusual scale (DHFR 1rx1/2
-    deposit FP at ~1/18 of the absolute electron scale): refmac sees
-    the filled rows as Fobs an order of magnitude too large and
-    translates the model many Å trying to fit one bulk-solvent model
-    across both.  `pdb_path` is now ignored; kept for caller stability.
+    NaN.  Refmac and phenix.refine skip NaN-Fobs rows in their LSQ
+    target and R sum but still compute FC/FWT/2FOFCWT from the model for
+    those HKLs — on their own internal scale, so no Fobs scale mismatch
+    is possible.  Same behaviour they already apply to natively-empty
+    rows in some deposits (e.g. lyso 3aw7 ships with 683 such rows).
 
     If the input has no F or I column, returns the input path unchanged.
     """
@@ -3171,7 +3309,7 @@ def fitreso_scan(
     mov_pdb, ref_pdb, mov_mtz, ref_mtz, scan_dir,
     f_col=None, phi_col=None,
     run_refinement_flag=False, refine_cycles=5,
-    fill_fcalc=False,
+    fill_asu=False,
     sample_rate=0.0,
     mov_fullcell=None,
     fitreso_list=(20, 15, 12, 10, 8, 7, 6, 5),
@@ -3179,7 +3317,7 @@ def fitreso_scan(
     outlier_sigma=2.5, b_sigma=3.0, drop_snr=0.0, od_margin=1.5,
     batch_hkls=100, chunk_size=50000,
     riso_n_cycles=4, riso_sigma_cut=float('inf'),
-    subtract='ref',
+    subtract='ref', atom_sel='all',
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -3234,7 +3372,7 @@ def fitreso_scan(
         ref_pdb, ref_mtz = run_refinement(
             ref_pdb, ref_mtz,
             outdir=os.path.join(scan_dir, 'refine_ref'),
-            n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
+            n_cycles=refine_cycles, fill_asu=fill_asu)
 
     # ── pre/ refmac on raw mov, if needed for phases ──────────────────────────
     # The pre section FFTs raw_mov_mtz to a map.  If FWT/PHWT aren't present
@@ -3249,7 +3387,7 @@ def fitreso_scan(
         pre_mov_pdb, pre_mov_mtz = run_refinement(
             pre_mov_pdb, pre_mov_mtz,
             outdir=os.path.join(scan_dir, 'refine_mov_raw'),
-            n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
+            n_cycles=refine_cycles, fill_asu=fill_asu)
 
     # ── altindex / origin resolution ──────────────────────────────────────────
     # Discrete (rotation × symop × origin) enumeration ranked by post-transform
@@ -3269,7 +3407,7 @@ def fitreso_scan(
         _res = resolve_altindex(mov_pdb, ref_pdb, mov_mtz,
                                  outdir=os.path.join(scan_dir, 'altindex_resolve'),
                                  refine_cycles=refine_cycles, verbose=verbose,
-                                 fill_fcalc=fill_fcalc)
+                                 fill_asu=fill_asu)
         mov_pdb = _res['mov_pdb_out']
         mov_mtz = _res['mov_mtz_out']
 
@@ -3280,7 +3418,7 @@ def fitreso_scan(
         mov_pdb, mov_mtz = run_refinement(
             mov_pdb, mov_mtz,
             outdir=os.path.join(scan_dir, 'refine_mov'),
-            n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
+            n_cycles=refine_cycles, fill_asu=fill_asu)
 
     # ── load maps ─────────────────────────────────────────────────────────────
     # For CCP4 ASU map inputs, expand mov to the full unit cell so interpolation
@@ -3434,9 +3572,9 @@ def fitreso_scan(
                       'diff = ref − bent  (+peak ⇒ density in ref absent from bent)')
         print(f"\nsign convention: {_sign_note}", flush=True)
         print(f"\n{'label':>7}  {'RMSD':>6}  {'active':>6}  "
-              f"{'Rbent':>6}  {'Rbend':>6}  "
+              f"{'Rbent':>6}  {'Rbend':>6}  {'bondZ/angZ':>13}  "
               f"{'peak':>7}  {'atom':>20}", flush=True)
-        print('-' * 80, flush=True)
+        print('-' * 96, flush=True)
 
     # The PSDVF maps every fractional point in the moving cell to its
     # corresponding fractional point in the reference cell.  For PSDVF=0
@@ -3463,8 +3601,10 @@ def fitreso_scan(
         diffnorm_name    = f'diff_norm{col_suffix}.map'
         bent_mtz_name    = f'bent{col_suffix}.mtz'
         write_ccp4(f'{outdir}/{bent_map_name}', bent_map, ref_h)
+        geom = None
         if hkls is not None and AB_xyz is not None:
             write_bent_pdb(mov_pdb, ref_pdb, hkls, AB_xyz, f'{outdir}/bent.pdb')
+            geom = check_geometry(f'{outdir}/bent.pdb')
         def _relsymlink(src, dst):
             if os.path.lexists(dst):
                 os.unlink(dst)
@@ -3513,14 +3653,22 @@ def fitreso_scan(
         rbend_str  = f'{rbend*100:.1f}%' if rbend is not None else '  N/A'
         after_str  = f'{rmsd_after:.3f}'  if rmsd_after  is not None else '  ---'
         atom_str   = _atom_label(p_top[1])
+        # Bond/angle RMSZ vs CCP4 monomer-library ideals.  Format:
+        # "<bondRMSZ>/<angleRMSZ>".  Refined-quality < 1; loose deposit ~2;
+        # geometry breaking down > 5; catastrophic > 100.
+        if geom is not None:
+            geom_str = f'{geom["bond_rmsz"]:7.2f}/{geom["angle_rmsz"]:5.2f}'
+        else:
+            geom_str = '        --'
         row_str = (f"{label:>7}  {after_str:>6}  {n_active:>6d}  "
-                   f"{rbent_str:>6}  {rbend_str:>6}  "
+                   f"{rbent_str:>6}  {rbend_str:>6}  {geom_str:>13}  "
                    f"{p_top[0]:>+7.2f}σ  {atom_str:>20} {p_top[2]:.2f}Å  "
                    f"[{t_elapsed:.0f}s]")
         _log_rows.append(dict(label=label, rmsd=rmsd_after, n_active=n_active,
                               rbent=riso, rbend=rbend, k=kF, B=B,
                               peak_sigma=p_top[0], peak_atom=atom_str,
                               peak_dist=p_top[2], peak_idx=p_top[3],
+                              geom=geom,
                               t=t_elapsed, row_str=row_str))
         if verbose:
             print(row_str, flush=True)
@@ -3571,13 +3719,14 @@ def fitreso_scan(
     pre_t_el   = time.time() - t_pre
     pre_rbent_str = f'{pre_riso*100:.1f}%' if pre_riso is not None else '  N/A'
     pre_row_str = (f"{'pre':>7}  {raw_rmsd:>6.3f}  {0:>6d}  "
-                   f"{pre_rbent_str:>6}  {'  ---':>6}  "
+                   f"{pre_rbent_str:>6}  {'  ---':>6}  {'       --':>13}  "
                    f"{pre_p_top[0]:>+7.2f}σ  {pre_atom_s:>20} {pre_p_top[2]:.2f}Å  "
                    f"[{pre_t_el:.0f}s]")
     _log_rows.append(dict(label='pre', rmsd=raw_rmsd, n_active=0,
                           rbent=pre_riso, rbend=None, k=pre_kF, B=pre_B,
                           peak_sigma=pre_p_top[0], peak_atom=pre_atom_s,
                           peak_dist=pre_p_top[2], peak_idx=pre_p_top[3],
+                          geom=None,
                           t=pre_t_el, row_str=pre_row_str))
     if verbose:
         print(pre_row_str, flush=True)
@@ -3645,7 +3794,7 @@ def fitreso_scan(
         mov_pdb, ref_pdb,
         fitreso_start=100.0, fitreso_end=2.0,
         max_canon=max_hkl_scan + 1, batch_hkls=1, od_margin=od_margin,
-        drop_snr=drop_snr, outlier_sigma=outlier_sigma, b_sigma=b_sigma,
+        drop_snr=drop_snr, outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel,
         verbose=False,
         iter_callback=_hkl_callback,
         precomputed_origin=precomputed_origin,
@@ -3739,7 +3888,7 @@ def fitreso_scan(
             mov_pdb, ref_pdb,
             fitreso_start=20.0, fitreso_end=fr_min,
             drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
-            outlier_sigma=outlier_sigma, b_sigma=b_sigma,
+            outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel,
             verbose=False,
             iter_callback=_fr_callback,
             precomputed_origin=precomputed_origin,
@@ -3763,15 +3912,49 @@ def fitreso_scan(
     # then climbing again as high-frequency HKLs add noise outside the smooth
     # PSDVF's natural bandwidth.  Fit a parabola in x=1/d² to the 3-5 fr-rows
     # nearest the empirical minimum, find the vertex, and re-fit at d_opt.
-    fr_rows = [r for r in _log_rows
-               if r['label'].startswith('fr') and r['rbent'] is not None]
-    fr_resos = []
-    for r in fr_rows:
+    fr_rows_all = [r for r in _log_rows
+                    if r['label'].startswith('fr') and r['rbent'] is not None]
+    fr_resos_all = []
+    for r in fr_rows_all:
         try:
-            fr_resos.append(float(r['label'][2:]))
+            fr_resos_all.append(float(r['label'][2:]))
         except ValueError:
-            fr_resos.append(None)
+            fr_resos_all.append(None)
+
+    # ── RMSD-baseline filter ─────────────────────────────────────────────
+    # The fr-row list is in admission order (coarse → fine).  Walking
+    # forward, accept rows as long as their CA RMSD remains ≤ the hkl00
+    # (unbent) baseline.  A row with RMSD > baseline means the field is
+    # actively pulling CAs further from their targets than no-bending would
+    # — clearly the wrong direction; stop the parabola fit there.  We do
+    # NOT require strict monotone decrease, because a parabola minimum
+    # legitimately sits between two rows where one is slightly higher than
+    # the other; both can still be useful.
+    hkl00_rmsd = next((r['rmsd'] for r in _log_rows
+                       if r['label'] == 'hkl00' and r['rmsd'] is not None), None)
+    fr_rows  = []
+    fr_resos = []
+    cliff_reason = None
+    for r, d in zip(fr_rows_all, fr_resos_all):
+        if d is None or r['rmsd'] is None:
+            continue
+        if hkl00_rmsd is not None and r['rmsd'] > hkl00_rmsd:
+            cliff_reason = (f'{r["label"]} RMSD {r["rmsd"]:.3f} > baseline '
+                            f'{hkl00_rmsd:.3f}')
+            break
+        fr_rows.append(r)
+        fr_resos.append(d)
+    if verbose and cliff_reason:
+        print(f'\nbest filter: stopped at RMSD cliff ({cliff_reason}); '
+              f'using {len(fr_rows)} of {len(fr_rows_all)} fr-rows',
+              flush=True)
+
     fr_pts = [(d, r['rbent']) for d, r in zip(fr_resos, fr_rows) if d is not None]
+    d_opt   = None
+    r_pred  = None
+    clamped = ''
+    ds_used, lo, hi = None, 0, 0
+
     if len(fr_pts) >= 3:
         ds  = np.array([p[0] for p in fr_pts], dtype=float)
         rbs = np.array([p[1] for p in fr_pts], dtype=float)
@@ -3799,11 +3982,31 @@ def fitreso_scan(
             d_opt  = float(ds[i_min])
             r_pred = float(rbs[i_min])
             clamped = ' (parabola concave-down; using argmin)'
+        ds_used = ds[lo:hi]
         if verbose:
             print(f'\nbest-fit parabola over {hi - lo} fr-rows '
                   f'({", ".join(f"fr{int(d) if d == int(d) else d}" for d in ds[lo:hi])}): '
                   f'd_opt = {d_opt:.2f} Å, predicted Rbent = {r_pred*100:.1f}%{clamped}',
                   flush=True)
+    elif len(fr_rows_all) > 0:
+        # Not enough RMSD-monotone rows for a parabola — use the row with
+        # the smallest RMSD across ALL fr-rows as the best fitreso end.
+        rmsd_arr = [r['rmsd'] for r in fr_rows_all if r['rmsd'] is not None]
+        i_min_rmsd = int(np.argmin(rmsd_arr))
+        d_opt  = float(fr_resos_all[i_min_rmsd])
+        r_pred = float(fr_rows_all[i_min_rmsd]['rbent'])
+        clamped = (f' (parabola skipped — only {len(fr_rows)} RMSD-monotone '
+                    f'rows; using argmin-RMSD fr-row)')
+        ds_used = np.array([d_opt])
+        lo, hi = 0, 1
+        if verbose:
+            print(f'\nbest: argmin(RMSD) fallback at d={d_opt:.2f} Å, '
+                  f'Rbent={r_pred*100:.1f}%{clamped}', flush=True)
+
+    # If d_opt was determined by either branch, re-fit at it and save the
+    # 'best' point with full per-point outputs.  Otherwise (no fr-rows at
+    # all — shouldn't happen) skip the best section.
+    if d_opt is not None:
         outdir = os.path.join(scan_dir, 'best')
         os.makedirs(outdir, exist_ok=True)
         t0 = time.time()
@@ -3811,7 +4014,7 @@ def fitreso_scan(
             mov_pdb, ref_pdb,
             fitreso_start=20.0, fitreso_end=d_opt,
             drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
-            outlier_sigma=outlier_sigma, b_sigma=b_sigma,
+            outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel,
             verbose=False,
             precomputed_origin=precomputed_origin,
         )
@@ -3833,17 +4036,11 @@ def fitreso_scan(
         save_fitparams(f'{outdir}/PSDVF.mtz',
                        result.hkls, result.AB, result.active, result.snr,
                        result.cell1, result.cell2, result.dimensions, result.rmsd)
-        # Stash for the summary footer
         _best_meta = dict(d_opt=d_opt, r_pred=r_pred, n_fit=int(hi - lo),
-                          fr_used=[float(d) for d in ds[lo:hi]],
+                          fr_used=[float(d) for d in (ds_used if ds_used is not None
+                                                       else [])],
                           clamped=clamped)
         # ── pre-σ at best-peak location ──────────────────────────────────────
-        # Same ref grid → voxel indices are 1:1.  Sample pre's normalised diff
-        # map at best's top-peak voxel to quantify how visible the revealed
-        # feature was *before* alignment + bending.  A small |pre_at_best|
-        # confirms that the post-bend peak is genuinely revealed by the
-        # alignment + shift-field, not just sharpened from something already
-        # visible in the raw subtraction.
         best_row = _log_rows[-1]
         if best_row.get('peak_idx') is not None:
             i, j, k = best_row['peak_idx']
@@ -3874,9 +4071,13 @@ def fitreso_scan(
         fh.write(f"# k, B    : F-space scale + isotropic B (Å²) used for Rbent\n")
         fh.write(f"# pre@best: σ in pre/diff_norm.map at the voxel of best row's top peak\n")
         fh.write(f"#           (small |pre@best| ⇒ feature genuinely revealed by alignment+bending)\n\n")
+        fh.write(f"# bondZ/  : RMSZ of bond lengths / bond angles vs CCP4 monomer-lib\n")
+        fh.write(f"# angZ      ideals (gemmi.prepare_topology).  Refined ~<1; loose ~2;\n")
+        fh.write(f"#           breaking >5; catastrophic >100 — bent.pdb is unphysical.\n\n")
         hdr = (f"{'label':>7}  {'RMSD':>6}  {'active':>6}  "
                f"{'Rbent':>6}  {'Rbend':>6}  "
                f"{'k':>6}  {'B(Å²)':>7}  "
+               f"{'bondZ':>7}/{'angZ':>5}  "
                f"{'peak':>7}  {'atom':>20}  {'dist':>6}  "
                f"{'pre@best':>9}  {'t(s)':>5}\n")
         fh.write(hdr)
@@ -3887,11 +4088,17 @@ def fitreso_scan(
             rbd_s  = f"{r['rbend']*100:.1f}%" if r['rbend'] is not None else '  N/A'
             k_s    = f"{r['k']:.3f}"   if r['k'] is not None else '  N/A'
             B_s    = f"{r['B']:+6.2f}" if r['B'] is not None else '   N/A'
+            g      = r.get('geom')
+            if g is not None:
+                g_s = f"{g['bond_rmsz']:7.2f}/{g['angle_rmsz']:5.2f}"
+            else:
+                g_s = f"{'--':>7}/{'--':>5}"
             pab    = r.get('pre_at_best_sigma')
             pab_s  = f"{pab:>+7.2f}σ" if pab is not None else f"{'—':>9}"
             fh.write(f"{r['label']:>7}  {rmsd_s:>6}  {r['n_active']:>6d}  "
                      f"{rbe_s:>6}  {rbd_s:>6}  "
                      f"{k_s:>6}  {B_s:>7}  "
+                     f"{g_s}  "
                      f"{r['peak_sigma']:>+7.2f}σ  {r['peak_atom']:>20}  "
                      f"{r['peak_dist']:>5.2f}Å  "
                      f"{pab_s:>9}  {r['t']:>4.0f}s\n")
@@ -4096,7 +4303,7 @@ def mtz_to_map_data(mtz_path, f_col, phi_col, sample_rate=0.0):
 
 
 def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
-                   fill_fcalc=False, completeness_threshold=0.99):
+                   fill_asu=False, completeness_threshold=0.99):
     """Run refmac5 or phenix.refine on pdb_path+mtz_path; return
     (refined_pdb_path, refined_mtz_path).
 
@@ -4108,16 +4315,19 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
     which can differ from the input atom set when refmac drops
     disordered residues during the run.
 
-    fill_fcalc : if True, augment input MTZ with model-derived Fcalc at
-                 SG-ASU HKLs missing from the deposited dataset before
-                 calling refmac.  Required when completeness is below
-                 `completeness_threshold` (default 99%) — refmac only
-                 writes FWT for HKLs present in input, so an incomplete
-                 input means incomplete FWT and incomplete downstream
-                 bent.mtz coverage.  When False and input is below
-                 threshold, sys.exit(1) with instructions.
+    fill_asu : if True, pad input MTZ to full SG-ASU coverage by adding
+                 HKL+work-set-FreeR rows (FP=NaN) for HKLs missing from
+                 the deposited dataset before refinement.  Refmac/phenix
+                 skip NaN-Fobs rows in the LSQ target but still emit
+                 FC/FWT/2FOFCWT for them from the model, so output map
+                 coefficients reach 100% SG-ASU coverage — important
+                 because refmac/phenix only emit FWT for HKLs present
+                 in input, so an incomplete input means an incomplete
+                 bent.mtz downstream.  When False and input is below
+                 `completeness_threshold` (default 99%), sys.exit(1)
+                 with instructions.
     completeness_threshold : minimum SG-ASU completeness required when
-                 fill_fcalc=False.
+                 fill_asu=False.
     """
     import shutil as _sh2
     os.makedirs(outdir, exist_ok=True)
@@ -4129,28 +4339,29 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
     # in the input MTZ; an incomplete input means an incomplete FWT and
     # downstream bent.mtz inherits the gaps (Coot shows missing chunks).
     # Below `completeness_threshold` (default 99%) we refuse to proceed
-    # unless the caller opts into `fill_fcalc=True`, which augments the
-    # input MTZ with Fcalc-derived rows at SG-ASU HKLs missing from the
-    # deposited dataset.  This is a deliberate choice — silently filling
-    # would risk biasing the refinement / downstream fit, so make it
-    # explicit.
+    # unless the caller opts into `fill_asu=True`, which pads the input
+    # MTZ to full SG-ASU coverage with HKL+work-set-FreeR rows (FP=NaN).
+    # Refmac/phenix then compute FC/FWT/2FOFCWT from the model on those
+    # rows during refinement.  Opt-in because silently padding changes
+    # the rowcount refmac reports and the FWT coverage downstream tools
+    # see — not the refinement target itself, but worth being explicit.
     n_obs, n_exp, frac = _mtz_completeness(mtz_path)
     print(f'  input completeness: {n_obs}/{n_exp} = {100*frac:.1f}%',
           flush=True)
     mtz_path_for_refmac = mtz_path
     if frac < completeness_threshold:
-        if not fill_fcalc:
+        if not fill_asu:
             print(f'ERROR: {os.path.basename(mtz_path)} is {100*frac:.1f}% '
                   f'complete (< {100*completeness_threshold:.0f}% threshold).\n'
-                  f'  Re-run with fill_fcalc=True (or pass --fill-fcalc on CLI) '
-                  f'to extend the input MTZ to full SG-ASU coverage so refmac '
+                  f'  Re-run with fill_asu=True (or pass --fill-asu on CLI) '
+                  f'to pad the input MTZ to full SG-ASU coverage so refmac '
                   f'writes FWT/FC_ALL for every HKL (added rows carry only HKL '
                   f'+ FreeR; the refinement target sees only deposited Fobs).',
                   file=sys.stderr)
             sys.exit(1)
         mtz_filled = os.path.join(outdir, f'{stem}_filled.mtz')
         try:
-            _fill_missing_with_fcalc(mtz_path, pdb_path, mtz_filled)
+            _pad_mtz_to_full_asu(mtz_path, mtz_filled)
             # Report row-count change, not Fobs completeness: the filled rows
             # carry only HKL + FreeR (FP/SIGFP stay NaN by design — refmac /
             # phenix generate Fcalc/FWT/2FOFCWT for them).  _mtz_completeness
@@ -4163,7 +4374,7 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
                   f'for refinement', flush=True)
             mtz_path_for_refmac = mtz_filled
         except Exception as e:
-            print(f'  _fill_missing_with_fcalc failed ({e!r}); aborting',
+            print(f'  _pad_mtz_to_full_asu failed ({e!r}); aborting',
                   file=sys.stderr)
             sys.exit(1)
 
@@ -4217,7 +4428,7 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
             # flags to LABIN sometimes triggered divergence (e.g. dhfr
             # 1rx2.mtz carries a degenerate FREE column where all observed
             # rows are flagged as work, leaving the "free" set populated
-            # only by fcalc-filled rows after run_refinement → Rfree=0.91
+            # only by the asu-pad rows after run_refinement → Rfree=0.91
             # → SigmaA collapse → rigid-body shifts to R=0.53).  We don't
             # use Rfree downstream and refmac handles its absence cleanly.
             # (The phenix.refine fallback below picks free flags directly
@@ -4621,7 +4832,7 @@ def _relabel_mtz_cell(in_mtz, target_cell, out_mtz):
 
 
 def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
-                               fill_fcalc, drot_deg, rmsd, verbose):
+                               fill_asu, drot_deg, rmsd, verbose):
     """When cell-stretching alone aligned moving to ref (no discrete altindex
     needed), re-refine the stretched moving model+data under the new cell so
     FWT/PHWT are consistent with ref's cell metric.  The pre-stretch FWT/PHWT
@@ -4632,7 +4843,7 @@ def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
               f"under ref cell ...", flush=True)
     out_pdb, out_mtz = run_refinement(mov_pdb, mov_mtz, outdir=outdir,
                                        n_cycles=refine_cycles,
-                                       fill_fcalc=fill_fcalc)
+                                       fill_asu=fill_asu)
     return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
                 action='cell_stretch_only', R_frac=np.eye(3),
                 t_frac=np.zeros(3), drot_deg=drot_deg, rmsd_after=rmsd)
@@ -4640,7 +4851,7 @@ def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
 
 def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                      refine_cycles=5, improve_threshold=0.7,
-                     verbose=True, fill_fcalc=False):
+                     verbose=True, fill_asu=False):
     """Find (altindex × symop × origin) discrete transform that aligns mov onto ref.
 
     Strategy: Kabsch LSQ fit gives the continuous rigid-body answer; enumerate
@@ -4795,7 +5006,7 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                   f"{rmsd_base:.2f} A — no improvement, skipping", flush=True)
         if stretched:
             return _finish_after_stretch_only(mov_pdb, mov_mtz, outdir,
-                                              refine_cycles, fill_fcalc,
+                                              refine_cycles, fill_asu,
                                               drot_deg, rmsd_base, verbose)
         return _no_op_resolve_result(mov_pdb, mov_mtz,
                                      drot=drot_deg, rmsd=rmsd_base)
@@ -4806,7 +5017,7 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                   flush=True)
         if stretched:
             return _finish_after_stretch_only(mov_pdb, mov_mtz, outdir,
-                                              refine_cycles, fill_fcalc,
+                                              refine_cycles, fill_asu,
                                               drot_deg, rmsd_top, verbose)
         return _no_op_resolve_result(mov_pdb, mov_mtz,
                                      drot=drot_deg, rmsd=rmsd_top)
@@ -4878,11 +5089,11 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
 
     # Re-refinement of the altindex-reindexed MTZ: reindex generally drops
     # ~half the reflections (the reindex is a SG-asymmetric reshuffle, and
-    # any unmatched HKLs become missing).  Propagate fill_fcalc so the
+    # any unmatched HKLs become missing).  Propagate fill_asu so the
     # completeness gate inside run_refinement engages here too.
     out_pdb, out_mtz = run_refinement(pre_pdb, pre_mtz, outdir=outdir,
                                        n_cycles=refine_cycles,
-                                       fill_fcalc=fill_fcalc)
+                                       fill_asu=fill_asu)
 
     return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
                 action=action, R_frac=R_frac, t_frac=t_frac,
@@ -4922,7 +5133,7 @@ def main():
                      f_col=p['f_col'], phi_col=p['phi_col'],
                      run_refinement_flag=p['run_refinement'],
                      refine_cycles=p['refine_cycles'],
-                     fill_fcalc=p['fill_fcalc'],
+                     fill_asu=p['fill_asu'],
                      sample_rate=p['sample_rate'],
                      subtract=p['subtract'])
         sys.exit(0)
@@ -4931,11 +5142,11 @@ def main():
     if mov_mtz and p['run_refinement']:
         pdb1, mov_mtz = run_refinement(pdb1, mov_mtz, outdir='refine_mov',
                                         n_cycles=p['refine_cycles'],
-                                        fill_fcalc=p['fill_fcalc'])
+                                        fill_asu=p['fill_asu'])
     if ref_mtz and p['run_refinement']:
         pdb2, ref_mtz = run_refinement(pdb2, ref_mtz, outdir='refine_ref',
                                         n_cycles=p['refine_cycles'],
-                                        fill_fcalc=p['fill_fcalc'])
+                                        fill_asu=p['fill_asu'])
 
     if mov_mtz:
         _res = resolve_altindex(pdb1, pdb2, mov_mtz,

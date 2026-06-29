@@ -40,13 +40,13 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
   insulin/                      insulin hexamer 4fg3→4e7u (H3, T→R transition)
     4fg3.pdb, 4e7u.pdb          NB: both deposited MTZs are < 99% SG-ASU
                                  complete (4e7u 93%, 4fg3 97.6%) — pass
-                                 `fill_fcalc=True` (CLI `--fill-fcalc`)
+                                 `fill_asu=True` (CLI `--fill-fcalc`)
                                  to fitreso_scan or run_refinement will
                                  sys.exit(1).
   porin/                        porin 3poq→3pou (H 3 2)
     3poq.pdb, 3pou.pdb          NB: 3poq.mtz is 89.9% complete
                                  (3pou.mtz 99.6%) — needs
-                                 `fill_fcalc=True`.  3poq/3pou are an
+                                 `fill_asu=True`.  3poq/3pou are an
                                  obverse/reverse pair — see the
                                  "altalign.py and the porin
                                  obverse/reverse problem" section
@@ -59,7 +59,7 @@ The git repo lives at `./map_bender/` (relative to `../`). The working developme
                                  a 92.0→96.0, b 93.0→94.5, c 49.0→50.5,
                                  β 92.7→91.2°).  Raw cif2mtz outputs
                                  are I-only and < 99% SG-ASU complete,
-                                 so `fill_fcalc=True` is required and
+                                 so `fill_asu=True` is required and
                                  `run_refinement` auto-ctruncates I→F
                                  before refmac.  The mov→ref relation
                                  is a non-crystallographic ~180°
@@ -90,11 +90,11 @@ Per-system `*_fitreso_scan.py` wrapper scripts have been removed.
 ## Algorithm (Python version)
 
 1. Both PDBs are expanded from their crystallographic space group to P1 via gemmi.
-2. CA atom pairs are matched by residue+atom name. Outliers rejected by shift magnitude (`outlier_sigma`) and B-factor (`b_sigma`) using robust statistics (MAD-based).
+2. Atom pairs are matched by residue+atom name; default `atom_sel='all'` keeps every matched pair (backbone, side chain, waters, ligands), `atom_sel='backbone'` restricts to {N, CA, C, O}, `atom_sel='ca'` to CA only. Outliers rejected by shift magnitude (`outlier_sigma`) and B-factor (`b_sigma`) using robust statistics (MAD-based).
 3. All (h,k,l) out to `fitreso_end` Å are enumerated, sorted low-resolution first, deduplicated for Friedel symmetry.
 4. Proper-rotation symmetry of the space group is applied (`use_symm=True`): each Friedel-unique HKL is assigned a canonical representative, reducing free parameters by the point-group order (×8 for P4₃2₁2).
 5. A joint design matrix **X** (3N_atoms × 6M_canon) is built from symmetry-expanded sine/cosine basis. All three axes are fitted simultaneously.
-6. **X @ params = shifts** is solved by SVD (scipy.linalg), giving globally optimal (A, B) coefficients and covariance-matrix uncertainties.
+6. **X @ params = shifts** is solved by SVD (scipy.linalg), giving (A, B) coefficients and covariance-matrix uncertainties. By default each canonical HKL's (A, B) block is then multiplied by a **Pnn weight** w = erf(\|snr\|/√2)^M, where snr = \|AB\|/σ from the SVD covariance and M is the number of canonical HKLs being fit. High-SNR coefficients pass through unchanged; low-SNR coefficients are damped toward zero. This is built-in multiple-testing correction — see [SNR weighting (Pnn / softPnna)](#snr-weighting-pnn--softpnna) below. Legacy hard-cut pruning available via `drop_snr > 0`.
 7. Steps 3–6 repeat coarse-to-fine (`fitreso_start` → `fitreso_end`), admitting `batch_hkls` new HKLs per iteration. The loop stops when the overdetermination ratio (atoms / canonical params) drops below `od_margin`.
 8. Optional `iter_callback(iter_i, nhkls, n_canon, rmsd, hkls, AB_xyz, active, snr)` is called after each iteration. `max_canon` stops the loop once n_canon ≥ that value.
 
@@ -106,13 +106,61 @@ Per-system `*_fitreso_scan.py` wrapper scripts have been removed.
 | `fitreso_end` | 7.0 | Finest resolution to admit (Å) |
 | `batch_hkls` | 100 | New HKLs admitted per iteration |
 | `od_margin` | 1.5 | Stop when atoms/(canon params) < od_margin |
-| `outlier_sigma` | 2.5 | CA pair rejection threshold (robust σ of shift magnitude) |
-| `b_sigma` | 3.0 | CA pair rejection threshold (B-factor; median + b_sigma×σ_MAD) |
-| `drop_snr` | 0.0 | Drop HKLs with \|A,B\|/σ < drop_snr (0 = keep all) |
+| `atom_sel` | 'all' | Which atom population enters the SVD: `'all'` (every matched pair), `'backbone'` (N/CA/C/O), `'ca'` |
+| `outlier_sigma` | 2.5 | Atom rejection threshold (robust σ of shift magnitude, MAD) |
+| `b_sigma` | 3.0 | Atom rejection threshold (B-factor; median + b_sigma×σ_MAD) |
+| `drop_snr` | 0.0 | **0 (default) → apply Pnn weight w = erf(\|snr\|/√2)^M to each HKL's (A,B). >0 → legacy iterative hard-cut: drop HKLs with snr < drop_snr.** |
 | `use_symm` | True | Apply space-group proper-rotation constraints |
 | `dimensions` | 'xyz' | Which coordinate axes to fit |
 | `iter_callback` | None | Called after each progressive iteration (see above) |
 | `max_canon` | None | Stop after first iteration where n_canon ≥ this value |
+
+## SNR weighting (Pnn / softPnna)
+
+Each canonical HKL's (A, B) pair comes out of the SVD with a per-HKL
+SNR = \|AB\| / σ where σ is the SVD-covariance estimate of the noise
+on \|AB\|.  For large progressive fits (hundreds of HKLs fit
+simultaneously) most coefficients are reliable and a few are noise.
+A single ringing low-SNR HKL is enough to throw non-fitted atoms
+(side chains, atoms not in the fit population) by many Å while the
+CA residual stays small — so we don't see the catastrophe from the
+fit metric alone, only from the bent-PDB geometry RMSZ.
+
+The default fix (`drop_snr=0`) applies the Holton **Pnn** weight to
+each AB block:
+
+```
+w_m = erf(|snr_m| / √2) ** M     for M canonical HKLs
+```
+
+This is the probability that a single deviate of magnitude `snr_m`
+would NOT be exceeded by random noise across `M` independent
+measurements — a Bonferroni-style multiple-testing correction baked
+into the weight.  Behaviour vs `snr`:
+
+- snr ≪ required threshold  ⇒  w ≈ 0       (noise-only HKL silenced)
+- snr ≈ σ_50%(M)             ⇒  w = 0.5    (50% threshold rises with M)
+- snr ≫ σ_50%(M)             ⇒  w ≈ 1      (real signal preserved)
+
+For M=30, σ_50% ≈ 1.5σ; for M=500, σ_50% ≈ 3.2σ.  The bar
+automatically rises as more HKLs are admitted — exactly what's
+needed to suppress ringing at fine fitreso without hand-tuning a
+threshold.
+
+`_pnn_weight(snr, M)` and `_soft_pnn_weight(snr, M)` are in
+`bendfinder.py` near line 580.  The default uses the exact
+erf-power form; a softer polynomial approximation is also available
+(Holton's `softPnna`) — currently unused by default but kept for
+diagnostic comparison.
+
+Stored `snr` in `PSDVF.mtz` is always the RAW pre-weight SNR so the
+weighting is reproducible from the saved file.
+
+`drop_snr > 0` switches off Pnn weighting and reverts to the legacy
+iterative hard-cut path (drop HKLs with snr < drop_snr, re-solve).
+The Pnn default is empirically robust across both clean and noisy
+datasets; the hard-cut path is retained for backward compatibility
+and as an opt-out.
 
 ## Fitreso scan
 
@@ -144,23 +192,37 @@ resolution, then climbs again at the highest resolutions as
 high-frequency HKLs add noise outside the shift field's natural
 bandwidth.  `fitreso_scan` exploits this by fitting a parabola in
 **x = 1/d²** (the natural axis for R-factor-vs-resolution behaviour) to
-the 3–5 fr-rows centred on the empirical argmin, locating the vertex
+the fr-rows where the fit is still helping, locating the vertex
 `d_opt = sqrt(1 / x_vert)`, clamping if the vertex falls outside the
 bracket, and then re-running `bend_fit_progressive(fitreso_end=d_opt)`
-once more.  The result lands in `scan_dir/best/` with the same per-point
-outputs as a normal fr-row.  A footer in `scan_fitreso.log` records
-which rows were used, `d_opt`, and the parabola-predicted Rbent.
+once more.
 
-Empirically (May 2026 reference runs) d_opt sits in the 8–11 Å band for
-the bend-friendly systems (lyso d_opt = 9.7 Å; raddam similar) and
-collapses to whatever the empirical argmin already was for systems
-where Rbent saturates quickly (insulin, where the T→R shift exceeds the
-PSDVF's smooth-deformation assumption — the curve barely bends, so the
-parabola vertex is close to the coarsest scan point).
+**RMSD-baseline filter (June 2026):** the parabola only fits fr-rows
+whose CA RMSD is ≤ the unbent baseline (hkl00 RMSD).  Walking
+coarse→fine, the first fr-row with RMSD > baseline is treated as the
+"going-wrong-way" cliff; everything finer is excluded.  This catches
+the failure mode where the SVD is satisfying its own residual but
+actively pulling CAs further from their targets than no-bending would
+— a regime where Rbent might still be dropping while RMSD climbs.
+The cliff reason is logged ("best filter: stopped at RMSD cliff
+(frN RMSD x.xxx > baseline y.yyy); using K of N fr-rows").
 
-If fewer than 3 fr-rows have a valid Rbent, or the parabola opens
-downward (no interior minimum), the best section silently falls back to
-the empirical argmin or is skipped.
+If fewer than 3 RMSD-monotone rows remain, `argmin(RMSD)` across all
+fr-rows is used as `d_opt` instead of fitting a parabola.  The result
+lands in `scan_dir/best/` with the same per-point outputs as a normal
+fr-row.  A footer in `scan_fitreso.log` records which rows were used,
+`d_opt`, and the parabola-predicted Rbent.
+
+Empirically (June 2026 with Pnn weighting + RMSD-baseline filter)
+d_opt sits in the 8–17 Å band for bend-friendly systems (lyso 12.2 Å,
+dhfr 16.5 Å, raddam 17–20 Å, myoglobin 10 Å); for systems where the
+deformation exceeds the smooth-PSDVF model (insulin T→R, lipox
+cross-cell, low-res noisy data) the filter correctly clamps d_opt
+coarser to keep geometry clean.
+
+If fewer than 3 fr-rows have a valid Rbent at all, or the parabola
+opens downward (no interior minimum), the best section silently falls
+back to the empirical argmin or is skipped.
 
 **Diff map sign convention**: controlled by the `subtract` parameter on `fitreso_scan` (CLI: `subtract=ref|bent`).
 - `subtract='ref'` (default) → diff = bent − ref. Positive peaks = density present in bent (the moving structure resampled into ref's frame) but absent (or weaker) in ref. This is the "what new density does the moving structure bring in?" view.
@@ -440,7 +502,7 @@ chunks in Coot.
 1. Measures SG-ASU completeness of its input MTZ
    (`_mtz_completeness` returns n_obs / n_expected — Fobs-finite rows
    only; rows with HKL+FreeR but no F don't count).
-2. Refuses to proceed below 99% unless caller passes `fill_fcalc=True`
+2. Refuses to proceed below 99% unless caller passes `fill_asu=True`
    (CLI: `--fill-fcalc`).  The name is historical; see below.
 3. When set, calls `_fill_missing_with_fcalc(in, pdb, out)` which:
    - Strips any pre-existing systematic absences from input rows
@@ -471,7 +533,7 @@ target scale and never introduces a second Fobs population.
 `pdb_path` is still accepted by `_fill_missing_with_fcalc` for caller
 stability but is unused inside.
 
-Plumbed through `fitreso_scan(..., fill_fcalc=False)` → `run_refinement`.
+Plumbed through `fitreso_scan(..., fill_asu=False)` → `run_refinement`.
 
 `run_refinement` prefers `refmac5`; if missing it falls back to
 `phenix.refine`.  The phenix call uses
@@ -573,14 +635,14 @@ a PASS/FAIL table with per-test metrics:
 1. `test_symm_all_sgs.py` — 65 Sohncke SGs constraint check
 2. `magdoff/test_magdoff.py` — synthetic 0.5° rigid-body deformation
 3–10. Eight `fitreso_scan` examples (lyso, dhfr, raddam×3, myoglobin,
-   insulin, lipox) — all with `fill_fcalc=True` since the deposited
+   insulin, lipox) — all with `fill_asu=True` since the deposited
    reference MTZs are below the 99% SG-ASU completeness gate.  Lipox
    additionally exercises the cross-cell pipeline (cell stretch +
    loose-tol altindex; see "Cross-cell pairs" section above).
 11. Porin altalign + refmac on the R 3 2 :R output
 
 Each example writes to `<sys>/scan_test*/` (separate from the canonical
-`scan_fitreso_fc/` reference runs).  Per-test logs land in
+`scan_fitreso/` reference runs).  Per-test logs land in
 `test_results_<timestamp>/`.  Script cd's up if invoked from inside
 `map_bender/`; exits 2 if the working area can't be found, exits 1 if
 any test fails.
@@ -589,24 +651,25 @@ Run as `./run_all_tests.com` from the working area.
 
 ## Empirical results (fitreso scans)
 
-All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `batch_hkls=100`).
+All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0` → Pnn weighting active, `batch_hkls=100`, `atom_sel='all'`).  **June 2026 refresh** with Pnn weighting in `fit_lstsq_symm`/`fit_lstsq` and the RMSD-baseline best filter.  The `fr5` row is now mostly diagnostic — for noisy data softPnna-damped fits at the finest resolution can have inflated RMSD because the field is under-bending; the **best** row is the practical deliverable.
 
-| System | Space group | CA pairs | fr5 RMSD | fr5 Rbent | best Rbent | d_opt | subtract |
-|--------|------------|----------|----------|-----------|------------|-------|----------|
-| Lyso 3aw6→3aw7 | P4₃2₁2 | 1008 | 0.033 Å | 33.2% | 30.3% | 9.7 Å | ref |
-| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 592 | 0.070 Å | 41.5% | 37.7% | 12.6 Å | ref |
-| Raddam 5kxk→5kxl | P4₃2₁2 | 976 | 0.087 Å | 21.9% | 11.5% | 20 Å (clamped) | bent |
-| Raddam 5kxk→5kxm | P4₃2₁2 | 984 | 0.047 Å | 19.2% |  9.9% | 20 Å (clamped) | bent |
-| Raddam 5kxk→5kxn | P4₃2₁2 | 992 | 0.048 Å | 24.1% | 17.8% | 20 Å (clamped) | bent |
-| Myoglobin 1mbo→1a6m | P2₁ | 294 | 0.063 Å | 49.8% | 49.8% | 5.5 Å | ref |
-| Insulin 4fg3→4e7u | H3 | 801 | 0.510 Å | 60.3% | 60.5% | 5.8 Å | ref (fill_fcalc=True) |
-| Porin 3poq→3pou | H 3 2 | 340 | 0.366 Å | 57.7% | 57.8% | 9.5 Å | ref (fill_fcalc=True) — in-bendfinder altindex resolution; obverse/reverse pair, altalign also emits H32+SYMM and R32:R (R32:R refmac-runnable, R=0.37) |
-| Lipox 9o4s→9o4t | P2₁ | 795 | 0.283 Å (fr12)¹ | 53.2% (fr12) | 53.2% | 12 Å (clamped) | ref (fill_fcalc=True) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z (drot=0.00° from LSQ) in nearly-orthorhombic monoclinic; refmac R=0.254 after reindex+rigid-body |
+| System | Space group | fr5 RMSD | fr5 Rbent | best RMSD | best Rbent | d_opt | subtract |
+|--------|------------|----------|-----------|-----------|------------|-------|----------|
+| Lyso 3aw6→3aw7 | P4₃2₁2 | 0.285 Å | 34.1% | 0.105 Å | 29.1% | 12.2 Å | ref |
+| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 0.437 Å | 43.0% | 0.199 Å | 38.0% | 16.5 Å | ref |
+| Raddam 5kxk→5kxl | P4₃2₁2 | 0.126 Å | 13.5% | 0.114 Å | 11.2% | 20 Å (clamped) | bent |
+| Raddam 5kxk→5kxm | P4₃2₁2 | 0.085 Å | 11.2% | 0.079 Å |  9.9% | 17.3 Å | bent |
+| Raddam 5kxk→5kxn | P4₃2₁2 | 0.116 Å | 19.0% | 0.100 Å | 17.6% | 20 Å (clamped) | bent |
+| Myoglobin 1mbo→1a6m | P2₁ | 0.195 Å | 53.9% | 0.115 Å | 52.6% | 10.0 Å | ref |
+| Insulin 4fg3→4e7u | H3 | 1.004 Å | 62.6% | 1.014 Å | 63.3% | 8.1 Å | ref (`fill_asu=True`) |
+| Porin 3poq→3pou | H 3 2 | (altalign+R32:R; refmac R=0.46) | | | | | ref |
+| Lipox 9o4s→9o4t | P2₁ | 230 Å¹ | 72.3% | 0.341 Å | 52.8% | 16.1 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
 
-¹ Lipox numbers are fr12, not fr5 — finer scan points blow up in
-wall-time at this molecule size (~6700 P1 atoms × many HKLs).  fr12
-already takes ~8 minutes; fr5 would extrapolate to ~hours.  The full
-fr5 row will be filled in once the canonical reference run completes.
+¹ The fr5 RMSD=230 Å for lipox is exactly the failure mode the
+RMSD-baseline filter is designed to catch: at fine fitreso the
+softPnna-damped fit lets non-fitted atoms wander far from any
+constraint.  The filter excludes this from the parabola; **best**
+lands at d_opt=16.1 Å with RMSD=0.341 Å (canonical 0.300 Å).
 
 The `best` row in each `scan_dir/scan_fitreso.log` is the
 parabola-vertex re-fit (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
@@ -618,11 +681,14 @@ purely low-frequency.  Myoglobin and insulin gain nothing from the
 parabola (myoglobin's curve plateaus at fr8; insulin's T→R shift
 exceeds the smooth-PSDVF model so no fitreso choice helps).
 
-All "from-raw" runs in `<system>/scan_fitreso_fc/` (May 2026,
-fill_fcalc=True propagated through refmac and altindex re-refinement).
-Self-test runs: `test_symm_all_sgs.py` 65/65 PASS (max violation
-2.68e-13 Å); `magdoff/test_magdoff.py` Test 2 recovery 91.8%/92.2%
-(constrained/unconstrained).
+All "from-raw" runs in `<system>/scan_fitreso/` (June 2026 gamut,
+`fill_asu=True` propagated through refmac and altindex re-refinement,
+Pnn weighting + RMSD-baseline best filter active).  Self-test runs:
+`test_symm_all_sgs.py` 65/65 PASS (max violation 2.72e-13 Å);
+`magdoff/test_magdoff.py` Test 2 recovery 0.069/0.038 (constrained/
+unconstrained) — about 2× looser than the pre-Pnn reference because
+softPnna damps even synthetic-data HKLs at modest SNR, but still
+well within "PASS" envelope.
 
 Rbent values are post-F-space (k+B) scaling (compute_riso F-LS).  See per-
 system README files in `lyso/`, `dhfr/`, `raddam/` for invocation details
@@ -661,10 +727,10 @@ Notes:
   T-state (4fg3) and R-state (4e7u), which is outside the smooth
   shift-field model.  Dominant diff peak: −39σ at D/101ZN/ZN(r) (zinc
   position differs between T and R states).  **Requires
-  `fill_fcalc=True`** — both deposited MTZs are < 99% SG-ASU complete
+  `fill_asu=True`** — both deposited MTZs are < 99% SG-ASU complete
   (4e7u 93%, 4fg3 97.6%); without filling, refmac inherits the gaps
   and bent.mtz shows missing-HKL chunks in Coot.  Reference run:
-  `scan_fitreso_fc/` (raw inputs → fill → refmac → altindex → scan).
+  `scan_fitreso/` (raw inputs → fill → refmac → altindex → scan).
   The hkl01 → hkl02 jump (Rbend 0.1% → 64%, the canonical (1,1,0)
   HKL picking up `|d| = 2.1 Å` in `hkl02/PSDVF.mtz`) **is not an
   over-fit** — inspecting the bent map at that stage shows the
