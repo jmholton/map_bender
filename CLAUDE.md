@@ -176,6 +176,37 @@ compensate for this, even though it's the "wrong" null distribution.
 `_pnn_weight_chik(snr, N, k=6)` is retained in the file for diagnostic
 comparison but is not used by default.
 
+### kth-from-top Pnn (step-down ranking)
+
+The standard Pnn `erf(s/√2)^N` is the CDF of the *single most extreme*
+deviate among N noise tests.  Once you've decided the top HKL is real,
+the second-most-extreme competes against only the remaining N−1.  Two
+helpers implement this rank-conditional weighting:
+
+`_pnn_weight_k(snr, N, k)` — exact CDF of the kth-from-top order
+statistic via regularized incomplete beta:
+
+```
+P(Y_(N-k+1) ≤ snr) = I_F(N-k+1, k)       F = erf(snr/√2)
+```
+
+For k=1 reduces to F^N (standard Pnn).  For k≥2 admits weaker
+deviates — by k=10 nearly every snr≥1.5 gets weight ≈ 1.
+
+`_soft_pnn_weight_k(snr, N, k)` — Holm-Bonferroni step-down soft
+variant: softPnna with effective N reduced to N−k+1.  The conditional
+("given the top k−1 are spent") form, smoothed by the same polynomial
+fit softPnna uses.  More conservative than the exact form on the noisy
+tail (snr≈1 stays at weight ≈0.45 vs ≈1 for the exact form), which
+matters when "spent" deviates aren't truly independent of the current
+one.
+
+Usage in step-down ranking: sort HKLs by snr descending, weight the
+i-th-ranked HKL by `_soft_pnn_weight_k(snr_i, N, k=i)`.  Each
+successive rank widens the admit zone by one Bonferroni step.  Not
+wired into `fit_lstsq_symm`/`fit_lstsq` by default — diagnostic
+helpers only.
+
 Stored `snr` in `PSDVF.mtz` is always the RAW pre-weight SNR so the
 weighting is reproducible from the saved file.
 

@@ -47,7 +47,7 @@ from pathlib import Path
 import numpy as np
 from scipy.linalg import lstsq as sp_lstsq, svd as sp_svd
 from scipy.ndimage import map_coordinates
-from scipy.special import erf as sp_erf, erfinv as sp_erfinv, gammainc as sp_gammainc, gammaincinv as sp_gammaincinv
+from scipy.special import erf as sp_erf, erfinv as sp_erfinv, gammainc as sp_gammainc, gammaincinv as sp_gammaincinv, betainc as sp_betainc, betaincinv as sp_betaincinv
 import gemmi
 
 TWO_PI = 2.0 * np.pi
@@ -664,6 +664,61 @@ def _soft_pnn_weight(snr, N):
         val = -np.power(np.maximum(ratio, 1e-30), expo)
     val = np.clip(val, -1000.0, 0.0)
     return 1.0 - np.power(2.0, val)
+
+
+def _pnn_weight_k(snr, N, k=1):
+    """Exact k-th-from-top Pnn: probability that random noise across N tests
+    would NOT produce ≥k deviates exceeding `snr`.
+
+    For k=1 this is the standard Pnn (top order statistic): F^N.  For
+    k≥2 the bar lowers — we only need fewer than k noise deviates to
+    exceed snr.  Closed form via the order-statistic CDF:
+
+        P( Y_(N-k+1) ≤ snr ) = I_F(snr) (N-k+1, k)
+
+    where F = erf(snr/√2) and I is the regularized incomplete beta —
+    scipy.special.betainc.  Numerically well-conditioned for all 1 ≤ k ≤ N.
+
+    Use in step-down ranking: sort HKLs by snr descending and weight
+    the i-th-ranked HKL by `_pnn_weight_k(snr_i, N, k=i)`.  The top HKL
+    faces F^N (strict); the second faces F^N + N·F^(N-1)·(1-F); etc.
+    Each successive 'spent' deviate widens the admit zone by one
+    Bonferroni step — analogous to Holm-Bonferroni for sequential
+    hypothesis testing.
+
+    Diagnostic helper; not used by default.
+    """
+    snr_abs = np.abs(np.asarray(snr, dtype=float))
+    if N <= 0 or k < 1 or k > N:
+        return np.zeros_like(snr_abs)
+    F = sp_erf(snr_abs / np.sqrt(2.0))
+    return sp_betainc(N - k + 1, k, F)
+
+
+def _soft_pnn_weight_k(snr, N, k=1):
+    """Soft k-th-from-top Pnn: softPnna with effective N = N − k + 1.
+
+    The step-down equivalent of softPnna.  Each of the (k−1) prior
+    deviates is 'spent' on a higher-ranked test, so the multiple-
+    testing budget shrinks by one per rank:
+
+        softPnna_k(snr, N, k)  =  softPnna(snr, N − k + 1)
+
+    This is the conditional (Holm) form, not the unconditional kth-
+    order-statistic CDF — but matches the spirit of softPnna's
+    polynomial-smoothed transition and reuses the same fitted
+    constants.  For k=1 reduces to plain softPnna.
+
+    Compared to the exact `_pnn_weight_k`:
+      - exact form jumps sharply at σ_50(N, k);
+      - soft form keeps moderate-snr HKLs with nonzero weight, which
+        empirically holds up under SVD basis correlation (see chi-k
+        note in `_pnn_weight`).
+
+    Diagnostic helper; not used by default.
+    """
+    N_eff = max(1, int(N) - int(k) + 1)
+    return _soft_pnn_weight(snr, N_eff)
 
 
 def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5):
