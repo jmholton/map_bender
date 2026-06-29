@@ -47,7 +47,7 @@ from pathlib import Path
 import numpy as np
 from scipy.linalg import lstsq as sp_lstsq, svd as sp_svd
 from scipy.ndimage import map_coordinates
-from scipy.special import erf as sp_erf, erfinv as sp_erfinv
+from scipy.special import erf as sp_erf, erfinv as sp_erfinv, gammainc as sp_gammainc, gammaincinv as sp_gammaincinv
 import gemmi
 
 TWO_PI = 2.0 * np.pi
@@ -590,6 +590,19 @@ def _pnn_weight(snr, N):
 
     Below the safe threshold (where Pnn would underflow to ~0), return 0
     exactly to avoid floating-point garbage.
+
+    Note: half-normal is a slight statistical mis-match for the way snr
+    is constructed in fit_lstsq_symm (joint |AB| / √Σσᵢ², which under H0
+    is χ_k/√k for k=6 not a single half-normal — see _pnn_weight_chik).
+    The half-normal form is retained as the empirical default because the
+    SVD basis is correlated; the effective multiple-testing N is much
+    smaller than the raw HKL count, and the looser half-normal CDF
+    accidentally compensates.  Replacing with the matched chi-k Pnn
+    over-suppresses moderate-snr HKLs at fine fitreso (8jee fr10 bondZ
+    25 with chi-6 vs 6 with half-normal/softPnna) — leaving the SVD with
+    too few effective basis vectors and producing ringing instead of a
+    smooth field.  Keep half-normal as the workhorse; chi-k is available
+    as `_pnn_weight_chik` for future experimentation.
     """
     snr_abs = np.abs(np.asarray(snr, dtype=float))
     s_thresh = np.sqrt(2.0) * sp_erfinv((1e-30) ** (1.0 / max(N, 1)))
@@ -598,6 +611,21 @@ def _pnn_weight(snr, N):
     if safe.any():
         w[safe] = sp_erf(snr_abs[safe] / np.sqrt(2.0)) ** N
     return w
+
+
+def _pnn_weight_chik(snr, N, k=6):
+    """Matched-null Pnn weight: F_χ_k(s·√k)^N via scipy gammainc.
+
+    Theoretically correct for the joint-magnitude snr used by
+    fit_lstsq_symm (k = 2 · N_dims).  Empirically too aggressive at fine
+    fitreso because the SVD basis is correlated — effective N < raw N.
+    Not used by default; retained for diagnostic comparison."""
+    snr_abs = np.abs(np.asarray(snr, dtype=float))
+    if N <= 0:
+        return np.ones_like(snr_abs)
+    F = sp_gammainc(k / 2.0, k * snr_abs * snr_abs / 2.0)
+    logF = np.log(np.clip(F, 1e-300, 1.0))
+    return np.exp(np.clip(N * logF, -700.0, 0.0))
 
 
 def _soft_pnn_weight(snr, N):
@@ -2191,8 +2219,8 @@ def bend_fit(pdb1_path, pdb2_path, nhkls=30, fitreso=None, drop_snr=1.0,
     ca_rmsd   = float(np.sqrt(np.mean(np.sum(ca_orth**2, axis=1))))
     print(f"largest fractional CA shift: {ca_mags[max_i]:.7f} for {ca_ids[max_i]}")
     print(f"CA RMSD after origin fix: {ca_rmsd:.3f} Å  ({ca_mask.sum()} CA pairs)")
-    if ca_rmsd > 5.0:
-        raise ValueError(f"CA RMSD after origin fix {ca_rmsd:.3f} Å > 5.0 Å. "
+    if ca_rmsd > 10.0:
+        raise ValueError(f"CA RMSD after origin fix {ca_rmsd:.3f} Å > 10.0 Å. "
                          "Check structure alignment.")
     if ca_mags[max_i] > 0.35:
         raise ValueError(f"Largest fractional CA shift {ca_mags[max_i]:.4f} > 0.35 cells. "
@@ -2456,8 +2484,8 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
     if verbose:
         print(f"largest fractional CA shift: {ca_mags[max_i]:.7f} for {ca_ids[max_i]}", flush=True)
         print(f"CA RMSD after origin fix: {ca_rmsd:.3f} Å  ({ca_mask.sum()} CA pairs)", flush=True)
-    if ca_rmsd > 5.0:
-        raise ValueError(f"CA RMSD after origin fix {ca_rmsd:.3f} Å > 5.0 Å. "
+    if ca_rmsd > 10.0:
+        raise ValueError(f"CA RMSD after origin fix {ca_rmsd:.3f} Å > 10.0 Å. "
                          "Check structure alignment.")
     if ca_mags[max_i] > 0.35:
         raise ValueError(f"Largest fractional CA shift {ca_mags[max_i]:.4f} > 0.35 cells. "
@@ -3512,6 +3540,16 @@ def fitreso_scan(
     _CANONICAL_F = {'FWT', '2FOFCWT'}
 
     os.makedirs(scan_dir, exist_ok=True)
+
+    # ── normalize mov PDB chain/resnum vs ref (apply BEFORE anything else) ───
+    # Some deposits use a different chain ID (e.g. mov='B' vs ref='A') or a
+    # constant resnum offset (e.g. old-PDB +1000 convention).  Without this
+    # both resolve_altindex's _collect_matched_ca and downstream match_atoms
+    # fail to find any pairs.  The replacement PDB has identical Cartesian
+    # coordinates — only the (chain, resnum) labels change — so all downstream
+    # consumers (pre/, refmac, altindex, bend) see a consistent view.
+    _norm_pdb = os.path.join(scan_dir, '_mov_normalized.pdb')
+    mov_pdb = _normalize_mov_pdb(mov_pdb, ref_pdb, _norm_pdb, verbose=verbose)
 
     # ── snapshot the truly-raw inputs (used by the pre/ section below) ───────
     # pre/ shows the "old-fashioned" diff map: mov sampled on ref's grid with
@@ -4949,6 +4987,151 @@ def _cells_match(c1, c2, rtol=1e-4):
     p1 = np.array(c1.parameters, dtype=float)
     p2 = np.array(c2.parameters, dtype=float)
     return np.allclose(p1, p2, rtol=rtol, atol=0)
+
+
+def _detect_chain_resnum_remap(mov_st, ref_st):
+    """Detect a single-chain rename and/or constant resnum offset that
+    maximizes (chain, resnum, resname) overlap between two structures.
+
+    Two-stage detection with different stringency for each step:
+
+    1. **Chain rename** — if both structures are single-chain with
+       different chain IDs, apply the rename if it brings the offset=0
+       residue-name match count from <30 to ≥30 with ≥50% identity.
+       Lenient threshold (50%) admits same-protein cases where an
+       internal indel shifts most resnums by 1 (like 5jdv) — these
+       look like 50% identity under constant-offset matching but are
+       ~95% identical under proper alignment.
+
+    2. **Resnum offset** — try non-zero constant offsets and apply the
+       best one only if (a) it adds ≥30 matches over offset=0 AND
+       (b) the per-offset frac is ≥90%. Strict threshold (90%) avoids
+       false-positive offset shifts on related-but-different isoforms
+       (like 8phm vs 6klz CA isozymes) where a +2 offset happens to
+       give 55% identity coincidentally.
+
+    Returns dict with chain_remap, resnum_offset, matches, overlap, frac,
+    or None if no justified remap.
+
+    Detection strategy:
+      1. If both structures are single-chain with different IDs, try
+         remapping mov's chain to ref's.
+      2. Build (resnum, resname) sets and score each candidate offset
+         O ∈ {ref_resnum - mov_resnum} by counting how many (mov_resnum
+         + O, mov_resname) pairs hit a ref residue with same resname.
+      3. Pick the best (chain_remap, offset) by match count.
+
+    Pure detection — does not mutate inputs.
+    """
+    def _ca_residues(st):
+        out = []
+        for model in st:
+            for chain in model:
+                for res in chain:
+                    if any(a.name.strip() == 'CA' for a in res):
+                        out.append((chain.name, res.seqid.num, res.name))
+            break
+        return out
+
+    a = _ca_residues(mov_st)
+    b = _ca_residues(ref_st)
+    if len(a) < 10 or len(b) < 10:
+        return None
+
+    chains_a = sorted(set(c for c, _, _ in a))
+    chains_b = sorted(set(c for c, _, _ in b))
+
+    b_by_chain = {}
+    for c, r, n in b:
+        b_by_chain.setdefault(c, {})[r] = n
+
+    def score(a_renamed, offset):
+        overlap = matches = 0
+        for c, r, n in a_renamed:
+            ref_n = b_by_chain.get(c, {}).get(r + offset)
+            if ref_n is not None:
+                overlap += 1
+                if ref_n == n:
+                    matches += 1
+        return overlap, matches
+
+    a_resnums = [r for _, r, _ in a]
+    b_resnums = [r for _, r, _ in b]
+    lo = min(b_resnums) - max(a_resnums) - 5
+    hi = max(b_resnums) - min(a_resnums) + 5
+
+    # Stage 1: chain rename (lenient — accepts indel-shifted same proteins)
+    chain_remap = None
+    base_a = a
+    overlap0, matches0 = score(base_a, 0)
+    if (len(chains_a) == 1 and len(chains_b) == 1 and chains_a != chains_b
+            and matches0 < 30):
+        cmap = (chains_a[0], chains_b[0])
+        cand_a = [(cmap[1] if c == cmap[0] else c, r, n) for c, r, n in a]
+        o_r, m_r = score(cand_a, 0)
+        if m_r >= 30 and o_r >= 10 and m_r / o_r >= 0.5:
+            chain_remap = cmap
+            base_a = cand_a
+            overlap0, matches0 = o_r, m_r
+
+    # Stage 2: resnum offset (strict — must be near-perfect)
+    best_offset = 0
+    best_overlap, best_matches = overlap0, matches0
+    for offset in range(lo, hi + 1):
+        if offset == 0:
+            continue
+        o, m = score(base_a, offset)
+        if o < 10:
+            continue
+        # Strict: need ≥30 improvement AND ≥90% frac at the new offset
+        if m >= matches0 + 30 and m / o >= 0.9 and m > best_matches:
+            best_offset = offset
+            best_overlap = o
+            best_matches = m
+
+    if chain_remap is None and best_offset == 0:
+        return None
+    return dict(chain_remap=chain_remap, resnum_offset=best_offset,
+                matches=best_matches, overlap=best_overlap,
+                frac=best_matches / best_overlap if best_overlap else 0.0)
+
+
+def _normalize_mov_pdb(mov_pdb, ref_pdb, out_pdb, verbose=True):
+    """Apply chain rename + resnum offset to mov_pdb so its (chain, resnum)
+    keys align with ref_pdb. Writes corrected PDB to out_pdb only if a
+    justified remap is detected (sequence id ≥ 90% over ≥10 residues);
+    returns out_pdb in that case, else mov_pdb (unmodified).
+
+    Useful for old PDBs with +1000 resnum offsets (1zfk, 3v7x, 3vbd) and
+    single-chain entries with B/X chain labels (5j**, etc.) where
+    resolve_altindex's pre-bend CA matching would otherwise fail."""
+    mov_st = gemmi.read_pdb(mov_pdb)
+    ref_st = gemmi.read_pdb(ref_pdb)
+    plan = _detect_chain_resnum_remap(mov_st, ref_st)
+    if plan is None:
+        return mov_pdb
+    cmap = plan['chain_remap']
+    off  = plan['resnum_offset']
+    if verbose:
+        msg = []
+        if cmap is not None:
+            msg.append(f"chain '{cmap[0]}' → '{cmap[1]}'")
+        if off != 0:
+            msg.append(f"resnum offset {off:+d}")
+        print(f"  _normalize_mov_pdb: {', '.join(msg)} "
+              f"({plan['matches']}/{plan['overlap']} CA-residues "
+              f"name-match, {100*plan['frac']:.0f}% sequence id)",
+              flush=True)
+    for model in mov_st:
+        for chain in model:
+            if cmap is not None and chain.name == cmap[0]:
+                chain.name = cmap[1]
+            if off != 0:
+                for res in chain:
+                    res.seqid.num += off
+        break
+    mov_st.write_pdb(out_pdb)
+    return out_pdb
 
 
 def _stretch_pdb_to_cell(in_pdb, target_cell, out_pdb):

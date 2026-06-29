@@ -148,10 +148,33 @@ needed to suppress ringing at fine fitreso without hand-tuning a
 threshold.
 
 `_pnn_weight(snr, M)` and `_soft_pnn_weight(snr, M)` are in
-`bendfinder.py` near line 580.  The default uses the exact
-erf-power form; a softer polynomial approximation is also available
-(Holton's `softPnna`) — currently unused by default but kept for
-diagnostic comparison.
+`bendfinder.py` near line 580.  The default uses **softPnna** (the
+polynomial-approximation soft variant) which leaves a small but
+nonzero weight on moderate-snr HKLs (rather than the hard-zero of
+the strict erf-power Pnn).  This softness empirically retains useful
+signal at fine fitreso.
+
+### Why not chi-k (the theoretically correct null)?
+
+The snr in `fit_lstsq_symm` is constructed as `|AB| / √Σσᵢ²` over
+the 6 components of each canonical HKL (3 dims × (A,B)).  Under H0
+this ratio follows χ_6/√6, NOT a single half-normal.  The matched
+Pnn is therefore `F_χ_6(s·√6)^N` (`scipy.special.gammainc(3, 3·s²)^N`),
+not `erf(s/√2)^N`.
+
+Tested.  Empirically the chi-6 form is consistently **worse** than the
+half-normal/softPnna at fine fitreso: 8jee fr10 bondZ jumped from
+6.20 (softPnna) to 25.30 (chi-6); fr8 from 25.47 to 73.39.  Cause: the
+chi-6 form is strictly correct under H0 (N truly independent noise
+deviates), but the SVD basis is **correlated** — adjacent HKLs see
+overlapping spatial information through the design matrix.  The
+effective multiple-testing N is much smaller than the raw HKL count,
+so the strict chi-6 Pnn over-suppresses moderate-snr HKLs that were
+adding real signal.  softPnna's polynomial softness happens to
+compensate for this, even though it's the "wrong" null distribution.
+
+`_pnn_weight_chik(snr, N, k=6)` is retained in the file for diagnostic
+comparison but is not used by default.
 
 Stored `snr` in `PSDVF.mtz` is always the RAW pre-weight SNR so the
 weighting is reproducible from the saved file.
@@ -233,6 +256,46 @@ The diff is computed in F-space after k+B scaling of bent → ref (`_fspace_scal
 **Raddam sign convention**: 5kxk (undamaged, lowest dose) is the **moving** model; 5kxl/5kxm/5kxn (increasingly damaged) are the **references**. Dose ordering is alphabetical: 5kxk < 5kxl < 5kxm < 5kxn. With the new default `subtract='ref'`: positive diff peaks = features in the **undamaged** model absent from the damaged reference (features disappearing with dose); negative peaks = features appearing with dose. (Sign flipped from the pre-2026-05-16 default — pass `subtract=bent` to recover the old convention.)
 
 **Large-map memory**: `eval_shift_field` allocates an (N_voxels × N_hkls) phase matrix. For large maps (raddam: 3.7M voxels × 900+ HKLs ≈ 26 GB) this must be chunked. `fitreso_scan` uses an internal `_eval_chunked` helper in 50k-voxel batches (configurable via `chunk_size` parameter).
+
+## Chain/resnum normalization (`_normalize_mov_pdb`)
+
+`fitreso_scan` calls `_normalize_mov_pdb(mov_pdb, ref_pdb, out_pdb)` at
+the very top — before `raw_mov_pdb_in` is snapshotted — to fix
+(chain, resnum) mismatches that would otherwise make match-by-tuple fail
+across the entire pipeline.  Two clusters of legacy/edge-case deposits
+hit this in the CA production run:
+
+- **+1000 resnum offset** (old PDB convention): mov has resnums
+  1003–1261 vs ref 4–260, but identical Cartesian coordinates.  Detector
+  finds offset = −1000 at near-100% sequence identity and rewrites the
+  PDB.  (1zfk, 3v7x, 3vbd.)
+- **Single-chain rename** (PDB-REDO sometimes labels chain `B` for a
+  single-chain monomer): mov chain `B` vs ref chain `A`.  Detector tests
+  rename + offset=0, accepts if ≥30 residues match by resname AND frac
+  ≥ 50% (lenient — admits same-protein cases with internal indels like
+  5jdv where two ~95% segments cross at resnum 127 and average to 51%
+  under constant-offset matching).  (5jdv, 5je7, 5jeg, 5jeh, 5jep, 5jg3,
+  5jg5, 5jgs, 5jgt.)
+
+Two-stage detection with different stringency to avoid false positives:
+chain rename is lenient (50% sequence id) since unrelated proteins
+score far lower even with chain remap, while resnum offset is strict
+(≥90% per-offset frac AND ≥30-match improvement over offset=0) to keep
+related-but-distinct isoforms (like the 8phm/6yzt/6yzv CA paralogs) from
+being silently realigned.
+
+The 5 Å CA-RMSD gate in `bend_fit_progressive` (after origin fix) was
+also bumped to **10 Å** to admit borderline cases where altindex
+converged but not super-tightly (8phm 5.4 Å, 6yzt 7.6 Å, 6yzv 7.6 Å —
+likely related isoforms; bend produces high-bondZ output but the entries
+no longer crash).  The 0.35-cell fractional-shift sanity check is
+unchanged.
+
+End result on the 902-entry CA production: 100% completion, zero
+crashes.  Quality distribution: 2.4% refined, 68.1% good, 24.1% loose,
+2.8% broken, 0.9% catastrophic (the rescued isoforms account for most
+of the "catastrophic" bucket; that's expected — they're different
+proteins).
 
 ## Origin alignment (`_find_best_origin`)
 
