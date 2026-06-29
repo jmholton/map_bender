@@ -826,6 +826,67 @@ def eval_shift_field(frac_coords, hkls, AB):
     return shifts.T
 
 
+def _shift_magnitude_fourier(hkls, AB_xyz, cell):
+    """Fourier amplitudes/phases of the displacement-magnitude map |Δr(x)|.
+
+    The shift field has three independent vector components per voxel;
+    |Δr|(x) = √(δx_orth² + δy_orth² + δz_orth²) is a derived real-space
+    scalar map.  It is NOT a linear combination of the AB Fourier
+    components — it's a non-linear function of them — so to express it
+    as (amplitude, phase) per HKL we sample the field on a real-space
+    grid, take voxelwise |Δr|, FFT, and look up at the input HKLs.
+
+    Diagnostic in Coot: large |Δr| outside the protein body signals the
+    field ringing where there are no constraints (a tell-tale of over-fit
+    or wrong-direction bending).
+
+    Parameters
+    ----------
+    hkls   : (N, 3) int   — same HKL set written to the rest of PSDVF.mtz
+    AB_xyz : (3, N, 2)    — fractional-axis A, B coefficients
+    cell   : 6-tuple      — unit cell (a,b,c,α,β,γ)
+
+    Returns
+    -------
+    dR_amp   : (N,) float32 — |F(h)| of the |Δr| map (Å³, gemmi convention)
+    PHIR_deg : (N,) float32 — phase in degrees
+    """
+    if len(hkls) == 0 or AB_xyz.shape[0] != 3:
+        return (np.zeros(len(hkls), dtype=np.float32),
+                np.zeros(len(hkls), dtype=np.float32))
+
+    # Grid sized to comfortably resolve the highest miller index in the set
+    hmax = max(int(np.abs(hkls[:, 0]).max()), 1)
+    kmax = max(int(np.abs(hkls[:, 1]).max()), 1)
+    lmax = max(int(np.abs(hkls[:, 2]).max()), 1)
+    nx, ny, nz = 4 * (hmax + 1), 4 * (kmax + 1), 4 * (lmax + 1)
+
+    # Fractional coordinate grid (NX × NY × NZ)
+    xs = np.arange(nx, dtype=np.float64) / nx
+    ys = np.arange(ny, dtype=np.float64) / ny
+    zs = np.arange(nz, dtype=np.float64) / nz
+    Xg, Yg, Zg = np.meshgrid(xs, ys, zs, indexing='ij')
+    frac_pts = np.stack([Xg.ravel(), Yg.ravel(), Zg.ravel()], axis=1)
+
+    # Field at each voxel → orthogonal Å → scalar magnitude
+    delta_frac = eval_shift_field(frac_pts, hkls, AB_xyz)        # (N_voxels, 3)
+    delta_orth = frac_to_orth(delta_frac, cell)                  # (N_voxels, 3)
+    mag = np.linalg.norm(delta_orth, axis=1).reshape((nx, ny, nz))
+
+    # FFT and look up at each HKL using the +2πi crystallographic
+    # convention (gemmi/refmac), matching the existing _map2mtz path.
+    F = np.fft.fftn(mag)
+    H = hkls[:, 0].astype(int)
+    K = hkls[:, 1].astype(int)
+    L = hkls[:, 2].astype(int)
+    cell_vol = gemmi.UnitCell(*cell).volume
+    F_h = F[(-H) % nx, (-K) % ny, (-L) % nz] * (cell_vol / (nx * ny * nz))
+
+    dR_amp = np.abs(F_h).astype(np.float32)
+    PHIR_deg = np.degrees(np.angle(F_h)).astype(np.float32)
+    return dR_amp, PHIR_deg
+
+
 def eval_divergence(frac_coords, hkls, AB):
     """Analytic divergence div(δ) = ∂δx/∂x + ∂δy/∂y + ∂δz/∂z in fractional coords.
 
@@ -1310,6 +1371,10 @@ def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
         f'BENDFINDER rmsd {rmsd:.6f}',
     ]
 
+    # Whether to compute the derived |Δr| Fourier amplitudes (dR/PHIR).
+    # Only meaningful when all three axes are fitted — otherwise skip.
+    write_dR = (dimensions == 'xyz' or set(dimensions) == set('xyz'))
+
     mtz.add_dataset('bendfinder')
     mtz.add_column('H', 'H')
     mtz.add_column('K', 'H')
@@ -1317,6 +1382,13 @@ def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
     for dim in dimensions:
         mtz.add_column(f'd{dim.upper()}', 'F')   # amplitude of d{x,y,z} shift (Å)
         mtz.add_column(f'PH{dim.upper()}', 'P')  # phase (degrees)
+    if write_dR:
+        # Derived |Δr(x)| = √(δx² + δy² + δz²) map in Å, FFT'd to (amp, phase)
+        # per HKL.  Diagnostic in Coot — large |Δr| outside the protein body
+        # signals over-fit / ringing.  Not a linear function of AB so this
+        # is computed via real-space sample + FFT, not by combining AB.
+        mtz.add_column('dR',   'F')
+        mtz.add_column('PHIR', 'P')
     mtz.add_column('SNR', 'R')
     mtz.add_column('ACTIVE', 'R')
 
@@ -1332,7 +1404,8 @@ def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
     # so this is purely a display-units change.
     _AXIS_LEN = {'x': cell1[0], 'y': cell1[1], 'z': cell1[2]}
     mtz.history = list(mtz.history) + ['BENDFINDER amplitude_units angstrom']
-    n_cols = 3 + 2 * n_dims + 2
+    n_extra = 2 if write_dR else 0
+    n_cols = 3 + 2 * n_dims + n_extra + 2
     data = np.zeros((n_hkls, n_cols), dtype=np.float32)
     data[:, 0] = hkls[:, 0]
     data[:, 1] = hkls[:, 1]
@@ -1342,8 +1415,15 @@ def save_fitparams(path, hkls, AB, active, snr, cell1, cell2, dimensions, rmsd):
         amp_frac = np.sqrt(A**2 + B**2)
         data[:, 3 + 2*d]     = amp_frac * _AXIS_LEN[dim]
         data[:, 3 + 2*d + 1] = np.degrees(np.arctan2(-A, B))
-    data[:, 3 + 2*n_dims]     = snr
-    data[:, 3 + 2*n_dims + 1] = active.astype(np.float32)
+    if write_dR:
+        # Need AB ordered as (x,y,z); reorder if `dimensions` was permuted.
+        order = [dimensions.index(d) for d in 'xyz']
+        AB_xyz = AB[order, :, :]
+        dR_amp, PHIR_deg = _shift_magnitude_fourier(hkls, AB_xyz, cell1)
+        data[:, 3 + 2*n_dims]     = dR_amp
+        data[:, 3 + 2*n_dims + 1] = PHIR_deg
+    data[:, 3 + 2*n_dims + n_extra]     = snr
+    data[:, 3 + 2*n_dims + n_extra + 1] = active.astype(np.float32)
 
     mtz.set_data(data)
     mtz.write_to_file(path)

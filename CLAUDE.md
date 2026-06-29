@@ -561,6 +561,35 @@ cell_<axis> on load to restore fractional AB — so the units change is
 display-only.  Files written before this change have no tag and are
 read as fractional unchanged.
 
+### `dR`, `PHIR` — displacement-magnitude diagnostic
+
+When `dimensions='xyz'` (the default), `save_fitparams` additionally
+writes an `dR`/`PHIR` column pair that holds the Fourier coefficients
+of the per-voxel displacement magnitude
+**|Δr(x)| = √(δx_orth² + δy_orth² + δz_orth²)** (in Å).
+
+`|Δr|` is NOT a linear function of the AB coefficients — it's a real-
+space scalar derived voxelwise from the three vector components — so
+it can't be expressed as a clean combination of the fitted (A, B)
+pairs.  `_shift_magnitude_fourier` (`bendfinder.py:~830`) samples the
+field on a real-space grid (4× Nyquist in each axis based on the
+admitted Miller indices), converts to orthogonal Å, takes the per-
+voxel magnitude, FFTs, and looks up at each input HKL using the
+gemmi/refmac sign convention (V/N scaled, +2πi convention via
+numpy's −2πi lookup).
+
+**Use in Coot:** load PSDVF.mtz, display `dR / PHIR` as F/PHI.  Large
+positive features outside the protein body are a tell-tale of
+high-frequency over-fit — the field is doing work where there are no
+constraints.  A clean `|Δr|` map is smooth, modest amplitude, and
+concentrated on the protein surface (where the actual deformation
+lives).
+
+`load_fitparams` ignores `dR`/`PHIR` (only `dX/dY/dZ/PHX/PHY/PHZ/
+SNR/ACTIVE` round-trip into the consumer-facing AB array); the
+columns are write-only diagnostic.  Files written before this change
+have no `dR`/`PHIR` columns and are read unchanged.
+
 ## Space-group generality and testing
 
 ### Symmetry constraint
