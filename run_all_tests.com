@@ -2,18 +2,25 @@
 #
 # run_all_tests.com — run the full gamut of bendfinder tests and examples.
 #
+# Step 0 (always runs first, idempotent):
+#   Download deposited PDB + sf-cif files from RCSB and cif2mtz to MTZ
+#   into per-system dirs.  Skips any file that already exists, so re-runs
+#   are fast.  This is the "fresh clone" entry point — running this script
+#   in a directory with just bendfinder.py / altalign.py / test_symm_all_sgs.py
+#   is sufficient.
+#
 # Tests:
 #   1. test_symm_all_sgs.py     — 65 Sohncke SGs symmetry constraint check
 #   2. magdoff/test_magdoff.py  — synthetic 0.5deg deformation recovery
 #
-# Examples (fitreso_scan from raw, scan_fitreso_test/ subdir per system):
+# Examples (fitreso_scan from raw, scan_fitreso/ subdir per system):
 #   3. lyso     3aw6 -> 3aw7   P4(3)2(1)2
 #   4. dhfr     1rx2 -> 1rx1   P2(1)2(1)2(1)
 #   5. raddam   5kxk -> 5kxl   P4(3)2(1)2   subtract=bent
 #   6. raddam   5kxk -> 5kxm   P4(3)2(1)2   subtract=bent
 #   7. raddam   5kxk -> 5kxn   P4(3)2(1)2   subtract=bent
 #   8. myoglobin 1mbo -> 1a6m  P2(1)
-#   9. insulin  4fg3 -> 4e7u   H3           fill_fcalc=True
+#   9. insulin  4fg3 -> 4e7u   H3           fill_asu=True
 #  10. lipox    9o4s -> 9o4t   P2(1)        same crystal, just distorted
 #                                            (~4% metric drift in a/b/c);
 #                                            exercises stretch + loose-tol
@@ -38,16 +45,17 @@ if (-e /programs/phenix-2.1rc2-6037/lib/libopenblas.so.0) then
     setenv OPENBLAS_NUM_THREADS $NCPUS
 endif
 
-# CWD sanity check — this script needs the working area (parent of
-# map_bender/), which has bendfinder.py + lyso/ + dhfr/ + ... .  If
-# invoked from inside map_bender/ (the git subdir), cd up; otherwise
-# fail loudly so we don't fake PASS off "no such file" grep output.
-if (! -e bendfinder.py || ! -e test_symm_all_sgs.py || ! -d lyso) then
-    if (-e ../bendfinder.py && -e ../test_symm_all_sgs.py && -d ../lyso) then
+# CWD sanity check — this script just needs bendfinder.py + altalign.py +
+# test_symm_all_sgs.py in the CWD.  The per-system input dirs (lyso/, dhfr/,
+# ...) are created and populated by the step-0 setup below.  If invoked from
+# inside map_bender/ (the git subdir), cd up; otherwise fail loudly so we
+# don't fake PASS off "no such file" grep output.
+if (! -e bendfinder.py || ! -e altalign.py || ! -e test_symm_all_sgs.py) then
+    if (-e ../bendfinder.py && -e ../altalign.py && -e ../test_symm_all_sgs.py) then
         echo "(cd .. — running from working area, not map_bender/)"
         cd ..
     else
-        echo "ERROR: run from the working area (must contain bendfinder.py, test_symm_all_sgs.py, lyso/, dhfr/, ...)."
+        echo "ERROR: run from a directory containing bendfinder.py, altalign.py, test_symm_all_sgs.py."
         echo "       CWD=`pwd`"
         exit 2
     endif
@@ -63,6 +71,63 @@ echo "logs and per-test details: $logdir/"
 @ nfail = 0
 printf "%-30s %-7s %s\n" "test" "result" "metric" > $summary
 printf "%-30s %-7s %s\n" "------------------------------" "------" "------" >> $summary
+
+# ── 0. ensure inputs (download PDBs + sf-cifs from RCSB, cif2mtz) ────────
+# Idempotent: skips per-file work whenever the target already exists, so a
+# re-run is fast.  Removes a legacy lipox symlink so we land real downloaded
+# inputs in lipox/.  magdoff has no deposited SF — only 7rsa.pdb is fetched.
+echo ""
+echo "==> [ 0/11] ensure inputs (RCSB download + cif2mtz)"
+set setup_log = $logdir/00_setup.log
+echo "setup log: $setup_log" >& $setup_log
+foreach line ( \
+    "lyso      3aw6 3aw7" \
+    "dhfr      1rx2 1rx1" \
+    "raddam    5kxk 5kxl 5kxm 5kxn" \
+    "myoglobin 1mbo 1a6m" \
+    "insulin   4fg3 4e7u" \
+    "porin     3poq 3pou" \
+    "lipox     9o4s 9o4t" \
+    "magdoff   7rsa" \
+)
+    set parts = ( $line )
+    set sysd  = $parts[1]
+    if (-l $sysd) rm $sysd                      # drop legacy symlink (lipox)
+    mkdir -p $sysd
+    foreach pdbid ( $parts[2-] )
+        set pdb = $sysd/$pdbid.pdb
+        if (! -e $pdb) then
+            echo "    [$sysd] fetching $pdbid.pdb"
+            curl -s -f -o $pdb https://files.rcsb.org/download/$pdbid.pdb
+            if ($status != 0) then
+                echo "    ERROR: curl failed for $pdbid.pdb" | tee -a $setup_log
+                rm -f $pdb
+            endif
+        endif
+        if ($sysd == magdoff) continue          # magdoff: no SF needed
+        set cif = $sysd/$pdbid-sf.cif
+        set mtz = $sysd/$pdbid.mtz
+        if (! -e $cif) then
+            echo "    [$sysd] fetching $pdbid-sf.cif"
+            curl -s -f -o $cif https://files.rcsb.org/download/$pdbid-sf.cif
+            if ($status != 0) then
+                echo "    ERROR: curl failed for $pdbid-sf.cif" | tee -a $setup_log
+                rm -f $cif
+            endif
+        endif
+        if (! -e $mtz && -e $cif) then
+            echo "    [$sysd] cif2mtz $pdbid-sf.cif → $pdbid.mtz"
+            echo END | cif2mtz hklin $cif hklout $mtz >>& $setup_log
+        endif
+    end
+end
+# magdoff/test_magdoff.py is not currently shipped in the git repo; until
+# it is, copy from old/magdoff (where the previous gamut lived) if present.
+if (! -e magdoff/test_magdoff.py && -e old/magdoff/test_magdoff.py) then
+    cp old/magdoff/test_magdoff.py magdoff/test_magdoff.py
+    echo "    [magdoff] copied test_magdoff.py from old/magdoff/" | tee -a $setup_log
+endif
+echo "    setup done"
 
 # ── 1. test_symm_all_sgs ─────────────────────────────────────────────────
 echo ""
@@ -107,13 +172,12 @@ endif
 # Reusable: run one fitreso_scan example.  Args via env vars (tcsh has no
 # functions; using a foreach loop with positional vars per iteration).
 #
-# For each example: spec = "label sys mov_pdb ref_pdb mov_mtz ref_mtz subtract fill_fcalc tag"
+# For each example: spec = "label sys mov_pdb ref_pdb mov_mtz ref_mtz subtract fill_asu tag"
 # tag goes in the scan_dir name (so raddam variants don't collide).
 
 set i = 2
-# All canonical reference runs (scan_fitreso_fc/) use fill_fcalc=True because
-# the deposited reference MTZs sit below the 99% SG-ASU completeness gate
-# (lyso 3aw7 is 90.2%, etc.).  Match that here.
+# fill_asu=True for every example because the deposited reference MTZs
+# sit below the 99% SG-ASU completeness gate (lyso 3aw7 is 90.2%, etc.).
 foreach spec ( \
     "lyso        lyso        3aw6.pdb 3aw7.pdb 3aw6.mtz 3aw7.mtz ref  True ''" \
     "dhfr        dhfr        1rx2.pdb 1rx1.pdb 1rx2.mtz 1rx1.mtz ref  True ''" \
@@ -135,13 +199,13 @@ foreach spec ( \
     set fill  = $parts[8]
     set tag   = $parts[9]
     if ("$tag" == "''") set tag = ""
-    set scan = scan_fitreso_test$tag
+    set scan = scan_fitreso$tag
     @ i++
     set log = $logdir/`printf "%02d" $i`_$label.log
 
     echo ""
-    echo "==> [`printf '%2d' $i`/11] $label  ($sys $movp -> $refp, fill_fcalc=$fill, subtract=$sub)"
-    ( cd $sys && rm -rf $scan && srun -c $NCPUS --job-name=$label ccp4-python -c "import sys; sys.path.insert(0,'..'); from bendfinder import fitreso_scan; fitreso_scan(mov_pdb='$movp', ref_pdb='$refp', mov_mtz='$movm', ref_mtz='$refm', scan_dir='$scan', run_refinement_flag=True, refine_cycles=5, fill_fcalc=$fill, subtract='$sub')" ) >& $log
+    echo "==> [`printf '%2d' $i`/11] $label  ($sys $movp -> $refp, fill_asu=$fill, subtract=$sub)"
+    ( cd $sys && rm -rf $scan && srun -c $NCPUS --job-name=$label ccp4-python -c "import sys; sys.path.insert(0,'..'); from bendfinder import fitreso_scan; fitreso_scan(mov_pdb='$movp', ref_pdb='$refp', mov_mtz='$movm', ref_mtz='$refm', scan_dir='$scan', run_refinement_flag=True, refine_cycles=5, fill_asu=$fill, subtract='$sub')" ) >& $log
 
     if (! -e $sys/$scan/scan_fitreso.log) then
         echo "    FAIL  $sys/$scan/scan_fitreso.log not written (see $log)"
@@ -176,21 +240,21 @@ end
 echo ""
 echo "==> [`printf '%2d' $i`/11] porin  altalign 3poq->3pou + refmac on R32:R"
 set plog = $logdir/`printf "%02d" $i`_porin_altalign.log
-( cd porin && rm -rf altalign_test && mkdir altalign_test && \
+( cd porin && rm -rf altalign && mkdir altalign && \
     srun -c $NCPUS --job-name=porin_aa ccp4-python ../altalign.py 3poq.pdb 3pou.pdb \
-        altalign_test/aa.pdb 3poq.mtz altalign_test/aa.mtz ) >& $plog
+        altalign/aa.pdb 3poq.mtz altalign/aa.mtz ) >& $plog
 
 set residual = ""
 if (-e $plog) set residual = `grep 'honest discrete CA RMSD' $plog | head -1 | awk '{print $7}'`
-if (-e porin/altalign_test/aa_R32R.pdb && -e porin/altalign_test/aa_R32R.mtz) then
+if (-e porin/altalign/aa_R32R.pdb && -e porin/altalign/aa_R32R.mtz) then
     set rlog = $logdir/`printf "%02d" $i`_porin_refmac.log
-    srun -c $NCPUS --job-name=porin_refmac ccp4-python -c "import sys; sys.path.insert(0,'.'); from bendfinder import run_refinement; run_refinement('porin/altalign_test/aa_R32R.pdb', 'porin/altalign_test/aa_R32R.mtz', outdir='porin/altalign_test/refine', n_cycles=5, fill_fcalc=True)" >& $rlog
+    srun -c $NCPUS --job-name=porin_refmac ccp4-python -c "import sys; sys.path.insert(0,'.'); from bendfinder import run_refinement; run_refinement('porin/altalign/aa_R32R.pdb', 'porin/altalign/aa_R32R.mtz', outdir='porin/altalign/refine', n_cycles=5, fill_asu=True)" >& $rlog
 
     set rf = ""
-    if (-d porin/altalign_test/refine) then
+    if (-d porin/altalign/refine) then
         # refmac prints BOTH "Overall weighted R factor" and "Overall weighted R2
         # factor"; specifying "R factor" excludes the R2 line.
-        set rf = `grep 'Overall weighted R factor' porin/altalign_test/refine/*refmac.log | tail -1 | awk '{print $6}'`
+        set rf = `grep 'Overall weighted R factor' porin/altalign/refine/*refmac.log | tail -1 | awk '{print $6}'`
     endif
     if ("$rf" != "") then
         echo "    PASS  altalign residual=${residual} A   refmac R=$rf"

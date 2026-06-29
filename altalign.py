@@ -389,7 +389,7 @@ def _dual_write_R32R(res, choice, t_apply, out_pdb, mov_mtz, out_mtz, verbose):
 
 
 def resolve(res, out_pdb, out_mtz=None, outdir='.', refine=False,
-            refine_cycles=5, fill_fcalc=False, improve_threshold=0.7,
+            refine_cycles=5, fill_asu=False, improve_threshold=0.7,
             verbose=True):
     """Apply the rank-1 candidate using bendfinder's 4-action gate.
 
@@ -518,7 +518,7 @@ def resolve(res, out_pdb, out_mtz=None, outdir='.', refine=False,
         _say(f"  --refine: chaining refmac5 rigid-body ({refine_cycles} cycles)...")
         refined_pdb, refined_mtz = bf.run_refinement(
             out_pdb, out_mtz, outdir=outdir,
-            n_cycles=refine_cycles, fill_fcalc=fill_fcalc)
+            n_cycles=refine_cycles, fill_asu=fill_asu)
         refined = dict(pdb=refined_pdb, mtz=refined_mtz)
         _say(f"    refined PDB: {refined_pdb}")
         _say(f"    refined MTZ: {refined_mtz}")
@@ -530,11 +530,11 @@ def resolve(res, out_pdb, out_mtz=None, outdir='.', refine=False,
 
 def _parse_args(argv):
     """Minimal CLI parser: positional args (mov, ref, out_pdb, mov_mtz,
-    out_mtz) + --refine, --outdir, --no-fill-fcalc flags."""
+    out_mtz) + --refine, --outdir, --no-fill-asu flags."""
     pos = []
     refine = False
     outdir = '.'
-    fill_fcalc = True
+    fill_asu = True
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -544,20 +544,20 @@ def _parse_args(argv):
             refine = False
         elif a == '--outdir':
             outdir = argv[i+1]; i += 1
-        elif a == '--no-fill-fcalc':
-            fill_fcalc = False
-        elif a == '--fill-fcalc':
-            fill_fcalc = True
+        elif a == '--no-fill-asu':
+            fill_asu = False
+        elif a == '--fill-asu':
+            fill_asu = True
         elif a in ('-h', '--help'):
             sys.exit(__doc__)
         else:
             pos.append(a)
         i += 1
-    return pos, refine, outdir, fill_fcalc
+    return pos, refine, outdir, fill_asu
 
 
 def main():
-    pos, refine, outdir, fill_fcalc = _parse_args(sys.argv[1:])
+    pos, refine, outdir, fill_asu = _parse_args(sys.argv[1:])
     if len(pos) < 2:
         sys.exit(__doc__)
     mov_pdb = pos[0]
@@ -575,7 +575,7 @@ def main():
     res = search(mov_pdb, ref_pdb, mov_mtz=mov_mtz, outdir=outdir)
     report(res)
     resolve(res, out_pdb, out_mtz=out_mtz, outdir=outdir,
-            refine=refine, fill_fcalc=fill_fcalc)
+            refine=refine, fill_asu=fill_asu)
 
 
 if __name__ == '__main__':
