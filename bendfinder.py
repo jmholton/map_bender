@@ -291,6 +291,66 @@ def expand_to_p1(pdb_path, altloc_filter=False, altloc_fallback=1.0, origin_shif
     return atoms, cell, sg_name
 
 
+def _maybe_remap_single_chain(atoms1, atoms2, seq_id_min=0.9, verbose=True):
+    """If atoms1 and atoms2 are each single-chain but use different chain
+    IDs (e.g. 'A' vs 'X' — common with older PDB-REDO outputs), return a
+    chain-remapped *copy* of atoms2 with its chain renamed to match
+    atoms1's, gated by a sequence-similarity sanity check.
+
+    Sanity: among residues sharing (resnum, icode) in both inputs, at
+    least `seq_id_min` fraction must have the same residue name.  This
+    keeps the remap from silently aligning two different proteins that
+    happen to overlap in residue numbering.
+
+    Returns atoms2 unchanged when no remap is warranted (multi-chain
+    inputs, matching chain IDs, or sequence-id below threshold).
+    """
+    chains1 = {a['chain'] for a in atoms1}
+    chains2 = {a['chain'] for a in atoms2}
+    if chains1 == chains2:
+        return atoms2
+    if len(chains1) != 1 or len(chains2) != 1:
+        return atoms2   # multi-chain — too ambiguous, leave alone
+
+    # Compare CA residue identities at each (resnum, icode)
+    r1 = {(a['resnum'], a.get('icode', '')): a['resname']
+          for a in atoms1 if a.get('is_ca')}
+    r2 = {(a['resnum'], a.get('icode', '')): a['resname']
+          for a in atoms2 if a.get('is_ca')}
+    common = set(r1) & set(r2)
+    if not common:
+        return atoms2
+    matches = sum(1 for k in common if r1[k] == r2[k])
+    frac = matches / len(common)
+    if frac < seq_id_min:
+        if verbose:
+            print(f"  match_atoms: chains differ ('{next(iter(chains1))}' vs "
+                  f"'{next(iter(chains2))}') but sequence id only "
+                  f"{100*frac:.0f}% — refusing to remap", flush=True)
+        return atoms2
+
+    src    = next(iter(chains2))
+    target = next(iter(chains1))
+    if verbose:
+        print(f"  match_atoms: chain-ID remap '{src}' → '{target}' "
+              f"({matches}/{len(common)} CA pairs same resname, "
+              f"{100*frac:.0f}% sequence id)", flush=True)
+
+    # Shallow-copy each atom; rewrite chain + the leading uid token
+    remapped = []
+    for a in atoms2:
+        if a['chain'] != src:
+            remapped.append(a)
+            continue
+        b = dict(a)
+        b['chain'] = target
+        parts = a['uid'].split('_')
+        parts[0] = target
+        b['uid'] = '_'.join(parts)
+        remapped.append(b)
+    return remapped
+
+
 def match_atoms(atoms1, atoms2):
     """Match atoms between two P1 lists by uid.
 
@@ -301,6 +361,11 @@ def match_atoms(atoms1, atoms2):
     uids    : list[str]
     bfacs   : ndarray (N, 2) — [B1, B2] for each matched pair
     """
+    # Auto-remap single-chain mismatches (e.g. 'X' vs 'A') if the residue
+    # sequences agree.  No-op when both inputs already use the same chains
+    # or the multi-chain case is too ambiguous to remap safely.
+    atoms2 = _maybe_remap_single_chain(atoms1, atoms2)
+
     idx2 = {a['uid']: a for a in atoms2}
     rows, ca, uids, bfacs = [], [], [], []
     for a1 in atoms1:
@@ -1025,8 +1090,16 @@ def check_geometry(pdb_path, outlier_z=5.0):
     angles = topo.angles
     if not bonds:
         return None
-    bz = np.array([b.calculate_z() for b in bonds])
-    az = np.array([a.calculate_z() for a in angles]) if angles else np.zeros(0)
+    # Some bonds/angles can lack an ideal target (e.g. linkage to a residue
+    # whose monomer-lib entry doesn't fully constrain it).  Their
+    # calculate_z() returns NaN and would propagate to the RMSZ.  Filter
+    # out non-finite z's before reducing.
+    bz_all = np.array([b.calculate_z() for b in bonds])
+    az_all = np.array([a.calculate_z() for a in angles]) if angles else np.zeros(0)
+    bz = bz_all[np.isfinite(bz_all)]
+    az = az_all[np.isfinite(az_all)]
+    if len(bz) == 0:
+        return None     # truly no usable bonds left
     return dict(n_bonds=int(len(bz)),
                 bond_rmsz=float(np.sqrt(np.mean(bz*bz))),
                 bond_max_z=float(np.max(np.abs(bz))),
@@ -2279,6 +2352,12 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                                        altloc_fallback=altloc_fallback)
     if verbose:
         print(f"{sg2} to P1", flush=True)
+
+    # If atoms1 and atoms2 use different single-chain IDs but the same
+    # residue sequence (e.g. 'A' vs 'X' in older PDB-REDO outputs),
+    # remap atoms2's chain to atoms1's BEFORE the origin search — which
+    # also matches by uid and would otherwise hit zero pairs.
+    atoms2 = _maybe_remap_single_chain(atoms1, atoms2, verbose=verbose)
 
     if verbose:
         print("matching atoms...", end=' ', flush=True)
