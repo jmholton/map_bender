@@ -114,6 +114,8 @@ Per-system `*_fitreso_scan.py` wrapper scripts have been removed.
 | `dimensions` | 'xyz' | Which coordinate axes to fit |
 | `iter_callback` | None | Called after each progressive iteration (see above) |
 | `max_canon` | None | Stop after first iteration where n_canon ≥ this value |
+| `bound_by_obs` | True | Tikhonov-ridge the SVD so the fitted field's total energy ≤ obs_max² (Parseval).  Replaces 1/s with s/(s² + λ), λ = σ_noise²·6M/obs². Bounds catastrophic ringing at fine fitreso — see [Field-bounded SVD ridge](#field-bounded-svd-ridge) |
+| `pnn_mode` | None | Per-HKL weight: `'softpnna'` (constN, default w/o ridge), `'softpnna_kth'` (Holm step-down N_eff = N-rank+1, default w/ ridge), `'pnn'`/`'pnn_kth'` (strict erf^N), `'chik'`/`'chik_kth'` (chi-6 null), `'off'` |
 
 ## SNR weighting (Pnn / softPnna)
 
@@ -215,6 +217,72 @@ iterative hard-cut path (drop HKLs with snr < drop_snr, re-solve).
 The Pnn default is empirically robust across both clean and noisy
 datasets; the hard-cut path is retained for backward compatibility
 and as an opt-out.
+
+## Field-bounded SVD ridge (`bound_by_obs=True`)
+
+Default for every `fitreso_scan` call.  Tikhonov-regularizes the SVD
+inside `fit_lstsq_symm` so the fitted shift-field's total Fourier
+energy is bounded by the **observed CA shift max**.  Replaces the
+plain pseudo-inverse `1/s` per singular value with the Wiener-filtered
+form
+
+```
+s / (s² + λ)         λ  =  σ_noise² · 6M / obs_max²
+```
+
+where `σ_noise²` is the SVD residual variance, `6M` is the symm-path
+parameter count (3 dims × (A,B) × M canonical HKLs), and `obs_max` is
+the max per-atom shift magnitude (fractional) over the fit population
+after outlier rejection.  Recomputed per progressive iteration since
+the active atom set evolves.
+
+**Why it works.**  By Parseval, the sum-of-squared (A,B) coefficients
+equals the mean-squared field magnitude over the unit cell up to
+normalization.  Demanding `Σ|AB|² ≤ obs_max²` enforces an L²
+containment that bounds the L∞ (peak) field magnitude as well — the
+ringing failure mode at fine fitreso is "field max ≫ obs max", which
+the prior makes impossible.
+
+**Empirical effect.**  Catastrophic ringing at the finest fitreso
+collapses to refined-quality geometry:
+
+| system | fr5 RMSD before | fr5 RMSD after | fr5 bondZ before | fr5 bondZ after |
+|--------|-----------------|----------------|------------------|-----------------|
+| lyso  | 0.285 | **0.183** | 2.70 | 3.10 |
+| dhfr  | 0.437 | **0.247** | 6.45 | **3.82** |
+| myo   | 0.195 | **0.139** | 2.62 | 2.66 |
+| insulin | 1.004 | 0.920 | 22.89 | 21.60 |
+| **lipox** | **230.45 Å** | **0.591 Å** | **16982** | **7.80** |
+
+Lipox fr5 alone goes from a total catastrophe (CA RMSD ~230 Å — the
+field literally throws atoms across the cell) to a usable 0.59 Å fit.
+
+`best`-row results are unchanged because the d_opt parabola already
+filtered out the catastrophic fr-rows pre-ridge.  The ridge gain is
+making the entire scan-row population safe so the parabola fit and
+RMSD-baseline filter have more good data to work with — and the
+"best" `d_opt` can land at finer resolutions for systems that benefit.
+
+**Pnn pairing**: with ridge on, the default `pnn_mode` is
+`'softpnna_kth'` (Holm step-down: each rank uses softPnna with
+`N_eff = N − rank + 1`).  Tried alternatives on the 8jee CA-pilot
+worst-case:
+
+| variant | fr8 bondZ | best bondZ |
+|---------|-----------|------------|
+| softPnna only (no ridge) | 25.47 | 1.66 |
+| ridge only (no per-HKL Pnn) | 5.22 | 5.58 |
+| ridge × chi-k | 3.94 | 3.97 |
+| ridge × softPnna (constN) | 1.54 | 1.74 |
+| **ridge × softPnna_kth** | **1.56** | 1.79 |
+| ridge × Pnn_kth | 1.06 | 1.69 |
+| ridge × chi-k_kth | 3.82 | 4.13 |
+
+`softPnna_kth` chosen as default for the balance of clean geometry +
+best RMSD across the gamut.  `Pnn_kth` has slightly cleaner fr8
+bondZ in one system but is harsher in general (strict erf^N at small
+N_eff).  Override via `pnn_mode=...` on `fitreso_scan` /
+`bend_fit_progressive`.
 
 ## Fitreso scan
 

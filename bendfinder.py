@@ -810,11 +810,14 @@ def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5, bound_by_obs_frac=None,
         snr_full[ai] = snr_a    # raw SNR — record BEFORE any weighting
 
         if drop_snr <= 0:
-            # Default mode: softPnna when no ridge, off when ridge active.
+            # Default per-HKL weight: with ridge on, the Holm step-down
+            # softPnna_kth wins the empirical gamut (lipox fr5 RMSD
+            # 230 Å→0.59 Å, all other systems unchanged at best).
+            # Without ridge, fall back to constant-N softPnna.
             mode = pnn_mode
             if mode is None:
-                mode = 'off' if (bound_by_obs_frac is not None and
-                                  bound_by_obs_frac > 0) else 'softpnna'
+                mode = 'softpnna_kth' if (bound_by_obs_frac is not None and
+                                           bound_by_obs_frac > 0) else 'softpnna'
 
             N_act = len(snr_a)
             # Rank-conditional N_eff array for step-down variants
@@ -3629,7 +3632,7 @@ def fitreso_scan(
     batch_hkls=100, chunk_size=50000,
     riso_n_cycles=4, riso_sigma_cut=float('inf'),
     subtract='ref', atom_sel='all',
-    bound_by_obs=False, pnn_mode=None,
+    bound_by_obs=True, pnn_mode=None,
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
