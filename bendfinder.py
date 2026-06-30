@@ -721,7 +721,8 @@ def _soft_pnn_weight_k(snr, N, k=1):
     return _soft_pnn_weight(snr, N_eff)
 
 
-def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5):
+def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5, bound_by_obs_frac=None,
+                   pnn_mode=None):
     """Joint 3D lstsq with per-canonical-HKL Pnn weighting.
 
     X : (3N, 6M) symmetry-adapted design matrix
@@ -739,6 +740,15 @@ def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5):
       - drop_snr > 0: legacy hard-cut.  Iteratively drop HKLs with
         snr < drop_snr (up to max_rounds) and re-solve.  Surviving
         HKLs are returned at full (un-weighted) strength.
+
+    `bound_by_obs_frac` (optional): max observed shift magnitude in
+    FRACTIONAL units.  When set, the SVD pseudo-inverse `1/s` is
+    replaced with the Tikhonov-filtered form `s/(s² + λ)` with
+    `λ = σ_noise² · M / obs²` — calibrated so the prior on each of
+    the 6M parameters has variance obs²/M (Parseval bound, total field
+    energy ≤ obs²).  Shrinks small singular values; high-SNR
+    components pass through unchanged.  Bounds the fitted field
+    without per-HKL weighting.
 
     Returns
     -------
@@ -768,6 +778,19 @@ def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5):
         nz = s > s_thresh
         s_inv[nz] = 1.0 / s[nz]
 
+        # First-pass plain-inverse residual gives σ_noise² for the Tikhonov λ
+        sol_lsq = Vt.T @ (s_inv * (U.T @ b))
+        if bound_by_obs_frac is not None and bound_by_obs_frac > 0:
+            resid_lsq = b - Xa @ sol_lsq
+            dof_lsq   = max(n - int(nz.sum()), 1)
+            sig2_lsq  = float(np.dot(resid_lsq, resid_lsq)) / dof_lsq
+            M_act     = int(active.sum())
+            # σ_prior² per param = obs_frac² / (6·M_act) — total prior energy = obs²
+            sigma_prior2 = (bound_by_obs_frac ** 2) / max(6 * M_act, 1)
+            lam = sig2_lsq / sigma_prior2
+            # Tikhonov SVD filter: s/(s² + λ) replacing 1/s
+            s_inv = np.where(nz, s / (s * s + lam), 0.0)
+
         sol   = Vt.T @ (s_inv * (U.T @ b))
         resid = b - Xa @ sol
         rank  = int(nz.sum())
@@ -787,11 +810,45 @@ def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5):
         snr_full[ai] = snr_a    # raw SNR — record BEFORE any weighting
 
         if drop_snr <= 0:
-            # Pnn weight: erf(|snr|/√2)^N with N = number of canonical
-            # HKLs being tested.  Built-in multiple-testing correction:
-            # the more HKLs, the higher the per-HKL SNR bar.
-            w = _soft_pnn_weight(snr_a, len(snr_a))           # (M_active,)
-            params_full[col_mask] = (p_blk * w[:, None]).ravel()
+            # Default mode: softPnna when no ridge, off when ridge active.
+            mode = pnn_mode
+            if mode is None:
+                mode = 'off' if (bound_by_obs_frac is not None and
+                                  bound_by_obs_frac > 0) else 'softpnna'
+
+            N_act = len(snr_a)
+            # Rank-conditional N_eff array for step-down variants
+            ranks = np.empty(N_act, dtype=int)
+            order_desc = np.argsort(-np.abs(snr_a))
+            ranks[order_desc] = np.arange(1, N_act + 1)   # rank 1 = top |snr|
+            N_eff_per = np.maximum(1, N_act - ranks + 1)  # Holm: N_eff for rank-k
+
+            if mode == 'off':
+                params_full[col_mask] = sol
+            else:
+                if mode == 'chik':
+                    w = _pnn_weight_chik(snr_a, N_act, k=6)
+                elif mode == 'softpnna_kth':
+                    # softPnna with N_eff = N - rank + 1 per HKL (step-down)
+                    w = np.zeros_like(snr_a)
+                    for k_val in np.unique(N_eff_per):
+                        m_k = (N_eff_per == k_val)
+                        w[m_k] = _soft_pnn_weight(snr_a[m_k], int(k_val))
+                elif mode == 'pnn_kth':
+                    # Strict erf^N with N_eff = N - rank + 1 per HKL
+                    w = np.zeros_like(snr_a)
+                    for k_val in np.unique(N_eff_per):
+                        m_k = (N_eff_per == k_val)
+                        w[m_k] = _pnn_weight(snr_a[m_k], int(k_val))
+                elif mode == 'chik_kth':
+                    # chi-k with N_eff = N - rank + 1 per HKL
+                    w = np.zeros_like(snr_a)
+                    for k_val in np.unique(N_eff_per):
+                        m_k = (N_eff_per == k_val)
+                        w[m_k] = _pnn_weight_chik(snr_a[m_k], int(k_val), k=6)
+                else:  # 'softpnna'
+                    w = _soft_pnn_weight(snr_a, N_act)
+                params_full[col_mask] = (p_blk * w[:, None]).ravel()
             break
 
         params_full[col_mask] = sol
@@ -2386,7 +2443,9 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                          altloc_filter=False, altloc_fallback=1.0,
                          iter_callback=None, max_canon=None,
                          precomputed_origin=None,
-                         iteration_schedule=None):
+                         iteration_schedule=None,
+                         bound_by_obs=False,
+                         pnn_mode=None):
     """Fit a Fourier shift field progressively, admitting HKLs coarsest-first.
 
     HKLs are admitted in batches from fitreso_start (coarsest, large d) down to
@@ -2638,10 +2697,20 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
             shifts_xyz   = fitme[asu_fit_mask][:, [dim_col[d] for d in 'xyz']]
             shifts_flat  = shifts_xyz.ravel()
 
+            obs_max_frac = None
+            if bound_by_obs:
+                # Per-atom fractional-shift magnitude, max across the fit
+                # population.  Used as the L∞ field-magnitude prior in the
+                # SVD ridge (λ = σ_noise² · 6M / obs_max²).  Recomputed per
+                # iter because the active atom set changes via outlier rej.
+                mags = np.sqrt(np.sum(shifts_xyz**2, axis=1))
+                obs_max_frac = float(mags.max()) if len(mags) else None
+
             X_symm = build_design_matrix_symm(frac_asu, canon_hkls, proper_ops,
                                                hkl_to_canon, hkl_all_ops)
             params, active_c, snr_c = fit_lstsq_symm(
-                X_symm, shifts_flat, drop_snr=drop_snr)
+                X_symm, shifts_flat, drop_snr=drop_snr,
+                bound_by_obs_frac=obs_max_frac, pnn_mode=pnn_mode)
             AB_xyz = expand_ab_canon(params, active_c, canon_hkls, hkls_now,
                                      hkl_to_canon, hkl_all_ops, proper_ops)
 
@@ -3560,6 +3629,7 @@ def fitreso_scan(
     batch_hkls=100, chunk_size=50000,
     riso_n_cycles=4, riso_sigma_cut=float('inf'),
     subtract='ref', atom_sel='all',
+    bound_by_obs=False, pnn_mode=None,
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -4046,7 +4116,7 @@ def fitreso_scan(
         mov_pdb, ref_pdb,
         fitreso_start=100.0, fitreso_end=2.0,
         max_canon=max_hkl_scan + 1, batch_hkls=1, od_margin=od_margin,
-        drop_snr=drop_snr, outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel,
+        drop_snr=drop_snr, outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel, bound_by_obs=bound_by_obs, pnn_mode=pnn_mode,
         verbose=False,
         iter_callback=_hkl_callback,
         precomputed_origin=precomputed_origin,
@@ -4140,7 +4210,7 @@ def fitreso_scan(
             mov_pdb, ref_pdb,
             fitreso_start=20.0, fitreso_end=fr_min,
             drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
-            outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel,
+            outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel, bound_by_obs=bound_by_obs, pnn_mode=pnn_mode,
             verbose=False,
             iter_callback=_fr_callback,
             precomputed_origin=precomputed_origin,
@@ -4266,7 +4336,7 @@ def fitreso_scan(
             mov_pdb, ref_pdb,
             fitreso_start=20.0, fitreso_end=d_opt,
             drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
-            outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel,
+            outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel, bound_by_obs=bound_by_obs, pnn_mode=pnn_mode,
             verbose=False,
             precomputed_origin=precomputed_origin,
         )
