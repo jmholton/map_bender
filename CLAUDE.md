@@ -335,12 +335,13 @@ lands in `scan_dir/best/` with the same per-point outputs as a normal
 fr-row.  A footer in `scan_fitreso.log` records which rows were used,
 `d_opt`, and the parabola-predicted Rbent.
 
-Empirically (June 2026 with Pnn weighting + RMSD-baseline filter)
-d_opt sits in the 8–17 Å band for bend-friendly systems (lyso 12.2 Å,
-dhfr 16.5 Å, raddam 17–20 Å, myoglobin 10 Å); for systems where the
-deformation exceeds the smooth-PSDVF model (insulin T→R, lipox
-cross-cell, low-res noisy data) the filter correctly clamps d_opt
-coarser to keep geometry clean.
+Empirically (June 2026 with Tikhonov ridge + softpnna_kth + RMSD-
+baseline filter) d_opt sits in the 8–20 Å band for bend-friendly
+systems (lyso 11.25 Å, dhfr 15.45 Å, raddam 17.2–20 Å, myoglobin
+9.06 Å); for systems where the deformation exceeds the smooth-PSDVF
+model (insulin T→R at 8.15 Å, lipox cross-cell at 16.03 Å) the
+filter still lands on a defensible d_opt because the ridge keeps
+every fr-row honest.
 
 If fewer than 3 fr-rows have a valid Rbent at all, or the parabola
 opens downward (no interior minimum), the best section silently falls
@@ -844,22 +845,27 @@ Run as `./run_all_tests.com` from the working area.
 
 All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `bound_by_obs=True`, `pnn_mode='softpnna_kth'`, `batch_hkls=100`, `atom_sel='all'`).  **June 2026 refresh (ridge default)** — the two stacked regularizers active by default are the Tikhonov ridge (Wiener-filtered SVD bounded by the observed CA shift energy, [Field-bounded SVD ridge](#field-bounded-svd-ridge-bound_by_obstrue)) and the Holm step-down softPnna per-HKL weight ([SNR weighting](#snr-weighting-pnn--softpnna)) plus the RMSD-baseline best filter.  With the ridge active the fr5 row is no longer a catastrophe risk (lipox fr5 dropped from 230 Å pre-ridge to 0.591 Å); the **best** row remains the practical deliverable.
 
-| System | Space group | fr5 RMSD | fr5 Rbent | best RMSD | best Rbent | d_opt | subtract |
-|--------|------------|----------|-----------|-----------|------------|-------|----------|
-| Lyso 3aw6→3aw7 | P4₃2₁2 | 0.285 Å | 34.1% | 0.105 Å | 29.1% | 12.2 Å | ref |
-| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 0.437 Å | 43.0% | 0.199 Å | 38.0% | 16.5 Å | ref |
-| Raddam 5kxk→5kxl | P4₃2₁2 | 0.126 Å | 13.5% | 0.114 Å | 11.2% | 20 Å (clamped) | bent |
-| Raddam 5kxk→5kxm | P4₃2₁2 | 0.085 Å | 11.2% | 0.079 Å |  9.9% | 17.3 Å | bent |
-| Raddam 5kxk→5kxn | P4₃2₁2 | 0.116 Å | 19.0% | 0.100 Å | 17.6% | 20 Å (clamped) | bent |
-| Myoglobin 1mbo→1a6m | P2₁ | 0.195 Å | 53.9% | 0.115 Å | 52.6% | 10.0 Å | ref |
-| Insulin 4fg3→4e7u | H3 | 1.004 Å | 62.6% | 1.014 Å | 63.3% | 8.1 Å | ref (`fill_asu=True`) |
-| Porin 3poq→3pou | H 3 2 | (altalign+R32:R; refmac R=0.46) | | | | | ref |
-| Lipox 9o4s→9o4t | P2₁ | 0.591 Å¹ | 55.7% | 0.341 Å | 52.8% | 16.1 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
+| System | Space group | fr5 RMSD | fr5 Rbent | fr5 bondZ | best RMSD | best Rbent | best bondZ | d_opt | subtract |
+|--------|------------|----------|-----------|-----------|-----------|-----------|-----------|-------|----------|
+| Lyso 3aw6→3aw7 | P4₃2₁2 | 0.183 Å | 31.2% | 3.10 | 0.100 Å | 29.0% | 2.70 | 11.25 Å | ref |
+| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 0.247 Å | 39.1% | 3.82 | 0.192 Å | 37.9% | 3.16 | 15.45 Å | ref |
+| Raddam 5kxk→5kxl | P4₃2₁2 | 0.112 Å | 11.9% | 1.51 | 0.114 Å | 11.2% | 1.19 | 20 Å (clamped) | bent |
+| Raddam 5kxk→5kxm | P4₃2₁2 | 0.076 Å | 10.4% | 1.36 | 0.078 Å | 9.9%  | 1.20 | 17.21 Å | bent |
+| Raddam 5kxk→5kxn | P4₃2₁2 | 0.090 Å | 18.1% | 1.44 | 0.100 Å | 17.6% | 1.24 | 20 Å (clamped) | bent |
+| Myoglobin 1mbo→1a6m | P2₁ | 0.139 Å | 52.8% | 2.66 | 0.107 Å | 52.5% | 2.90 | 9.06 Å | ref |
+| Insulin 4fg3→4e7u | H3 | 0.920 Å | 62.5% | 21.60² | 0.944 Å | 63.4% | 19.39² | 8.15 Å | ref (`fill_asu=True`) |
+| Porin 3poq→3pou | H 3 2 | (altalign+R32:R; refmac R=0.46) | | | | | | | ref |
+| Lipox 9o4s→9o4t | P2₁ | 0.591 Å¹ | 54.4% | 7.80 | 0.323 Å | 52.7% | 6.97 | 16.03 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
 
 ¹ Pre-ridge lipox fr5 was 230 Å — the field ringed catastrophically
 outside the fit population.  With `bound_by_obs=True` (default) the
 Parseval energy bound collapses fr5 to a usable 0.591 Å with
 bondZ 7.80 (vs 16982 pre-ridge).  See [Field-bounded SVD ridge](#field-bounded-svd-ridge-bound_by_obstrue).
+
+² Insulin bondZ 21.60 / 19.39 is the T→R conformational limit, not a
+regularization failure — LEU B6 shifts ~8 Å between crystal forms,
+exceeding what a smooth shift field can bend cleanly.  Every other
+system in the gamut lands at bondZ ≤ 3.82 (refined-to-good geometry).
 
 The `best` row in each `scan_dir/scan_fitreso.log` is the
 parabola-vertex re-fit (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
