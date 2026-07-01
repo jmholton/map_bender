@@ -44,6 +44,8 @@ print(f"CA RMSD: {result.rmsd:.3f} Å")
 | `outlier_sigma` | 2.5 | Reject atom pairs > this many robust σ from median shift |
 | `b_sigma` | 3.0 | Reject atom pairs with B-factor > median + b_sigma × σ_MAD |
 | `drop_snr` | 0.0 | **0 = apply Pnn weight `erf(\|snr\|/√2)^M` to each HKL's (A,B); >0 = legacy iterative hard-cut at `drop_snr` σ.** See [SNR weighting](#snr-weighting) below. |
+| `bound_by_obs` | True | Tikhonov-ridge the SVD so the fitted field's total Fourier energy ≤ obs_max² (Parseval). Bounds catastrophic ringing at fine `fitreso`. |
+| `pnn_mode` | None | Per-HKL weight family: `'softpnna_kth'` (default when ridge is on — Holm step-down with `N_eff = N − rank + 1`), `'softpnna'` (const-N; default without ridge), `'pnn'`/`'pnn_kth'` (strict `erf^N`), `'chik'`/`'chik_kth'` (chi-6 null; diagnostic), `'off'`. |
 | `use_symm` | True | Apply space-group proper-rotation constraints |
 | `dimensions` | 'xyz' | Which coordinate axes to fit |
 | `frac` | 1.0 | How far along the bend path to place the output (0–1) |
@@ -67,21 +69,27 @@ print(f"CA RMSD: {result.rmsd:.3f} Å")
 
 Each canonical HKL gets a per-HKL SNR = \|A,B\| / σ from the SVD covariance. With many HKLs admitted (M ≈ 100–1000), naïve fits tend to absorb noisy low-SNR HKLs and produce a field that fits the constrained atoms exactly but rings wildly between them — atoms not in the fit population (or only weakly-coupled atoms in the fit) get thrown by tens of ångströms.
 
-The default `drop_snr=0` applies the Holton **Pnn** weight to each AB block:
+Two stacked regularizers control this by default:
+
+**Field-bounded SVD ridge (`bound_by_obs=True`).**  A Tikhonov ridge replaces the plain pseudo-inverse `1/s` with the Wiener-filtered form `s / (s² + λ)` where `λ = σ_noise² · 6M / obs_max²`.  By Parseval, this bounds the fitted shift-field's total Fourier energy by the observed CA shift energy — atoms outside the fit population can no longer be thrown across the cell.  Lipox fr5 dropped from 230 Å RMSD (bondZ 16982) pre-ridge to 0.591 Å (bondZ 7.80) with the ridge alone.
+
+**Per-HKL Pnn weight.**  Each AB block is scaled by the Holm step-down softPnna weight (`pnn_mode='softpnna_kth'`, the default when ridge is on):
 
 ```
-w_m = erf(|snr_m| / √2) ** M     for M canonical HKLs
+w_i = softpnna( snr_i , N_eff = N − rank_i + 1 )        (sorted by |snr| descending)
 ```
 
-This is the probability that an SNR of magnitude `snr_m` would not be exceeded by random noise across M independent measurements — built-in Bonferroni-style multiple-testing correction. As M grows the per-HKL bar for "real signal" rises automatically (σ_50% ≈ 1.5σ at M=30, ≈ 3.2σ at M=500). Low-SNR HKLs get smoothly damped toward zero; high-SNR signal passes through unchanged. The PSDVF.mtz `SNR` column stores the raw pre-weight value for diagnostics.
+The i-th-ranked HKL competes against `N − i + 1` remaining noise tests instead of the full N, so once the top HKL is committed as real signal the bar for the next drops by one Bonferroni step.  This is a smoothed variant of the Holton **Pnn** family `erf(|snr|/√2)^N` — a probability that a single deviate of magnitude `snr` would not be exceeded by random noise across N independent measurements.  Low-SNR HKLs damp smoothly toward zero; high-SNR signal passes through unchanged.  The `PSDVF.mtz` `SNR` column stores the raw pre-weight value so the weighting is reproducible from the saved file.
 
-`drop_snr > 0` switches to a legacy iterative hard-cut path (drop HKLs with snr < drop_snr and re-solve until stable). Equivalent in spirit but less graceful; retained for backward compatibility and as an opt-out.
+On the 8jee CA-pilot worst-case, the two regularizers together drop fr8 bondZ from 209.6 (raw SVD) → 25.5 (softPnna alone) → 5.2 (ridge alone) → **1.6** (both).  Neither alone is enough; ridge limits total field magnitude, softpnna_kth zeroes individual low-SNR HKLs.
+
+`drop_snr > 0` switches to a legacy iterative hard-cut path (drop HKLs with snr < drop_snr and re-solve until stable). Equivalent in spirit but less graceful; retained for backward compatibility and as an opt-out.  `pnn_mode='off'` and `bound_by_obs=False` are additional opt-outs.
 
 The companion `best` row from `fitreso_scan` further protects against pathological fine-fitreso fits with an **RMSD-baseline filter**: the parabola only considers fr-rows whose CA RMSD is ≤ the unbent baseline. The first fr-row where the field is making the CA RMSD WORSE than no bending is treated as the "going-wrong-way" cliff and excluded from `d_opt` selection.
 
 ## Benchmarks
 
-All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0` → Pnn weighting active, `atom_sel='all'`).  June 2026 gamut.
+All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `bound_by_obs=True`, `pnn_mode='softpnna_kth'`, `atom_sel='all'`).  June 2026 gamut — Tikhonov ridge + step-down softPnna active by default; ridge-off pre-catastrophe values (lipox fr5=230 Å) are historical.
 
 ### Python version (`bendfinder.py`)
 

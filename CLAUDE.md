@@ -842,7 +842,7 @@ Run as `./run_all_tests.com` from the working area.
 
 ## Empirical results (fitreso scans)
 
-All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0` → Pnn weighting active, `batch_hkls=100`, `atom_sel='all'`).  **June 2026 refresh** with Pnn weighting in `fit_lstsq_symm`/`fit_lstsq` and the RMSD-baseline best filter.  The `fr5` row is now mostly diagnostic — for noisy data softPnna-damped fits at the finest resolution can have inflated RMSD because the field is under-bending; the **best** row is the practical deliverable.
+All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `bound_by_obs=True`, `pnn_mode='softpnna_kth'`, `batch_hkls=100`, `atom_sel='all'`).  **June 2026 refresh (ridge default)** — the two stacked regularizers active by default are the Tikhonov ridge (Wiener-filtered SVD bounded by the observed CA shift energy, [Field-bounded SVD ridge](#field-bounded-svd-ridge-bound_by_obstrue)) and the Holm step-down softPnna per-HKL weight ([SNR weighting](#snr-weighting-pnn--softpnna)) plus the RMSD-baseline best filter.  With the ridge active the fr5 row is no longer a catastrophe risk (lipox fr5 dropped from 230 Å pre-ridge to 0.591 Å); the **best** row remains the practical deliverable.
 
 | System | Space group | fr5 RMSD | fr5 Rbent | best RMSD | best Rbent | d_opt | subtract |
 |--------|------------|----------|-----------|-----------|------------|-------|----------|
@@ -854,13 +854,12 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Myoglobin 1mbo→1a6m | P2₁ | 0.195 Å | 53.9% | 0.115 Å | 52.6% | 10.0 Å | ref |
 | Insulin 4fg3→4e7u | H3 | 1.004 Å | 62.6% | 1.014 Å | 63.3% | 8.1 Å | ref (`fill_asu=True`) |
 | Porin 3poq→3pou | H 3 2 | (altalign+R32:R; refmac R=0.46) | | | | | ref |
-| Lipox 9o4s→9o4t | P2₁ | 230 Å¹ | 72.3% | 0.341 Å | 52.8% | 16.1 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
+| Lipox 9o4s→9o4t | P2₁ | 0.591 Å¹ | 55.7% | 0.341 Å | 52.8% | 16.1 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
 
-¹ The fr5 RMSD=230 Å for lipox is exactly the failure mode the
-RMSD-baseline filter is designed to catch: at fine fitreso the
-softPnna-damped fit lets non-fitted atoms wander far from any
-constraint.  The filter excludes this from the parabola; **best**
-lands at d_opt=16.1 Å with RMSD=0.341 Å (canonical 0.300 Å).
+¹ Pre-ridge lipox fr5 was 230 Å — the field ringed catastrophically
+outside the fit population.  With `bound_by_obs=True` (default) the
+Parseval energy bound collapses fr5 to a usable 0.591 Å with
+bondZ 7.80 (vs 16982 pre-ridge).  See [Field-bounded SVD ridge](#field-bounded-svd-ridge-bound_by_obstrue).
 
 The `best` row in each `scan_dir/scan_fitreso.log` is the
 parabola-vertex re-fit (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
@@ -874,7 +873,8 @@ exceeds the smooth-PSDVF model so no fitreso choice helps).
 
 All "from-raw" runs in `<system>/scan_fitreso/` (June 2026 gamut,
 `fill_asu=True` propagated through refmac and altindex re-refinement,
-Pnn weighting + RMSD-baseline best filter active).  Self-test runs:
+Tikhonov ridge (`bound_by_obs=True`) + softPnna_kth Pnn weighting +
+RMSD-baseline best filter active).  Self-test runs:
 `test_symm_all_sgs.py` 65/65 PASS (max violation 2.72e-13 Å);
 `magdoff/test_magdoff.py` Test 2 recovery 0.069/0.038 (constrained/
 unconstrained) — about 2× looser than the pre-Pnn reference because
