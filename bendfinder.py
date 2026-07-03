@@ -3633,6 +3633,7 @@ def fitreso_scan(
     riso_n_cycles=4, riso_sigma_cut=float('inf'),
     subtract='ref', atom_sel='all',
     bound_by_obs=True, pnn_mode=None,
+    preserve_mov_numbering=True,
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -3677,7 +3678,9 @@ def fitreso_scan(
     # coordinates — only the (chain, resnum) labels change — so all downstream
     # consumers (pre/, refmac, altindex, bend) see a consistent view.
     _norm_pdb = os.path.join(scan_dir, '_mov_normalized.pdb')
-    mov_pdb = _normalize_mov_pdb(mov_pdb, ref_pdb, _norm_pdb, verbose=verbose)
+    orig_mov_pdb = mov_pdb                           # untouched user-supplied path
+    mov_pdb, norm_plan = _normalize_mov_pdb(
+        mov_pdb, ref_pdb, _norm_pdb, verbose=verbose)
 
     # ── snapshot the truly-raw inputs (used by the pre/ section below) ───────
     # pre/ shows the "old-fashioned" diff map: mov sampled on ref's grid with
@@ -3814,10 +3817,29 @@ def fitreso_scan(
     # frame (mov has already been moved into ref's frame by resolve_altindex
     # when applicable).  Each atom carries an `src` tag ('r' or 'm') shown
     # in the peak label.
+    # ── display-side mov PDBs: same coords/cell as the normalized files, but
+    # the moving structure's ORIGINAL chain / resnum / resname / atomname
+    # labels restored.  Used for anything the user reads — peak labels, bent
+    # PDBs, unbent.pdb symlinks — so they never wonder "which model am I
+    # looking at?" when scrolling residues in Coot.  Internal atom matching
+    # (match_atoms, resolve_altindex, bend_fit_progressive) keeps using the
+    # ref-labelled normalized copies.  `preserve_mov_numbering=False` reverts
+    # to today's ref-labelled outputs (opt-in for side-by-side overlays).
+    if preserve_mov_numbering and norm_plan is not None:
+        mov_display_pdb = _reverse_normalize_pdb(
+            mov_pdb, norm_plan,
+            os.path.join(scan_dir, '_mov_display.pdb'))
+        pre_mov_display_pdb = _reverse_normalize_pdb(
+            pre_mov_pdb, norm_plan,
+            os.path.join(scan_dir, '_pre_mov_display.pdb'))
+    else:
+        mov_display_pdb     = mov_pdb
+        pre_mov_display_pdb = pre_mov_pdb
+
     _ref_cell = gemmi.UnitCell(*ref_h['cell'])
     atoms     = (_scan_read_pdb_atoms_p1(ref_pdb, src='ref',
                                           cell_override=_ref_cell)
-                 + _scan_read_pdb_atoms_p1(mov_pdb, src='mov',
+                 + _scan_read_pdb_atoms_p1(mov_display_pdb, src='mov',
                                             cell_override=_ref_cell))
     # Pre/ uses the un-transformed mov pdb (resolve_altindex hasn't run on it).
     # For cross-cell pairs (lipox, porin) the raw mov atoms are NOT in ref's
@@ -3826,7 +3848,7 @@ def fitreso_scan(
     # would the un-aligned diff map look like?" answer.
     pre_atoms = (_scan_read_pdb_atoms_p1(ref_pdb, src='ref',
                                           cell_override=_ref_cell)
-                 + _scan_read_pdb_atoms_p1(pre_mov_pdb, src='mov',
+                 + _scan_read_pdb_atoms_p1(pre_mov_display_pdb, src='mov',
                                             cell_override=_ref_cell))
 
     # ── ref MTZ for Riso (FT of reference density map) ────────────────────────
@@ -3928,7 +3950,8 @@ def fitreso_scan(
         write_ccp4(f'{outdir}/{bent_map_name}', bent_map, ref_h)
         geom = None
         if hkls is not None and AB_xyz is not None:
-            write_bent_pdb(mov_pdb, ref_pdb, hkls, AB_xyz, f'{outdir}/bent.pdb')
+            write_bent_pdb(mov_display_pdb, ref_pdb, hkls, AB_xyz,
+                            f'{outdir}/bent.pdb')
             geom = check_geometry(f'{outdir}/bent.pdb')
         def _relsymlink(src, dst):
             if os.path.lexists(dst):
@@ -4016,11 +4039,14 @@ def fitreso_scan(
     pre_diff_name     = f'diff_norm{col_suffix}.map'
     pre_bent_mtz_name = f'bent{col_suffix}.mtz'
     write_ccp4(f'{outdir_pre}/{pre_bent_map_name}', pre_bent_map, ref_h)
-    # bent.pdb / unbent.pdb / unbent.mtz in pre/ all point to the RAW mov.
+    # bent.pdb / unbent.pdb / unbent.mtz in pre/ all point to the RAW mov
+    # (display copy under the default `preserve_mov_numbering=True`).
     # ref.pdb / ref.mtz still come from the (possibly refmac'd) ref.
-    _relsymlink_dir(os.path.abspath(pre_mov_pdb), f'{outdir_pre}/bent.pdb')
+    _relsymlink_dir(os.path.abspath(pre_mov_display_pdb),
+                    f'{outdir_pre}/bent.pdb')
     _relsymlink_dir(os.path.abspath(ref_pdb),     f'{outdir_pre}/ref.pdb')
-    _relsymlink_dir(os.path.abspath(pre_mov_pdb), f'{outdir_pre}/unbent.pdb')
+    _relsymlink_dir(os.path.abspath(pre_mov_display_pdb),
+                    f'{outdir_pre}/unbent.pdb')
     _relsymlink_dir(os.path.abspath(riso_ref_mtz),f'{outdir_pre}/ref.mtz')
     _relsymlink_dir(os.path.abspath(pre_mov_mtz), f'{outdir_pre}/unbent.mtz')
     pre_bent_mtz_path = f'{outdir_pre}/{pre_bent_mtz_name}'
@@ -4075,7 +4101,7 @@ def fitreso_scan(
     # won't overlay with ref structures in Coot — use the per-subdir
     # bent.{pdb,mtz} files for that overlay (they're written on ref's grid
     # by definition).
-    _relsymlink_dir(os.path.abspath(mov_pdb),
+    _relsymlink_dir(os.path.abspath(mov_display_pdb),
                      os.path.join(scan_dir, 'unbent.pdb'))
     if mov_mtz_resolved is not None:
         _relsymlink_dir(os.path.abspath(mov_mtz_resolved),
@@ -5117,11 +5143,141 @@ def _cells_match(c1, c2, rtol=1e-4):
     return np.allclose(p1, p2, rtol=rtol, atol=0)
 
 
-def _detect_chain_resnum_remap(mov_st, ref_st):
-    """Detect a single-chain rename and/or constant resnum offset that
-    maximizes (chain, resnum, resname) overlap between two structures.
+def _one_letter_for_resname(name):
+    """Return uppercase one-letter code for an amino-acid residue name, or
+    None for HETATMs / waters / metals / unknowns.  Modified AAs like MSE
+    map to their parent residue's letter (M)."""
+    info = gemmi.find_tabulated_residue(name)
+    if info is None or not info.is_amino_acid():
+        return None
+    letter = info.one_letter_code
+    if letter is None or letter == ' ':
+        return None
+    return letter.upper()
 
-    Two-stage detection with different stringency for each step:
+
+def _align_polymer_by_ca(mov_st, ref_st, chain_remap=None):
+    """Pairwise-align the mov and ref amino-acid CA sequences (first model,
+    single chain each — after applying chain_remap if given) via gemmi's
+    Needleman-Wunsch aligner.  Return a mapping and quality metrics.
+
+    Handles constant offsets AND internal INDELs / N-terminal truncations
+    that stump the fixed-offset detector (e.g. 6yzt/6yzv/8phm vs 6klz).
+
+    Parameters
+    ----------
+    mov_st, ref_st : gemmi.Structure
+    chain_remap : tuple(str, str) or None
+        If given, treat mov chain `chain_remap[0]` as if it had ID
+        `chain_remap[1]` (matches stage-1 rename semantics).
+
+    Returns
+    -------
+    dict or None — dict has keys:
+        residue_map  : {mov_resnum: ref_resnum} for matched columns only
+                       (mismatches / gaps skipped).
+        n_aligned    : alignment columns where both sequences have a residue
+                       (whether or not they match).
+        n_matches    : aligned columns whose letters match.
+        identity     : n_matches / n_aligned in [0, 1].
+        mov_coverage : n_aligned / (# CA residues in mov chain), in [0, 1].
+        ref_coverage : n_aligned / (# CA residues in ref chain), in [0, 1].
+    None if either structure has fewer than 10 mappable CA residues or
+    is not single-chain.
+    """
+    def _ca_seq(st, target_chain=None, rename_from=None):
+        # Return parallel lists of (one_letter, resnum) for the first
+        # model's target_chain (or first chain if None).  Non-amino-acids
+        # (HETATMs, waters) skipped; unknown letters become 'X'.
+        out_letters = []
+        out_resnums = []
+        for model in st:
+            for chain in model:
+                cname = chain.name
+                if rename_from is not None and cname == rename_from[0]:
+                    cname = rename_from[1]
+                if target_chain is not None and cname != target_chain:
+                    continue
+                for res in chain:
+                    letter = _one_letter_for_resname(res.name)
+                    if letter is None:
+                        continue
+                    out_letters.append(letter)
+                    out_resnums.append(res.seqid.num)
+                return out_letters, out_resnums
+            break
+        return out_letters, out_resnums
+
+    mov_chains = sorted({c.name for m in mov_st for c in m
+                         for r in c if any(a.name.strip() == 'CA' for a in r)})
+    ref_chains = sorted({c.name for m in ref_st for c in m
+                         for r in c if any(a.name.strip() == 'CA' for a in r)})
+    if len(mov_chains) != 1 or len(ref_chains) != 1:
+        return None
+    mov_chain0 = mov_chains[0]
+    ref_chain0 = ref_chains[0]
+    # Under a chain_remap, mov's chain is treated as if renamed; the ref
+    # chain we want to align against is chain_remap[1] which should equal
+    # ref_chain0.
+    if chain_remap is not None:
+        if chain_remap[0] != mov_chain0 or chain_remap[1] != ref_chain0:
+            return None
+
+    mov_seq, mov_resnums = _ca_seq(mov_st, target_chain=mov_chain0)
+    ref_seq, ref_resnums = _ca_seq(ref_st, target_chain=ref_chain0)
+    if len(mov_seq) < 10 or len(ref_seq) < 10:
+        return None
+
+    scoring = gemmi.AlignmentScoring()
+    result  = gemmi.align_string_sequences(list(mov_seq), list(ref_seq),
+                                           [], scoring)
+    mov_g = result.add_gaps(''.join(mov_seq), 1)
+    ref_g = result.add_gaps(''.join(ref_seq), 2)
+    if len(mov_g) != len(ref_g):
+        return None
+
+    # Map EVERY aligned column (both residues present), regardless of whether
+    # the letters match.  Match-atoms downstream still filters by resname via
+    # the uid — so mismatched residues won't erroneously pair up — but giving
+    # every mov residue in the alignment a definite ref-side resnum avoids
+    # collisions between "unmapped mov residues keeping their original resnum"
+    # and "mapped mov residues taking that resnum from ref".
+    residue_map = {}
+    n_aligned = 0
+    n_matches = 0
+    mov_i = 0
+    ref_i = 0
+    for ch_m, ch_r in zip(mov_g, ref_g):
+        m_present = (ch_m != '-')
+        r_present = (ch_r != '-')
+        if m_present and r_present:
+            n_aligned += 1
+            if ch_m == ch_r:
+                n_matches += 1
+            residue_map[mov_resnums[mov_i]] = ref_resnums[ref_i]
+        if m_present:
+            mov_i += 1
+        if r_present:
+            ref_i += 1
+
+    if n_aligned == 0:
+        return None
+    return dict(
+        residue_map=residue_map,
+        n_aligned=n_aligned,
+        n_matches=n_matches,
+        identity=n_matches / n_aligned,
+        mov_coverage=n_aligned / len(mov_seq),
+        ref_coverage=n_aligned / len(ref_seq),
+    )
+
+
+def _detect_chain_resnum_remap(mov_st, ref_st):
+    """Detect a chain rename and/or resnum-offset (constant OR per-residue
+    via sequence alignment) that maximizes atom-match uid overlap between
+    two structures.
+
+    Three-stage detection with different stringency for each step:
 
     1. **Chain rename** — if both structures are single-chain with
        different chain IDs, apply the rename if it brings the offset=0
@@ -5131,23 +5287,22 @@ def _detect_chain_resnum_remap(mov_st, ref_st):
        look like 50% identity under constant-offset matching but are
        ~95% identical under proper alignment.
 
-    2. **Resnum offset** — try non-zero constant offsets and apply the
-       best one only if (a) it adds ≥30 matches over offset=0 AND
-       (b) the per-offset frac is ≥90%. Strict threshold (90%) avoids
-       false-positive offset shifts on related-but-different isoforms
-       (like 8phm vs 6klz CA isozymes) where a +2 offset happens to
-       give 55% identity coincidentally.
+    2. **Constant resnum offset (fast path)** — try non-zero constant
+       offsets and apply the best one only if (a) it adds ≥30 matches
+       over offset=0 AND (b) the per-offset frac is ≥90%.  Strict
+       threshold (90%) avoids false-positive offset shifts on
+       related-but-different isoforms where a coincidental offset
+       gives 55% identity.
 
-    Returns dict with chain_remap, resnum_offset, matches, overlap, frac,
-    or None if no justified remap.
+    3. **Per-residue sequence alignment (fallback)** — if stage 2
+       rejected, run gemmi Needleman-Wunsch on the CA sequences to
+       find a per-residue map that handles internal INDELs (e.g.
+       6yzt/6yzv/8phm vs 6klz, all human CA II but with mixed-offset
+       numbering due to a missing residue in ref).  Accept if
+       identity ≥ 0.90, mov_coverage ≥ 0.50 AND n_matches ≥ 30.
 
-    Detection strategy:
-      1. If both structures are single-chain with different IDs, try
-         remapping mov's chain to ref's.
-      2. Build (resnum, resname) sets and score each candidate offset
-         O ∈ {ref_resnum - mov_resnum} by counting how many (mov_resnum
-         + O, mov_resname) pairs hit a ref residue with same resname.
-      3. Pick the best (chain_remap, offset) by match count.
+    Returns dict with chain_remap, resnum_offset, residue_map (or None),
+    matches, overlap, frac, or None if no justified remap.
 
     Pure detection — does not mutate inputs.
     """
@@ -5217,35 +5372,73 @@ def _detect_chain_resnum_remap(mov_st, ref_st):
             best_overlap = o
             best_matches = m
 
-    if chain_remap is None and best_offset == 0:
+    stage2_frac = (best_matches / best_overlap) if best_overlap else 0.0
+
+    # Stage 3: sequence-alignment fallback — only when stage 2 didn't
+    # accept a non-zero offset AND fewer than 90% of mov's residues
+    # already line up at offset=0.  Skips the aligner (cheap but not
+    # free) for pairs that share identical numbering (lyso, dhfr,
+    # magdoff, most of CA production) where the identity map is
+    # already correct.
+    residue_map = None
+    stage3_metrics = None
+    frac0_of_mov = (matches0 / len(a)) if len(a) else 0.0
+    if best_offset == 0 and frac0_of_mov < 0.90:
+        # Stage 2 didn't help.  Try the aligner (may return None for
+        # multi-chain, too-short, or degenerate cases).
+        al = _align_polymer_by_ca(mov_st, ref_st, chain_remap=chain_remap)
+        if (al is not None
+                and al['n_matches'] >= 30
+                and al['identity'] >= 0.90
+                and al['mov_coverage'] >= 0.50):
+            residue_map  = al['residue_map']
+            best_matches = al['n_matches']
+            best_overlap = al['n_aligned']
+            stage2_frac  = al['identity']
+            stage3_metrics = al
+
+    if chain_remap is None and best_offset == 0 and residue_map is None:
         return None
     return dict(chain_remap=chain_remap, resnum_offset=best_offset,
+                residue_map=residue_map,
                 matches=best_matches, overlap=best_overlap,
-                frac=best_matches / best_overlap if best_overlap else 0.0)
+                frac=stage2_frac,
+                mov_coverage=(stage3_metrics or {}).get('mov_coverage'))
 
 
 def _normalize_mov_pdb(mov_pdb, ref_pdb, out_pdb, verbose=True):
-    """Apply chain rename + resnum offset to mov_pdb so its (chain, resnum)
-    keys align with ref_pdb. Writes corrected PDB to out_pdb only if a
-    justified remap is detected (sequence id ≥ 90% over ≥10 residues);
-    returns out_pdb in that case, else mov_pdb (unmodified).
+    """Apply chain rename, constant resnum offset, or per-residue sequence-
+    aligned resnum map to mov_pdb so its (chain, resnum) keys align with
+    ref_pdb.  Writes corrected PDB to out_pdb only if a justified remap is
+    detected; returns (out_pdb, plan) in that case, else (mov_pdb, None).
 
-    Useful for old PDBs with +1000 resnum offsets (1zfk, 3v7x, 3vbd) and
-    single-chain entries with B/X chain labels (5j**, etc.) where
-    resolve_altindex's pre-bend CA matching would otherwise fail."""
+    `plan` is the detector's dict (chain_remap, resnum_offset, residue_map,
+    ...) — usable by `_reverse_normalize_pdb` later to restore mov's
+    original labels on downstream output PDBs.
+
+    Handles three flavours of nomenclature drift:
+      - old PDBs with +1000 resnum offsets (1zfk, 3v7x, 3vbd)
+      - single-chain entries with B/X chain labels (5j**)
+      - same-protein cases where the constant offset drifts across an
+        internal INDEL (6yzt/6yzv/8phm — same human CA II as 6klz)"""
     mov_st = gemmi.read_pdb(mov_pdb)
     ref_st = gemmi.read_pdb(ref_pdb)
     plan = _detect_chain_resnum_remap(mov_st, ref_st)
     if plan is None:
-        return mov_pdb
-    cmap = plan['chain_remap']
-    off  = plan['resnum_offset']
+        return mov_pdb, None
+    cmap  = plan['chain_remap']
+    off   = plan['resnum_offset']
+    rmap  = plan.get('residue_map')
     if verbose:
         msg = []
         if cmap is not None:
             msg.append(f"chain '{cmap[0]}' → '{cmap[1]}'")
         if off != 0:
             msg.append(f"resnum offset {off:+d}")
+        if rmap is not None:
+            mov_cov = plan.get('mov_coverage')
+            cov_str = f", mov_cov {100*mov_cov:.0f}%" if mov_cov is not None else ""
+            msg.append(f"residue-map ({len(rmap)} residues){cov_str}")
         print(f"  _normalize_mov_pdb: {', '.join(msg)} "
               f"({plan['matches']}/{plan['overlap']} CA-residues "
               f"name-match, {100*plan['frac']:.0f}% sequence id)",
@@ -5254,12 +5447,59 @@ def _normalize_mov_pdb(mov_pdb, ref_pdb, out_pdb, verbose=True):
         for chain in model:
             if cmap is not None and chain.name == cmap[0]:
                 chain.name = cmap[1]
-            if off != 0:
+            if rmap is not None:
+                for res in chain:
+                    new_num = rmap.get(res.seqid.num)
+                    if new_num is not None:
+                        res.seqid.num = new_num
+            elif off != 0:
                 for res in chain:
                     res.seqid.num += off
         break
     mov_st.write_pdb(out_pdb)
-    return out_pdb
+    return out_pdb, plan
+
+
+def _reverse_normalize_pdb(pdb_in, plan, pdb_out):
+    """Inverse of `_normalize_mov_pdb`: given a PDB whose labels are on
+    ref's side (because it descended from a normalized mov file — e.g.
+    the resolve_altindex-stretched/refined mov, or any bent PDB written
+    from it) and the `plan` dict returned by `_normalize_mov_pdb`, write
+    `pdb_out` with mov's ORIGINAL chain / resnum labels restored.
+    Coordinates, residue names, atom names, and HETATMs are untouched.
+
+    Used by fitreso_scan under `preserve_mov_numbering=True` (default)
+    so that the user-facing `bent.pdb` / `unbent.pdb` retain the naming
+    conventions of the moving structure they handed in."""
+    if plan is None:
+        _shutil.copy(pdb_in, pdb_out)
+        return pdb_out
+    st = gemmi.read_pdb(pdb_in)
+    cmap = plan.get('chain_remap')
+    off  = plan.get('resnum_offset', 0)
+    rmap = plan.get('residue_map')
+    inv_rmap = None
+    if rmap is not None:
+        inv_rmap = {v: k for k, v in rmap.items()}
+    for model in st:
+        for chain in model:
+            # Reverse per-residue map or constant offset (never both —
+            # detector always produces exactly one of the two).
+            if inv_rmap is not None:
+                for res in chain:
+                    orig_num = inv_rmap.get(res.seqid.num)
+                    if orig_num is not None:
+                        res.seqid.num = orig_num
+            elif off != 0:
+                for res in chain:
+                    res.seqid.num -= off
+            # Reverse chain rename LAST (so we don't disturb the
+            # chain-name match used by the residue loop above).
+            if cmap is not None and chain.name == cmap[1]:
+                chain.name = cmap[0]
+        break
+    st.write_pdb(pdb_out)
+    return pdb_out
 
 
 def _stretch_pdb_to_cell(in_pdb, target_cell, out_pdb):

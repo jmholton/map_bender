@@ -362,8 +362,13 @@ The diff is computed in F-space after k+B scaling of bent → ref (`_fspace_scal
 `fitreso_scan` calls `_normalize_mov_pdb(mov_pdb, ref_pdb, out_pdb)` at
 the very top — before `raw_mov_pdb_in` is snapshotted — to fix
 (chain, resnum) mismatches that would otherwise make match-by-tuple fail
-across the entire pipeline.  Two clusters of legacy/edge-case deposits
-hit this in the CA production run:
+across the entire pipeline.  Returns `(normalized_pdb_path, plan)` where
+`plan` is the detector's dict (or `None` if no remap fires).  `plan` is
+consumed later by `_reverse_normalize_pdb` to restore mov's original
+labels on user-facing output PDBs (see
+[`preserve_mov_numbering` — output PDB labelling](#preserve_mov_numbering--output-pdb-labelling)
+below).  Three deposit-cluster patterns hit this in the CA production
+run:
 
 - **+1000 resnum offset** (old PDB convention): mov has resnums
   1003–1261 vs ref 4–260, but identical Cartesian coordinates.  Detector
@@ -377,25 +382,57 @@ hit this in the CA production run:
   under constant-offset matching).  (5jdv, 5je7, 5jeg, 5jeh, 5jep, 5jg3,
   5jg5, 5jgs, 5jgt.)
 
-Two-stage detection with different stringency to avoid false positives:
-chain rename is lenient (50% sequence id) since unrelated proteins
-score far lower even with chain remap, while resnum offset is strict
-(≥90% per-offset frac AND ≥30-match improvement over offset=0) to keep
-related-but-distinct isoforms (like the 8phm/6yzt/6yzv CA paralogs) from
-being silently realigned.
+- **Per-residue alignment fallback** (stage 3): when stages 1-2 can't
+  find a working constant offset (INDEL cases like 6yzt/6yzv/8phm vs
+  6klz, all human CA II but with mixed offsets due to a numbering
+  discontinuity at 6klz residue 126), `_align_polymer_by_ca` runs
+  gemmi's Needleman-Wunsch on the CA one-letter sequences and returns
+  a per-residue `mov_resnum → ref_resnum` map.  Gate: identity ≥ 90%
+  of aligned columns, mov_coverage ≥ 50%, n_matches ≥ 30.  Unrelated
+  proteins (<40% identity) still fail.
+
+Three-stage detection with tuned stringency to admit legitimate cases
+while rejecting false positives: chain rename lenient (50%), constant
+offset strict (90% per-offset frac + ≥30 improvement over offset=0),
+alignment fallback strict (90% identity + 50% mov coverage).
 
 The 5 Å CA-RMSD gate in `bend_fit_progressive` (after origin fix) was
 also bumped to **10 Å** to admit borderline cases where altindex
-converged but not super-tightly (8phm 5.4 Å, 6yzt 7.6 Å, 6yzv 7.6 Å —
-likely related isoforms; bend produces high-bondZ output but the entries
-no longer crash).  The 0.35-cell fractional-shift sanity check is
-unchanged.
+converged but not super-tightly.  The 0.35-cell fractional-shift
+sanity check is unchanged.
 
-End result on the 902-entry CA production: 100% completion, zero
-crashes.  Quality distribution: 2.4% refined, 68.1% good, 24.1% loose,
-2.8% broken, 0.9% catastrophic (the rescued isoforms account for most
-of the "catastrophic" bucket; that's expected — they're different
-proteins).
+End result on the 902-entry CA production (with stages 1-2 alone):
+100% completion, zero crashes.  Quality distribution: 2.4% refined,
+68.1% good, 24.1% loose, 2.8% broken, 0.9% catastrophic (the last
+bucket comprised the 8phm/6yzt/6yzv paralogs — same protein as ref,
+just numbered differently).  Post-ridge (`bound_by_obs=True` default)
+those 3 crashed at the `best` re-fit stage.  With stage 3 alignment
+enabled, all 3 recover cleanly.
+
+### `preserve_mov_numbering` — output PDB labelling
+
+`fitreso_scan` accepts `preserve_mov_numbering=True` (**default**).
+Under this default, `bent.pdb`, `unbent.pdb`, and `pre/{bent,unbent}.pdb`
+carry mov's ORIGINAL chain / resnum / resname / atomname labels so the
+user cannot confuse "which model got bent" when reading them in Coot.
+Internally the pipeline still uses the normalized (ref-labelled)
+`_mov_normalized.pdb` for atom matching and everything the fit sees.
+The bridge is `_reverse_normalize_pdb`, which reads a ref-labelled
+downstream PDB + the normalization plan and rewrites it with mov's
+original labels (coordinates untouched).  Output files:
+
+- `scan_dir/_mov_normalized.pdb` — ref-labelled, used internally.
+- `scan_dir/_mov_display.pdb` — mov-labelled (post-resolve_altindex).
+- `scan_dir/_pre_mov_display.pdb` — mov-labelled (pre-resolve_altindex).
+
+Set `preserve_mov_numbering=False` to revert to ref-labelled outputs
+(useful for direct side-by-side Coot overlays where identically
+numbered residues should sit on top of each other).
+
+For pairs where the detector doesn't fire (identity numbering — lyso,
+dhfr, myo, raddam, most of the CA production), `norm_plan` is None,
+the display copies are skipped, and the outputs are exactly what they
+were pre-alignment work.  No I/O overhead for the common case.
 
 ## Origin alignment (`_find_best_origin`)
 
