@@ -5443,11 +5443,34 @@ def _normalize_mov_pdb(mov_pdb, ref_pdb, out_pdb, verbose=True):
               f"({plan['matches']}/{plan['overlap']} CA-residues "
               f"name-match, {100*plan['frac']:.0f}% sequence id)",
               flush=True)
+    n_dropped = 0
     for model in mov_st:
         for chain in model:
             if cmap is not None and chain.name == cmap[0]:
                 chain.name = cmap[1]
             if rmap is not None:
+                # Drop unmapped protein residues first — they'd collide with
+                # a mapped residue's target resnum (e.g. mov has an extra
+                # N-terminal insertion residue: {3:4, 5:5, ...} leaves mov's
+                # original res 4 unmapped, and it would keep num=4 while
+                # mov res 3 also lands at num=4).  Unmapped protein
+                # residues have no ref counterpart per the alignment, so
+                # they can't participate in the fit anyway.  HETATMs
+                # (waters, ligands, metals — no CA) are always kept.
+                to_drop = []
+                for res in chain:
+                    if res.seqid.num in rmap:
+                        continue
+                    has_ca = any(a.name == 'CA' for a in res)
+                    if has_ca:
+                        to_drop.append(res.seqid)
+                for sid in to_drop:
+                    # gemmi: remove by seqid; iterate to find + del
+                    for i in range(len(chain) - 1, -1, -1):
+                        if chain[i].seqid == sid:
+                            del chain[i]
+                            n_dropped += 1
+                            break
                 for res in chain:
                     new_num = rmap.get(res.seqid.num)
                     if new_num is not None:
@@ -5456,6 +5479,9 @@ def _normalize_mov_pdb(mov_pdb, ref_pdb, out_pdb, verbose=True):
                 for res in chain:
                     res.seqid.num += off
         break
+    if verbose and n_dropped:
+        print(f"  _normalize_mov_pdb: dropped {n_dropped} unmapped "
+              f"protein residues (insertions relative to ref)", flush=True)
     mov_st.write_pdb(out_pdb)
     return out_pdb, plan
 

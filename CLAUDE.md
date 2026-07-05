@@ -391,6 +391,20 @@ run:
   of aligned columns, mov_coverage ≥ 50%, n_matches ≥ 30.  Unrelated
   proteins (<40% identity) still fail.
 
+  **Unmapped-residue drop** (stage 3 only): when the aligner leaves
+  some mov protein residues unmapped (e.g. `4z1j` has an extra
+  N-terminal HIS at resnum 3, and the aligner picks `{3:4, 5:5, ...}`
+  which drops mov res 4 rather than mov res 3), those unmapped
+  residues would collide with a mapped residue's target resnum
+  (mov 3 → 4 while mov 4 stays 4) and `prepare_topology` would then
+  hallucinate a bond that isn't there, breaking bondZ at hkl00
+  before any fitting.  `_normalize_mov_pdb` therefore drops
+  unmapped protein residues (any residue with a CA and no map entry)
+  from the output.  HETATMs (waters, ligands, metals) are untouched
+  regardless.  The atoms in dropped residues can't participate in
+  the fit anyway per the alignment.  Verified rescue: 4z1j bondZ
+  8.07 → 1.16 at hkl00 after the drop.
+
 Three-stage detection with tuned stringency to admit legitimate cases
 while rejecting false positives: chain rename lenient (50%), constant
 offset strict (90% per-offset frac + ≥30 improvement over offset=0),
@@ -401,13 +415,17 @@ also bumped to **10 Å** to admit borderline cases where altindex
 converged but not super-tightly.  The 0.35-cell fractional-shift
 sanity check is unchanged.
 
-End result on the 902-entry CA production (with stages 1-2 alone):
-100% completion, zero crashes.  Quality distribution: 2.4% refined,
-68.1% good, 24.1% loose, 2.8% broken, 0.9% catastrophic (the last
-bucket comprised the 8phm/6yzt/6yzv paralogs — same protein as ref,
-just numbered differently).  Post-ridge (`bound_by_obs=True` default)
-those 3 crashed at the `best` re-fit stage.  With stage 3 alignment
-enabled, all 3 recover cleanly.
+End result on the 902-entry CA production against 6klz (stages 1-2-3
++ unmapped-drop + ridge default): **100% completion, zero crashes,
+zero catastrophic**.  Quality distribution: 1.6% refined, 78.4% good,
+19.4% loose, 0.1% broken (a single entry, 6ufc, whose bondZ 14.50 is
+inherited from the deposit and is unrelated to normalization).  The
+8phm/6yzt/6yzv trio (same human CA II as 6klz, mixed-offset numbering
+that stages 1-2 alone couldn't crack) all recover cleanly under stage
+3 alignment at bondZ 1.41–2.12.  For A/B: pre-alignment ridge baseline
+was 899 completed + 3 crashes with 8 broken (0.9%) and 214 loose
+(23.8%); adding stage 3 rescued all 3 crashes plus 7 of the 8 broken,
+plus 39 loose→good migrations.
 
 ### `preserve_mov_numbering` — output PDB labelling
 
