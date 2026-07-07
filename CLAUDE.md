@@ -284,6 +284,53 @@ bondZ in one system but is harsher in general (strict erf^N at small
 N_eff).  Override via `pnn_mode=...` on `fitreso_scan` /
 `bend_fit_progressive`.
 
+## Cross-validation holdout (`holdout_frac`, `holdout_seed`, `cv_callback`)
+
+`bend_fit_progressive` accepts `holdout_frac`, `holdout_seed`, and
+`cv_callback` kwargs for K-fold-style cross-validation of the shift
+field.  After atom matching + outlier rejection, a random
+`holdout_frac` fraction of matched atom pairs is reserved: those atoms
+are excluded from the SVD that solves for AB coefficients, but their
+positions are still evaluated by `eval_shift_field` every iteration.
+Comparing the fitted-shift prediction against the observed shift on
+the held-out atoms gives an honest error estimate that does not rely
+on the SVD covariance assuming iid noise.
+
+Per-iteration verbose output adds:
+
+```
+[CV] train=0.147 hold=0.149Å (pre=0.371)  holdCA=0.138 (pre=0.371)
+```
+
+- `train`  RMSD of (obs − pred) over training atoms (Cartesian Å)
+- `hold`   same over held-out atoms — the CV number
+- `pre=`   RMSD of held-out obs with NO field applied (baseline)
+- `holdCA`, `holdCA_pre` — CA-only holdout metric
+
+`cv_callback(iter_i, eff_reso, n_hkls, n_canon, rmsd, train_rmsd,
+hold_rmsd, hold_prefit, hold_ca_rmsd, hold_ca_prefit, n_hold)` fires
+each iteration alongside the existing `iter_callback`.
+
+**Interpretation:**
+- `hold_rmsd ≈ train_rmsd` → field is well-determined; SVD error bars
+  are honest at this fitreso.
+- `hold_rmsd >> train_rmsd` → field is over-fitting individual atoms.
+- `hold_rmsd < hold_prefit` → field genuinely helps unseen atoms
+  (JJD95 30kGy→1-6-100kGy at fitreso 8 Å across 3 random seeds:
+  prefit 0.371±0.002 Å → holdout 0.149±0.009 Å, a 2.5× reduction
+  with train/hold ratio 1.02 sustained across all 38 progressive
+  iterations — zero over-fit signature).
+
+**Small statistical leak.** The per-iteration residual-MAD outlier
+rejection computes its median/MAD over ALL atoms (holdouts included),
+which means a held-out atom's residual can influence which training
+atoms get marked as `fit_active` next iteration.  For strict Rfree
+semantics this should be over training only; in practice MAD is
+robust and holdouts are a small fraction, so the effect is
+negligible.  A 20-fold FreeR-style CV (every atom in exactly one bin,
+refit 20 times, aggregate held-out predictions) is a stronger analog
+but 20× the cost.
+
 ## Fitreso scan
 
 The scan logic is implemented as `fitreso_scan()` directly in `bendfinder.py`. Each system's `*_fitreso_scan.py` script is a thin wrapper that sets paths and calls `fitreso_scan()`.
@@ -305,6 +352,43 @@ The scan logic is implemented as `fitreso_scan()` directly in `bendfinder.py`. E
 - `diff_norm.map` — z-scored real-space difference map (sign controlled by `subtract`); default `subtract=ref` → diff = bent − ref, positive peaks = density present in bent but absent (or weaker) in ref.
 - `bent.map` — bent moving-crystal map resampled on the reference grid.
 - `PSDVF.mtz` (fr\* + best points) — fitted shift-field (h,k,l) coefficients.
+
+**`scan_fitreso.log` columns**: label, RMSD (CA before→after fit),
+active HKL count, Rbent (F-space k+B-scaled R vs ref), Rbend (R of bent
+map vs the hkl00-resampled map — how much the PSDVF moved density),
+k / B (F-space scale + isotropic B), bondZ/angZ (RMSZ vs CCP4
+monomer-lib ideals; see [Geometry check](#geometry-check-with-non-standard-cofactors)),
+**dipole** (σ²-weighted mean of per-peak dipole-ness on the top-30
+SG-unique diff peaks — 0 = no misregistration content, +1 = perfect
+dipoles; see [`_dipole_score_from_diff_norm`](#combined-d_opt-score)
+below), **score** (combined d_opt score — see below), top diff peak
+σ and nearest atom, **`pre@peak`** — σ in `pre/diff_norm.map` sampled
+at *this row's own* top-peak voxel: |pre@peak| ≪ |peak| ⇒ feature
+hidden pre-bending and revealed by the fit; |pre@peak| ≈ |peak| ⇒
+feature already visible pre-bending (either chemistry the field can't
+shift, or a persistent residual).  The pre and hkl00 rows trivially
+have pre@peak = peak because their diff map IS the pre map.  Renamed
+from `pre@best` (which sampled only the best row) — every row is now
+populated.
+
+### Combined d_opt score
+
+Each fr-row also carries a per-row `score`:
+
+    score = Rbent + 0.1·RMSD + 0.5·max(0,dipole) + 0.05·max(0,bondZ − 1)
+
+Lower is better.  `argmin(score)` across fr-rows is logged as
+`combined-score d_opt` in the log footer, next to the parabola-based
+`best row` d_opt pick.  When the two disagree, dipole content is
+usually the tiebreaker (the parabola tracks Rbent alone; the score
+penalizes misregistration/embossing residues that Rbent doesn't
+capture).  See `combined_score.py` for the standalone post-hoc form.
+
+Under the ridge + softpnna_kth defaults, over-fit no longer
+catastrophically hurts (RMSD/bondZ don't blow up at fine fitreso),
+but it *mildly* degrades every axis simultaneously — the combined
+score is designed to catch that multi-axis drift where any single
+metric would call it a wash.
 
 ### Best d_opt parabola fit
 
@@ -356,6 +440,27 @@ The diff is computed in F-space after k+B scaling of bent → ref (`_fspace_scal
 **Raddam sign convention**: 5kxk (undamaged, lowest dose) is the **moving** model; 5kxl/5kxm/5kxn (increasingly damaged) are the **references**. Dose ordering is alphabetical: 5kxk < 5kxl < 5kxm < 5kxn. With the new default `subtract='ref'`: positive diff peaks = features in the **undamaged** model absent from the damaged reference (features disappearing with dose); negative peaks = features appearing with dose. (Sign flipped from the pre-2026-05-16 default — pass `subtract=bent` to recover the old convention.)
 
 **Large-map memory**: `eval_shift_field` allocates an (N_voxels × N_hkls) phase matrix. For large maps (raddam: 3.7M voxels × 900+ HKLs ≈ 26 GB) this must be chunked. `fitreso_scan` uses an internal `_eval_chunked` helper in 50k-voxel batches (configurable via `chunk_size` parameter).
+
+### Geometry check with non-standard cofactors
+
+`check_geometry(pdb_path)` in `bendfinder.py` computes bondZ / angZ
+(bond-length and bond-angle RMSZ vs CCP4 monomer-library ideals) via
+`gemmi.prepare_topology`.  `prepare_topology` raises `RuntimeError` on
+the **first** atom whose name doesn't match its monomer-library
+definition — one mismatched atom in the whole structure (e.g. the
+pyruvoyl cofactor `PYR` in aspartate decarboxylase, where the deposit
+names the cofactor's α-carbon `C1` but the CCP4 dictionary expects
+`C`) kills topology prep for the *entire* structure and every `bondZ`
+in `scan_fitreso.log` silently reads `--/--`.
+
+`check_geometry` catches this: parses the offending resname out of the
+error message via regex, drops all residues of that resname from a
+working copy of the structure, and retries — up to 8 rounds so
+multi-cofactor cases still work.  The protein body's geometry check
+survives; the cofactor's own bonds are sacrificed rather than
+propagate the topology-prep failure.  Verified rescue on JJD95
+aspartate decarboxylase: bondZ went from `--/--` (silent failure) to
+1.55–2.10 across the scan points post-fix.
 
 ## Chain/resnum normalization (`_normalize_mov_pdb`)
 
@@ -475,6 +580,34 @@ _ALTINDEX_CANDIDATES = {
 Callers (`bend_fit`, `bend_fit_progressive`) unpack all 4 values and print: `origin shift: (x, y, z) for SG  +altindex  +symop_idx=k`.
 
 **CA shift sanity check**: After outlier rejection, if the largest fractional CA shift among remaining atoms exceeds **0.35 cells** (~16 Å for a 47 Å cell), an error is raised. This threshold was raised from 0.1 to accommodate genuine large conformational differences (e.g. insulin T→R, LEU B6 shifts ~8 Å ≈ 0.165 fractional). Values >0.35 indicate gross misalignment or a wrong origin.
+
+### `resolve_altindex.log`
+
+Every `resolve_altindex` call writes `<outdir>/resolve_altindex.log`
+regardless of the chosen action, capturing: the cell-stretch notice
+(when cells differ), CA pair count, baseline + Kabsch LSQ RMSD, the
+final `action=...` line, the R_frac matrix, t_frac, drot_deg,
+rmsd_after, and the output PDB/MTZ paths.  Backfills the info that
+used to be scattered across the entry's `stdout.log` — grep-friendly
+and per-entry rather than mixed with fitreso_scan chatter.
+
+### Origin-shift sign fix (2026-07-07)
+
+`_shift_mtz_origin` previously applied `exp(-2πi h·t)` to F/PHI
+column pairs, while `_apply_cart_transform_to_pdb` shifts atoms by
+`p' = R·p + t` (a `+t` real-space translation).  The two moved
+density and atoms in opposite directions.  For entries where
+`resolve_altindex` chose `action=origin_only`, this offset the
+displayed `unbent.mtz` from `unbent.pdb` by `2·t_cart` in Coot
+(typically 1-3 Å for small origin corrections).  Fixed to apply
+`exp(+2πi h·t)`, matching VALIDATE_ALTINDEX.md's formula and the
+`_apply_op_to_mtz` helper (used by the `sg_op_origin` path, which
+was always correct).  Downstream fits are unaffected — the shift
+field pathway doesn't route through `_shift_mtz_origin`.  Only
+display alignment is affected.  Affected 699 of 902 entries in the
+CA production; regenerating `unbent.mtz` for those requires
+re-running `resolve_altindex` on their stretched inputs (fast — one
+phase-shift pass per entry).
 
 ## Basis-change altindex enumeration (`_get_altindex_ops`)
 

@@ -87,6 +87,17 @@ On the 8jee CA-pilot worst-case, the two regularizers together drop fr8 bondZ fr
 
 The companion `best` row from `fitreso_scan` further protects against pathological fine-fitreso fits with an **RMSD-baseline filter**: the parabola only considers fr-rows whose CA RMSD is ≤ the unbent baseline. The first fr-row where the field is making the CA RMSD WORSE than no bending is treated as the "going-wrong-way" cliff and excluded from `d_opt` selection.
 
+**Cross-validation.**  `bend_fit_progressive` accepts `holdout_frac` /
+`holdout_seed` / `cv_callback` kwargs.  A random `holdout_frac`
+fraction of matched atom pairs is excluded from the SVD but still
+evaluated at each iteration, giving an honest error estimate that
+doesn't depend on the SVD covariance being iid.  With `holdout_frac=0.05`
+on JJD95 30kGy → 1-6-100kGy: prefit CA RMSD 0.371 Å → holdout CA RMSD
+0.149 Å (2.5× reduction) with train/hold ratio 1.02 across 38
+progressive iterations and 3 random seeds — zero over-fit signature.
+Per-iter verbose output adds `[CV] train=X hold=Y (pre=Z)` alongside
+the standard iteration log.
+
 ## Benchmarks
 
 All runs use default parameters (`fitreso_end=7.0 Å`, `batch_hkls=100`, `outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `bound_by_obs=True`, `pnn_mode='softpnna_kth'`, `atom_sel='all'`).  June 2026 gamut — Tikhonov ridge + step-down softPnna active by default; ridge-off pre-catastrophe values (lipox fr5=230 Å) are historical.

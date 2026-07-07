@@ -38,6 +38,7 @@ Public API:
 
 import sys
 import os
+import re
 import time
 import struct
 import subprocess
@@ -1222,12 +1223,37 @@ def check_geometry(pdb_path, outlier_z=5.0):
     try:
         st = gemmi.read_structure(str(pdb_path))
         st.setup_entities()
+    except Exception:
+        return None
+    # gemmi.prepare_topology raises RuntimeError on the FIRST atom whose name
+    # doesn't match its monomer-lib definition (e.g. Y/PYR 225/C1 vs C in
+    # pyruvoyl-dependent aspartate decarboxylase).  One mismatched atom kills
+    # topology prep for the entire structure, so bondZ silently drops to None
+    # for every scan point.  Strip the offending resname and retry — this
+    # keeps the protein body's geometry check while sacrificing the cofactor.
+    # Iterate: some structures have multiple problem cofactors.
+    dropped = []
+    for _ in range(8):
         resnames = {res.name for model in st for chain in model for res in chain}
         ml = _load_monlib(resnames)
         if ml is None:
             return None
-        topo = gemmi.prepare_topology(st, ml, model_index=0)
-    except Exception:
+        try:
+            topo = gemmi.prepare_topology(st, ml, model_index=0)
+            break
+        except RuntimeError as e:
+            msg = str(e)
+            m = re.search(r'\b([A-Za-z0-9]{1,4})\s+\d+\s*/\s*[A-Za-z0-9]', msg)
+            bad = m.group(1) if m else None
+            if not bad or bad in dropped:
+                return None
+            dropped.append(bad)
+            for model in st:
+                for chain in model:
+                    for i in range(len(chain) - 1, -1, -1):
+                        if chain[i].name == bad:
+                            del chain[i]
+    else:
         return None
     bonds  = topo.bonds
     angles = topo.angles
@@ -1272,6 +1298,7 @@ def read_ccp4(path):
     nx, ny, nz = i4(28),  i4(32),  i4(36)
     cell_a     = (f4(40), f4(44), f4(48), f4(52), f4(56), f4(60))
     mapc, mapr, maps = i4(64), i4(68), i4(72)
+    ispg       = i4(88)
     nsymbt     = i4(92)
 
     hdr_size = 1024 + nsymbt
@@ -1287,6 +1314,7 @@ def read_ccp4(path):
         'nx': nx, 'ny': ny, 'nz': nz,
         'cell': cell_a,
         'mapc': mapc, 'mapr': mapr, 'maps': maps,
+        'spacegroup': ispg,
         'nsymbt': nsymbt,
         'raw_header': raw[:hdr_size],
     }
@@ -2448,7 +2476,9 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                          precomputed_origin=None,
                          iteration_schedule=None,
                          bound_by_obs=False,
-                         pnn_mode=None):
+                         pnn_mode=None,
+                         holdout_frac=0.0, holdout_seed=0,
+                         cv_callback=None):
     """Fit a Fourier shift field progressively, admitting HKLs coarsest-first.
 
     HKLs are admitted in batches from fitreso_start (coarsest, large d) down to
@@ -2592,6 +2622,24 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
     if verbose:
         print(f"{ca_mask.sum()} CA remaining", flush=True)
 
+    # ── Cross-validation holdout ────────────────────────────────────────
+    # holdout_frac > 0: reserve a random subset of atoms that are NEVER
+    # used to constrain the fit.  They stay in `fitme` and their positions
+    # are still evaluated by eval_shift_field each iteration so we can
+    # compare predicted vs observed shift on unseen atoms — a proper
+    # error estimate that doesn't rely on the SVD covariance assuming
+    # iid noise across atoms.
+    holdout_mask = np.zeros(len(fitme), dtype=bool)
+    if holdout_frac and holdout_frac > 0.0:
+        _rng = np.random.RandomState(int(holdout_seed))
+        holdout_mask = _rng.rand(len(fitme)) < float(holdout_frac)
+        if verbose:
+            n_hold = int(holdout_mask.sum())
+            n_hold_ca = int((holdout_mask & ca_mask).sum())
+            print(f"holdout: {n_hold}/{len(fitme)} atoms reserved "
+                  f"({n_hold_ca} CA) — fit sees {len(fitme)-n_hold}", flush=True)
+    train_mask = ~holdout_mask
+
     ca_shifts = fitme[ca_mask, 3:6]
     ca_mags   = np.sqrt(np.sum(ca_shifts**2, axis=1))
     ca_ids    = [u for u, m in zip(uids, ca_mask) if m]
@@ -2695,7 +2743,7 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
 
         # ── Fit ──────────────────────────────────────────────────────────────
         if do_symm:
-            asu_fit_mask = asu_mask & fit_active
+            asu_fit_mask = asu_mask & fit_active & train_mask
             frac_asu     = fitme[asu_fit_mask, :3]
             shifts_xyz   = fitme[asu_fit_mask][:, [dim_col[d] for d in 'xyz']]
             shifts_flat  = shifts_xyz.ravel()
@@ -2726,8 +2774,9 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
             AB_xyz_eval = AB_xyz   # (3, n_hkls, 2)
 
         else:
-            frac_fit = fitme[fit_active, :3]
-            shifts   = fitme[fit_active][:, dim_indices]
+            fit_row_mask = fit_active & train_mask
+            frac_fit = fitme[fit_row_mask, :3]
+            shifts   = fitme[fit_row_mask][:, dim_indices]
             X        = build_design_matrix(frac_fit, hkls_now)
             AB, active, snr = fit_lstsq(X, shifts, drop_snr=drop_snr)
 
@@ -2745,6 +2794,28 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
         resid_orth = frac_to_orth(resid_frac, cell2)
         resid_mag  = np.linalg.norm(resid_orth, axis=1)
 
+        # ── CV metrics: how well does the fit predict held-out atoms? ─────
+        # Cartesian RMSD of (obs - frac*pred) over train subset vs holdout
+        # subset, plus the pre-fit "no-field" RMSD of holdout obs as the
+        # baseline that the field is trying to beat.
+        cv_train_rmsd = cv_hold_rmsd = cv_hold_prefit = None
+        cv_hold_ca_rmsd = cv_hold_ca_prefit = None
+        if holdout_mask.any():
+            t_orth = frac_to_orth(resid_frac[train_mask], cell2)
+            h_orth = frac_to_orth(resid_frac[holdout_mask], cell2)
+            h_pre  = frac_to_orth(fitme[holdout_mask, 3:6], cell2)
+            cv_train_rmsd  = float(np.sqrt(np.mean(np.sum(t_orth**2, axis=1))))
+            cv_hold_rmsd   = float(np.sqrt(np.mean(np.sum(h_orth**2, axis=1))))
+            cv_hold_prefit = float(np.sqrt(np.mean(np.sum(h_pre**2, axis=1))))
+            # CA-only metrics — useful because atom_sel='all' mixes CAs with
+            # side-chain / water atoms of very different shift magnitudes.
+            hca = holdout_mask & ca_mask
+            if hca.any():
+                hca_orth = frac_to_orth(resid_frac[hca], cell2)
+                hca_pre  = frac_to_orth(fitme[hca, 3:6], cell2)
+                cv_hold_ca_rmsd   = float(np.sqrt(np.mean(np.sum(hca_orth**2, axis=1))))
+                cv_hold_ca_prefit = float(np.sqrt(np.mean(np.sum(hca_pre**2, axis=1))))
+
         med_r = np.median(resid_mag)
         mad_r = np.median(np.abs(resid_mag - med_r))
         sig_r = mad_r / 0.6745
@@ -2759,9 +2830,17 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
         dt       = time.time() - t0
         if verbose:
             drop_str = f"  -{n_dropped_resid} resid" if n_dropped_resid else ""
+            cv_str = ""
+            if cv_hold_rmsd is not None:
+                cv_str = (f"  [CV] train={cv_train_rmsd:.3f} "
+                          f"hold={cv_hold_rmsd:.3f}Å "
+                          f"(pre={cv_hold_prefit:.3f})")
+                if cv_hold_ca_rmsd is not None:
+                    cv_str += (f"  holdCA={cv_hold_ca_rmsd:.3f} "
+                               f"(pre={cv_hold_ca_prefit:.3f})")
             print(f"  [iter {iter_count:2d}] fitreso={eff_reso:.2f}Å  "
                   f"nhkls={n_hkls-1}  canon={n_canon}  OD={od_ratio:.2f}  "
-                  f"active={n_active}  RMSD={rmsd:.3f}Å{drop_str}  {dt:.0f}s", flush=True)
+                  f"active={n_active}  RMSD={rmsd:.3f}Å{drop_str}{cv_str}  {dt:.0f}s", flush=True)
 
         result_AB     = AB
         result_active = active
@@ -2773,6 +2852,12 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
         if iter_callback is not None:
             iter_callback(iter_count, n_hkls - 1, n_canon, rmsd,
                           hkls_now, AB_xyz_eval, active, snr)
+
+        if cv_callback is not None and cv_hold_rmsd is not None:
+            cv_callback(iter_count, eff_reso, n_hkls - 1, n_canon,
+                        rmsd, cv_train_rmsd, cv_hold_rmsd,
+                        cv_hold_prefit, cv_hold_ca_rmsd,
+                        cv_hold_ca_prefit, int(holdout_mask.sum()))
 
         if max_canon is not None and n_canon >= max_canon:
             break
@@ -3380,6 +3465,144 @@ def _fft_box_d_min(cell_obj, NX, NY, NZ):
                      2.0 * cell_obj.c / NZ))
 
 
+def _dipole_score_from_diff_norm(diff_norm, ref_d, cell, sg_name,
+                                  sigma_min=4.0, n_top=30, min_sep_A=2.0):
+    """Continuous embossing / dipole content of a diff map.
+
+    For each of the top |σ|-ranked SG-unique peaks in ``diff_norm``:
+      1. Find the nearest local maximum in the reference density.
+      2. Compute the mirror position through that ref-density peak.
+      3. Sample the diff map at the mirror; a clean dipole has
+         mirror value opposite in sign to the peak.
+
+    Per-peak dipole-ness = (-v_mirror / v_peak) * min(1, d_dens/0.5).
+    The gate suppresses peaks that sit on the ref-density max (d_dens
+    ≈ 0, where mirror trivially = self).  Aggregate is a σ²-weighted
+    mean across the top-n peaks.
+
+    Returns a scalar in ~[-1, +1]:
+      0    = no dipole content (peaks sit on density or have no partner)
+      +1   = perfect dipoles for every peak
+      < 0  = same-sign mirrors (rare; usually noise-only maps)
+
+    ``diff_norm`` and ``ref_d`` are numpy (NX, NY, NZ) grids on the same
+    lattice (cell + dims).  ``sg_name`` is the H-M symbol used for
+    SG-orbit dedup of peaks.
+    """
+    from scipy.ndimage import maximum_filter, minimum_filter, map_coordinates
+
+    if diff_norm.shape != ref_d.shape:
+        return 0.0
+    dims = diff_norm.shape
+    # σ-normalise ref density for the local-maximum search (relative scale
+    # only; the value itself doesn't enter the dipole formula, just the
+    # position of the local max).
+    ref_rms = float(np.sqrt(np.mean(ref_d.astype(np.float64) ** 2)))
+    if ref_rms <= 0:
+        return 0.0
+    ref_n = ref_d / ref_rms
+
+    # SG symops for peak dedup (fractional).  gemmi.SpaceGroup accepts
+    # either H-M or gemmi's xhm() string; fall through to trivial group
+    # if lookup fails.
+    try:
+        sg = gemmi.SpaceGroup(sg_name)
+        sg_ops = list(sg.operations())
+    except Exception:
+        sg_ops = None
+
+    spacings = [cell.a / dims[0], cell.b / dims[1], cell.c / dims[2]]
+    fp = tuple(max(3, int(np.ceil(min_sep_A / s)) | 1) for s in spacings)
+
+    def _find(arr, positive):
+        if positive:
+            filt = maximum_filter(arr, size=fp, mode='wrap')
+            mask = (arr == filt) & (arr >= sigma_min)
+        else:
+            filt = minimum_filter(arr, size=fp, mode='wrap')
+            mask = (arr == filt) & (arr <= -sigma_min)
+        idxs = np.argwhere(mask)
+        vals = arr[mask]
+        order = np.argsort(-np.abs(vals))[:200]      # cap
+        out = []
+        seen = []
+        for k in order:
+            i, j, m = idxs[k]
+            frac = np.array([i/dims[0], j/dims[1], m/dims[2]])
+            is_dup = False
+            if sg_ops is not None:
+                for prev_frac in seen:
+                    for op in sg_ops:
+                        tf = op.apply_to_xyz(list(prev_frac))
+                        tf = np.array([tf[0] % 1.0, tf[1] % 1.0, tf[2] % 1.0])
+                        df = frac - tf
+                        df -= np.round(df)
+                        p = cell.orthogonalize(gemmi.Fractional(*df))
+                        if float(np.hypot(np.hypot(p.x, p.y), p.z)) < 1.5:
+                            is_dup = True
+                            break
+                    if is_dup:
+                        break
+            if is_dup:
+                continue
+            seen.append(frac)
+            out.append((frac, float(vals[k])))
+            if len(out) >= 60:
+                break
+        return out
+
+    peaks = sorted(_find(diff_norm, True) + _find(diff_norm, False),
+                   key=lambda x: -abs(x[1]))[:n_top]
+    if not peaks:
+        return 0.0
+
+    def _sample(arr, frac):
+        idx = np.array([frac[i] * dims[i] for i in range(3)])
+        return float(map_coordinates(arr, idx.reshape(3, 1),
+                                      order=3, mode='wrap')[0])
+
+    def _nearest_local_max(seed_frac, search_radius_A=3.0):
+        r_vox = [max(1, int(np.ceil(search_radius_A / s))) for s in spacings]
+        seed_idx = np.array([seed_frac[i] * dims[i] for i in range(3)])
+        di = np.arange(-r_vox[0], r_vox[0]+1)
+        dj = np.arange(-r_vox[1], r_vox[1]+1)
+        dk = np.arange(-r_vox[2], r_vox[2]+1)
+        ii = (int(seed_idx[0]) + di) % dims[0]
+        jj = (int(seed_idx[1]) + dj) % dims[1]
+        kk = (int(seed_idx[2]) + dk) % dims[2]
+        sub = ref_n[np.ix_(ii, jj, kk)]
+        lm = (sub == maximum_filter(sub, size=3, mode='reflect'))
+        lm_pts = np.argwhere(lm)
+        if len(lm_pts) == 0:
+            return seed_frac, 0.0
+        best_dist = None
+        best_frac = seed_frac
+        for lp in lm_pts:
+            i2 = int(ii[lp[0]]); j2 = int(jj[lp[1]]); k2 = int(kk[lp[2]])
+            lp_frac = np.array([i2/dims[0], j2/dims[1], k2/dims[2]])
+            df = lp_frac - seed_frac
+            df -= np.round(df)
+            p = cell.orthogonalize(gemmi.Fractional(*df))
+            d = float(np.hypot(np.hypot(p.x, p.y), p.z))
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_frac = lp_frac
+        return best_frac, best_dist
+
+    d_num = 0.0
+    d_den = 0.0
+    for frac, v in peaks:
+        q_frac, d_dens = _nearest_local_max(frac)
+        p_prime = np.array([(2*q_frac[k] - frac[k]) % 1.0 for k in range(3)])
+        v_mirror = _sample(diff_norm, p_prime)
+        gate = min(1.0, d_dens / 0.5)
+        dip_ness = (-v_mirror / v) * gate if v != 0 else 0.0
+        w = v * v
+        d_num += w * dip_ness
+        d_den += w
+    return float(d_num / d_den) if d_den > 0 else 0.0
+
+
 def _map2mtz(mapfile, mtzfile):
     """Convert a CCP4 map to an SG-ASU MTZ via direct numpy FFT.
 
@@ -3692,70 +3915,51 @@ def fitreso_scan(
     raw_mov_pdb_in = mov_pdb
     raw_mov_mtz_in = mov_mtz
 
-    # ── optional refinement ───────────────────────────────────────────────────
+    # ── optional refinement (parallel: ref + pre-mov-raw) ────────────────────
     # Refmac can drop disordered atoms during the run, so subsequent steps
     # (altindex resolution + re-refinement, write_bent_pdb, peak hunting)
     # all use the *refined* PDB to keep the atom set consistent.
-    if run_refinement_flag and ref_mtz.lower().endswith('.mtz'):
-        ref_pdb, ref_mtz = run_refinement(
-            ref_pdb, ref_mtz,
-            outdir=os.path.join(scan_dir, 'refine_ref'),
-            n_cycles=refine_cycles, fill_asu=fill_asu)
-
-    # ── pre/ refmac on raw mov, if needed for phases ──────────────────────────
-    # The pre section FFTs raw_mov_mtz to a map.  If FWT/PHWT aren't present
-    # (deposited Fobs-only inputs), refmac one pass on the raw mov against its
-    # own data — same idea as the post-resolve mov refmac below, but starting
-    # from the un-transformed mov so pre/ reflects the un-aligned state.
+    #
+    # ref refmac and pre-mov-raw refmac are fully independent — no shared
+    # inputs, no shared outputs — so we dispatch both to a
+    # ThreadPoolExecutor and wait for the pair.  Halves the front-end
+    # wall time on the common case where BOTH need refining.  If only
+    # one is needed, the executor still runs it (single-slot) and the
+    # code path is identical.
     pre_mov_pdb = raw_mov_pdb_in
     pre_mov_mtz = raw_mov_mtz_in
-    if (run_refinement_flag and pre_mov_mtz.lower().endswith('.mtz')
-            and 'FWT' not in {c.label
-                              for c in gemmi.read_mtz_file(pre_mov_mtz).columns}):
-        pre_mov_pdb, pre_mov_mtz = run_refinement(
-            pre_mov_pdb, pre_mov_mtz,
-            outdir=os.path.join(scan_dir, 'refine_mov_raw'),
-            n_cycles=refine_cycles, fill_asu=fill_asu)
+    _need_ref_refmac = (run_refinement_flag
+                        and ref_mtz.lower().endswith('.mtz'))
+    _need_premov_refmac = (run_refinement_flag
+                           and pre_mov_mtz.lower().endswith('.mtz')
+                           and 'FWT' not in {c.label for c in
+                               gemmi.read_mtz_file(pre_mov_mtz).columns})
+    if _need_ref_refmac or _need_premov_refmac:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(max_workers=2) as _refmac_pool:
+            _ref_fut = _premov_fut = None
+            if _need_ref_refmac:
+                _ref_fut = _refmac_pool.submit(
+                    run_refinement, ref_pdb, ref_mtz,
+                    outdir=os.path.join(scan_dir, 'refine_ref'),
+                    n_cycles=refine_cycles, fill_asu=fill_asu)
+            if _need_premov_refmac:
+                # pre/ FFTs raw_mov_mtz to a map.  If FWT/PHWT aren't
+                # present, refmac one pass on raw mov against its own
+                # data — same idea as the post-resolve mov refmac below,
+                # but starting from the un-transformed mov so pre/
+                # reflects the un-aligned state.
+                _premov_fut = _refmac_pool.submit(
+                    run_refinement, pre_mov_pdb, pre_mov_mtz,
+                    outdir=os.path.join(scan_dir, 'refine_mov_raw'),
+                    n_cycles=refine_cycles, fill_asu=fill_asu)
+            if _ref_fut is not None:
+                ref_pdb, ref_mtz = _ref_fut.result()
+            if _premov_fut is not None:
+                pre_mov_pdb, pre_mov_mtz = _premov_fut.result()
 
-    # ── altindex / origin resolution ──────────────────────────────────────────
-    # Discrete (rotation × symop × origin) enumeration ranked by post-transform
-    # CA RMSD.  On a non-trivial hit, mov PDB+MTZ are rewritten and re-refined
-    # (or phase-shifted, for origin-only) so the rest of the scan sees an
-    # already-aligned mov.
-    #
-    # Run on raw mov (NOT pre-refmac'd): refmac on raw mov against its own
-    # data shifts the model by ~0.5 Å, which can move it out of the basin of
-    # attraction of the best discrete altindex op (porin 3poq→3pou: best op
-    # gives 2.11 Å on raw mov, 38.8 Å on refined mov — refmac shift crosses
-    # a fractional boundary and the wrap-to-nearest-image hops to a wrong
-    # equivalent).  resolve_altindex's altindex_refine action re-refines
-    # internally on the reindexed MTZ, so mov gets a refinement pass in the
-    # correct frame anyway.
-    if mov_mtz.lower().endswith('.mtz'):
-        _res = resolve_altindex(mov_pdb, ref_pdb, mov_mtz,
-                                 outdir=os.path.join(scan_dir, 'altindex_resolve'),
-                                 refine_cycles=refine_cycles, verbose=verbose,
-                                 fill_asu=fill_asu)
-        mov_pdb = _res['mov_pdb_out']
-        mov_mtz = _res['mov_mtz_out']
-
-    # When altindex_resolve returned action='none' (already aligned, no
-    # altindex needed), we still need refmac on mov to generate FWT/PHWT.
-    if (run_refinement_flag and mov_mtz.lower().endswith('.mtz')
-            and 'FWT' not in {c.label for c in gemmi.read_mtz_file(mov_mtz).columns}):
-        mov_pdb, mov_mtz = run_refinement(
-            mov_pdb, mov_mtz,
-            outdir=os.path.join(scan_dir, 'refine_mov'),
-            n_cycles=refine_cycles, fill_asu=fill_asu)
-
-    # ── load maps ─────────────────────────────────────────────────────────────
-    # For CCP4 ASU map inputs, expand mov to the full unit cell so interpolation
-    # has correct periodic boundary conditions (pad_mode='wrap').  Without this,
-    # the bent map's boundary samples (y≈0.5 etc. for half-cell ASU maps) reflect
-    # interior density unrelated to ref — producing a noise plane at the ASU
-    # boundary in diff_norm.map.  This was historically controlled by the
-    # `--fullcell-mov` flag in the standalone fitreso_scan.py; now always on
-    # for CCP4 mov input.  MTZ inputs come out full-cell by construction.
+    # ── _load helper (used by both the ref/pre_mov phase below and the
+    # post-altindex mov phase further down) ─────────────────────────────────
     def _load(path, tag, fullcell=False):
         ext = os.path.splitext(path)[1].lower()
         if ext == '.mtz':
@@ -3771,31 +3975,26 @@ def fitreso_scan(
             data, hdr = read_ccp4(path)
         return data, hdr, None, None
 
-    # Default mov_fullcell to True for CCP4 input (avoids ASU-boundary noise);
-    # MTZ input ignores the flag (already full-cell).
-    if mov_fullcell is None:
-        mov_fullcell = mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc'))
-    mov_d, mov_h, mov_mtz_resolved, mov_f_col = _load(mov_mtz, 'mov',
-                                                        fullcell=mov_fullcell)
+    # ── Altindex-independent setup: ref density + pre_mov density + grids ──
+    # Everything below (up to the altindex launch) uses ONLY the pre-altindex
+    # inputs (raw mov_pdb, raw mov_mtz, pre_mov_pdb, pre_mov_mtz, ref_pdb,
+    # ref_mtz).  This lets us dispatch resolve_altindex to a background
+    # thread and run Section 0 (pre) concurrently — the pre section needs
+    # none of altindex's outputs.
     ref_d, ref_h, ref_mtz_resolved, ref_f_col = _load(ref_mtz, 'ref')
-    # pre/ section uses the un-transformed mov.  Load with the same
-    # fullcell/pad rules as the post-resolve mov so interpolation behaves
-    # the same way.  If pre_mov_mtz IS raw_mov_mtz_in and raw_mov_mtz_in
-    # is also the post-resolve mov_mtz (the resolve_altindex action='none'
-    # case), this re-FFT is redundant — re-use mov_d to avoid the cost.
-    pre_mov_fullcell = (pre_mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc')))
-    if os.path.abspath(pre_mov_mtz) == os.path.abspath(mov_mtz):
-        pre_mov_d, pre_mov_h = mov_d, mov_h
-        pre_mov_pad_mode = pad_mode
-    else:
-        pre_mov_d, pre_mov_h, _, _ = _load(pre_mov_mtz, 'pre_mov',
-                                            fullcell=pre_mov_fullcell)
-        pre_mov_pad_mode = ('wrap' if pre_mov_mtz.lower().endswith('.mtz')
-                                       or pre_mov_fullcell else 'reflect')
 
-    col_suffix = ('' if (mov_f_col is None or mov_f_col in _CANONICAL_F)
-                  else f'_{mov_f_col}')
-    pad_mode   = 'wrap' if (mov_mtz_resolved is not None or mov_fullcell) else 'reflect'
+    pre_mov_fullcell = pre_mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc'))
+    pre_mov_d, pre_mov_h, _, pre_mov_f_col = _load(
+        pre_mov_mtz, 'pre_mov', fullcell=pre_mov_fullcell)
+    pre_mov_pad_mode = ('wrap' if pre_mov_mtz.lower().endswith('.mtz')
+                                   or pre_mov_fullcell else 'reflect')
+    # col_suffix — filename suffix for bent{col_suffix}.map / .mtz / diff etc.
+    # Almost always '' (canonical FWT input); non-canonical F cols produce
+    # e.g. _F suffix.  Set from pre_mov here so Section 0 (pre) has a
+    # value; re-derived from mov_f_col after altindex for Section 1+
+    # (usually identical because mov and pre_mov share columns pre-altindex).
+    col_suffix = ('' if (pre_mov_f_col is None or pre_mov_f_col in _CANONICAL_F)
+                  else f'_{pre_mov_f_col}')
 
     ns2, nr2, nc2 = ref_h['ns'], ref_h['nr'], ref_h['nc']
     nx2, ny2, nz2 = ref_h['nx'], ref_h['ny'], ref_h['nz']
@@ -3811,36 +4010,25 @@ def fitreso_scan(
     frac_z = (amap[3].ravel() + start[3]) / Nxyz[3]
     ref_pts = np.stack([frac_x, frac_y, frac_z], axis=1)
 
-    M     = _scan_cell_matrix(ref_h)
-    # Atoms used for peak-labelling: union of ref and mov atoms.  Both
-    # fractionalized in ref's cell so distances are computed in a single
-    # frame (mov has already been moved into ref's frame by resolve_altindex
-    # when applicable).  Each atom carries an `src` tag ('r' or 'm') shown
-    # in the peak label.
-    # ── display-side mov PDBs: same coords/cell as the normalized files, but
-    # the moving structure's ORIGINAL chain / resnum / resname / atomname
-    # labels restored.  Used for anything the user reads — peak labels, bent
-    # PDBs, unbent.pdb symlinks — so they never wonder "which model am I
-    # looking at?" when scrolling residues in Coot.  Internal atom matching
-    # (match_atoms, resolve_altindex, bend_fit_progressive) keeps using the
-    # ref-labelled normalized copies.  `preserve_mov_numbering=False` reverts
-    # to today's ref-labelled outputs (opt-in for side-by-side overlays).
+    M         = _scan_cell_matrix(ref_h)
+    _ref_cell = gemmi.UnitCell(*ref_h['cell'])
+    # SG name used by _dipole_score_from_diff_norm and the pre-row dipole
+    # calculation.  Read from ref_pdb (authoritative CRYST1 record) —
+    # ref_h.get('spacegroup') gives the SG *number* which gemmi can look up.
+    try:
+        _sg_name = gemmi.read_pdb(ref_pdb).spacegroup_hm
+    except Exception:
+        _sg_name = None
+
+    # pre_mov_display_pdb / pre_atoms — used by Section 0 (pre), don't depend
+    # on altindex.  mov_display_pdb / atoms are computed AFTER altindex.
     if preserve_mov_numbering and norm_plan is not None:
-        mov_display_pdb = _reverse_normalize_pdb(
-            mov_pdb, norm_plan,
-            os.path.join(scan_dir, '_mov_display.pdb'))
         pre_mov_display_pdb = _reverse_normalize_pdb(
             pre_mov_pdb, norm_plan,
             os.path.join(scan_dir, '_pre_mov_display.pdb'))
     else:
-        mov_display_pdb     = mov_pdb
         pre_mov_display_pdb = pre_mov_pdb
 
-    _ref_cell = gemmi.UnitCell(*ref_h['cell'])
-    atoms     = (_scan_read_pdb_atoms_p1(ref_pdb, src='ref',
-                                          cell_override=_ref_cell)
-                 + _scan_read_pdb_atoms_p1(mov_display_pdb, src='mov',
-                                            cell_override=_ref_cell))
     # Pre/ uses the un-transformed mov pdb (resolve_altindex hasn't run on it).
     # For cross-cell pairs (lipox, porin) the raw mov atoms are NOT in ref's
     # frame — peak labelling for pre will pick whatever ref or raw-mov atom
@@ -3895,18 +4083,21 @@ def fitreso_scan(
                                             b_sigma=b_sigma, bfacs=_bf)
     raw_rmsd = rmsd_ca(_fm, _ca, _h0, _AB0, _cell2)
 
-    # ── post-resolve hkl00 RMSD ──────────────────────────────────────────────
-    # mov has already been aligned by resolve_altindex (above); the hkl00 RMSD
-    # is just the matched-atom RMSD with no Fourier shift field applied.
-    precomputed_origin = None
-    with open(os.devnull, 'w') as _dev, _contextlib.redirect_stdout(_dev):
-        _a1o, _cell1o, _sg1o = expand_to_p1(mov_pdb)
-        _a2o, _cell2o, _sg2o = expand_to_p1(ref_pdb)
-        _fmo, _cao, _uido, _bfo = match_atoms(_a1o, _a2o)
-        _fmo, _cao, _, _, _ = reject_outliers(_fmo, _cao, _uido, _cell1o,
-                                               mad_sigma=outlier_sigma,
-                                               b_sigma=b_sigma, bfacs=_bfo)
-    hkl00_rmsd = rmsd_ca(_fmo, _cao, _h0, _AB0, _cell2o)
+    # ── Launch resolve_altindex in a background thread ──────────────────────
+    # Runs concurrently with Section 0 (pre) below.  Section 0 depends only
+    # on ref + raw/pre_mov (all set above), so we don't need altindex's
+    # result until Section 1 (hkl00) starts.  Post-altindex mov refmac
+    # (if needed), post-altindex mov density load, mov_display_pdb, atoms,
+    # and hkl00_rmsd all happen after we wait, before Section 1.
+    from concurrent.futures import ThreadPoolExecutor as _TPE2
+    _altindex_pool = _TPE2(max_workers=1)
+    _altindex_fut = None
+    if mov_mtz.lower().endswith('.mtz'):
+        _altindex_fut = _altindex_pool.submit(
+            resolve_altindex, mov_pdb, ref_pdb, mov_mtz,
+            outdir=os.path.join(scan_dir, 'altindex_resolve'),
+            refine_cycles=refine_cycles, verbose=verbose,
+            fill_asu=fill_asu)
 
     # unbent.pdb: written further down (after hkl00 is set up) as a symlink
     # to hkl00/bent.pdb, keeping it in the same cell+frame as unbent.mtz
@@ -4008,6 +4199,30 @@ def fitreso_scan(
             geom_str = f'{geom["bond_rmsz"]:7.2f}/{geom["angle_rmsz"]:5.2f}'
         else:
             geom_str = '        --'
+
+        # ── Dipole content + combined d_opt score ─────────────────────────
+        # dipole_score: σ²-weighted mean of per-peak dipole-ness on the
+        # top-30 SG-unique peaks in diff_norm (see
+        # _dipole_score_from_diff_norm).  Combined score:
+        #     S = Rbent + 0.1·RMSD + 0.5·max(0,dip) + 0.05·max(0,bondZ−1)
+        # Higher = worse.  argmin(S) across fr-rows is an alternative
+        # d_opt pick that combines fit quality, geometry, and
+        # misregistration content on a single axis.
+        try:
+            dipole = _dipole_score_from_diff_norm(
+                diff_norm, ref_d,
+                gemmi.UnitCell(*ref_h['cell']),
+                _sg_name)
+        except Exception:
+            dipole = None
+        S = None
+        if riso is not None and rmsd_after is not None:
+            _bond_pen = (max(0.0, geom['bond_rmsz'] - 1.0)
+                          if geom is not None else 0.0)
+            _dip_pen  = max(0.0, dipole) if dipole is not None else 0.0
+            S = float(riso + 0.1 * rmsd_after + 0.5 * _dip_pen
+                       + 0.05 * _bond_pen)
+
         row_str = (f"{label:>7}  {after_str:>6}  {n_active:>6d}  "
                    f"{rbent_str:>6}  {rbend_str:>6}  {geom_str:>13}  "
                    f"{p_top[0]:>+7.2f}σ  {atom_str:>20} {p_top[2]:.2f}Å  "
@@ -4017,6 +4232,7 @@ def fitreso_scan(
                               peak_sigma=p_top[0], peak_atom=atom_str,
                               peak_dist=p_top[2], peak_idx=p_top[3],
                               geom=geom,
+                              dipole=dipole, S=S,
                               t=t_elapsed, row_str=row_str))
         if verbose:
             print(row_str, flush=True)
@@ -4067,6 +4283,28 @@ def fitreso_scan(
     pre_p_top  = (pre_peaks['pos'] if abs(pre_peaks['pos'][0]) >= abs(pre_peaks['neg'][0])
                   else pre_peaks['neg'])
     pre_atom_s = _atom_label(pre_p_top[1])
+
+    # bondZ/angZ + dipole + S for the pre row — same helpers as _save_point.
+    # bondZ from check_geometry on the raw mov PDB (the pre row's model
+    # source); dipole from the same _dipole_score_from_diff_norm helper
+    # applied to pre_diff_norm + ref_d.
+    try:
+        pre_geom = check_geometry(pre_mov_pdb)
+    except Exception:
+        pre_geom = None
+    try:
+        pre_dipole = _dipole_score_from_diff_norm(
+            pre_diff_norm, ref_d, gemmi.UnitCell(*ref_h['cell']), _sg_name)
+    except Exception:
+        pre_dipole = None
+    pre_S = None
+    if pre_riso is not None:
+        _bond_pen = (max(0.0, pre_geom['bond_rmsz'] - 1.0)
+                      if pre_geom is not None else 0.0)
+        _dip_pen  = max(0.0, pre_dipole) if pre_dipole is not None else 0.0
+        pre_S = float(pre_riso + 0.1 * raw_rmsd + 0.5 * _dip_pen
+                       + 0.05 * _bond_pen)
+
     pre_t_el   = time.time() - t_pre
     pre_rbent_str = f'{pre_riso*100:.1f}%' if pre_riso is not None else '  N/A'
     pre_row_str = (f"{'pre':>7}  {raw_rmsd:>6.3f}  {0:>6d}  "
@@ -4077,10 +4315,69 @@ def fitreso_scan(
                           rbent=pre_riso, rbend=None, k=pre_kF, B=pre_B,
                           peak_sigma=pre_p_top[0], peak_atom=pre_atom_s,
                           peak_dist=pre_p_top[2], peak_idx=pre_p_top[3],
-                          geom=None,
+                          geom=pre_geom,
+                          dipole=pre_dipole, S=pre_S,
                           t=pre_t_el, row_str=pre_row_str))
     if verbose:
         print(pre_row_str, flush=True)
+
+    # ── Wait for background altindex; post-altindex mov refmac + load ──────
+    # Everything below depends on the post-altindex mov (density, atoms,
+    # display PDB, hkl00_rmsd).  Section 0 (pre) ran in parallel with
+    # altindex — now block and rebind mov_pdb/mov_mtz to whatever
+    # resolve_altindex chose.
+    if _altindex_fut is not None:
+        _res = _altindex_fut.result()
+        _altindex_pool.shutdown(wait=True)
+        mov_pdb = _res['mov_pdb_out']
+        mov_mtz = _res['mov_mtz_out']
+
+    # When altindex returned action='none' (already aligned, no altindex
+    # needed), we still need refmac on mov to generate FWT/PHWT if it
+    # doesn't already carry them.
+    if (run_refinement_flag and mov_mtz.lower().endswith('.mtz')
+            and 'FWT' not in {c.label
+                              for c in gemmi.read_mtz_file(mov_mtz).columns}):
+        mov_pdb, mov_mtz = run_refinement(
+            mov_pdb, mov_mtz,
+            outdir=os.path.join(scan_dir, 'refine_mov'),
+            n_cycles=refine_cycles, fill_asu=fill_asu)
+
+    # Load post-altindex mov density.  Default mov_fullcell to True for
+    # CCP4 input (avoids ASU-boundary noise in diff_norm); MTZ input
+    # ignores the flag (already full-cell).
+    if mov_fullcell is None:
+        mov_fullcell = mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc'))
+    mov_d, mov_h, mov_mtz_resolved, mov_f_col = _load(mov_mtz, 'mov',
+                                                        fullcell=mov_fullcell)
+    col_suffix = ('' if (mov_f_col is None or mov_f_col in _CANONICAL_F)
+                  else f'_{mov_f_col}')
+    pad_mode   = ('wrap' if (mov_mtz_resolved is not None or mov_fullcell)
+                  else 'reflect')
+
+    # mov_display_pdb + `atoms` (post-altindex; used by _save_point and by
+    # write_bent_pdb via closure).
+    if preserve_mov_numbering and norm_plan is not None:
+        mov_display_pdb = _reverse_normalize_pdb(
+            mov_pdb, norm_plan,
+            os.path.join(scan_dir, '_mov_display.pdb'))
+    else:
+        mov_display_pdb = mov_pdb
+    atoms = (_scan_read_pdb_atoms_p1(ref_pdb, src='ref',
+                                      cell_override=_ref_cell)
+             + _scan_read_pdb_atoms_p1(mov_display_pdb, src='mov',
+                                        cell_override=_ref_cell))
+
+    # hkl00 RMSD — uses post-altindex mov_pdb.
+    precomputed_origin = None
+    with open(os.devnull, 'w') as _dev, _contextlib.redirect_stdout(_dev):
+        _a1o, _cell1o, _sg1o = expand_to_p1(mov_pdb)
+        _a2o, _cell2o, _sg2o = expand_to_p1(ref_pdb)
+        _fmo, _cao, _uido, _bfo = match_atoms(_a1o, _a2o)
+        _fmo, _cao, _, _, _ = reject_outliers(_fmo, _cao, _uido, _cell1o,
+                                               mad_sigma=outlier_sigma,
+                                               b_sigma=b_sigma, bfacs=_bfo)
+    hkl00_rmsd = rmsd_ca(_fmo, _cao, _h0, _AB0, _cell2o)
 
     # ── Section 1: hkl00 — zero shift field (post-resolve baseline) ──────────
     outdir0 = os.path.join(scan_dir, 'hkl00')
@@ -4391,18 +4688,29 @@ def fitreso_scan(
                           fr_used=[float(d) for d in (ds_used if ds_used is not None
                                                        else [])],
                           clamped=clamped)
-        # ── pre-σ at best-peak location ──────────────────────────────────────
-        best_row = _log_rows[-1]
-        if best_row.get('peak_idx') is not None:
-            i, j, k = best_row['peak_idx']
-            best_row['pre_at_best_sigma'] = float(pre_diff_norm[i, j, k])
-            if verbose:
-                print(f"  pre diff-map σ at best-peak voxel: "
-                      f"{best_row['pre_at_best_sigma']:+.2f}σ "
-                      f"(best peak: {best_row['peak_sigma']:+.2f}σ at "
-                      f"{best_row['peak_atom']})", flush=True)
+        # (Best-row pre-σ is now filled in the per-row loop below.)
     else:
         _best_meta = None
+
+    # ── Per-row pre@peak: σ in pre/diff_norm.map at each row's own top-peak
+    # voxel.  Small |pre@peak| relative to |peak_sigma| ⇒ the row's peak
+    # was hidden pre-bending and revealed by alignment+bending.  Similar
+    # magnitude ⇒ feature was already visible pre-bending and neither
+    # bending revealed nor damped it (chemistry or persistent residual).
+    # Trivially equals peak_sigma for the pre row and ~equal for hkl00.
+    for _row in _log_rows:
+        pidx = _row.get('peak_idx')
+        if pidx is None:
+            continue
+        i, j, k = pidx
+        _row['pre_at_peak_sigma'] = float(pre_diff_norm[i, j, k])
+    if verbose and _best_meta is not None:
+        _br = _log_rows[-1]
+        if _br.get('pre_at_peak_sigma') is not None:
+            print(f"  pre diff-map σ at best-peak voxel: "
+                  f"{_br['pre_at_peak_sigma']:+.2f}σ "
+                  f"(best peak: {_br['peak_sigma']:+.2f}σ at "
+                  f"{_br['peak_atom']})", flush=True)
 
     # ── Final summary log ───────────────────────────────────────────────────
     _sign_note = ('diff = bent − ref  (+peak ⇒ density in bent absent from ref)'
@@ -4420,17 +4728,24 @@ def fitreso_scan(
         fh.write(f"# Rbent   : Rfac after F-space (k+B) scaling of bent → ref\n")
         fh.write(f"# Rbend   : Rfac of bent vs hkl00 bent (how much the PSDVF moved density)\n")
         fh.write(f"# k, B    : F-space scale + isotropic B (Å²) used for Rbent\n")
-        fh.write(f"# pre@best: σ in pre/diff_norm.map at the voxel of best row's top peak\n")
-        fh.write(f"#           (small |pre@best| ⇒ feature genuinely revealed by alignment+bending)\n\n")
+        fh.write(f"# pre@peak: σ in pre/diff_norm.map at THIS row's top-peak voxel\n")
+        fh.write(f"#           (|pre@peak| ≪ |peak| ⇒ feature hidden pre-bending, revealed by fit;\n")
+        fh.write(f"#            |pre@peak| ≈ |peak|  ⇒ feature was already visible pre-bending)\n\n")
         fh.write(f"# bondZ/  : RMSZ of bond lengths / bond angles vs CCP4 monomer-lib\n")
         fh.write(f"# angZ      ideals (gemmi.prepare_topology).  Refined ~<1; loose ~2;\n")
-        fh.write(f"#           breaking >5; catastrophic >100 — bent.pdb is unphysical.\n\n")
+        fh.write(f"#           breaking >5; catastrophic >100 — bent.pdb is unphysical.\n")
+        fh.write(f"# dipole  : σ²-weighted mean of per-peak dipole-ness on the top-30 diff peaks.\n")
+        fh.write(f"#           ~0 = no misregistration/embossing content; +1 = perfect dipoles.\n")
+        fh.write(f"# score   : combined d_opt score, score = Rbent + 0.1·RMSD + 0.5·max(0,dipole)\n")
+        fh.write(f"#           + 0.05·max(0,bondZ−1).  Lower = better; argmin(score) across fr-rows\n")
+        fh.write(f"#           is an alternative d_opt pick that combines fit / geometry / align.\n\n")
         hdr = (f"{'label':>7}  {'RMSD':>6}  {'active':>6}  "
                f"{'Rbent':>6}  {'Rbend':>6}  "
                f"{'k':>6}  {'B(Å²)':>7}  "
                f"{'bondZ':>7}/{'angZ':>5}  "
+               f"{'dipole':>7}  {'score':>6}  "
                f"{'peak':>7}  {'atom':>20}  {'dist':>6}  "
-               f"{'pre@best':>9}  {'t(s)':>5}\n")
+               f"{'pre@peak':>9}  {'t(s)':>5}\n")
         fh.write(hdr)
         fh.write('-' * (len(hdr) - 1) + '\n')
         for r in _log_rows:
@@ -4444,15 +4759,33 @@ def fitreso_scan(
                 g_s = f"{g['bond_rmsz']:7.2f}/{g['angle_rmsz']:5.2f}"
             else:
                 g_s = f"{'--':>7}/{'--':>5}"
-            pab    = r.get('pre_at_best_sigma')
+            dip    = r.get('dipole')
+            dip_s  = f"{dip:>+7.3f}" if dip is not None else f"{'—':>7}"
+            S_val  = r.get('S')
+            S_s    = f"{S_val:>6.3f}" if S_val is not None else f"{'—':>6}"
+            pab    = r.get('pre_at_peak_sigma')
             pab_s  = f"{pab:>+7.2f}σ" if pab is not None else f"{'—':>9}"
             fh.write(f"{r['label']:>7}  {rmsd_s:>6}  {r['n_active']:>6d}  "
                      f"{rbe_s:>6}  {rbd_s:>6}  "
                      f"{k_s:>6}  {B_s:>7}  "
                      f"{g_s}  "
+                     f"{dip_s}  {S_s}  "
                      f"{r['peak_sigma']:>+7.2f}σ  {r['peak_atom']:>20}  "
                      f"{r['peak_dist']:>5.2f}Å  "
                      f"{pab_s:>9}  {r['t']:>4.0f}s\n")
+
+        # ── Alternative d_opt pick from argmin(score) across fr-rows ──────
+        fr_score_rows = [r for r in _log_rows
+                         if r['label'].startswith('fr') and r.get('S') is not None]
+        if fr_score_rows:
+            best_score = min(fr_score_rows, key=lambda r: r['S'])
+            fh.write(f"\n# combined-score d_opt: {best_score['label']}  "
+                     f"score={best_score['S']:.3f}  "
+                     f"(Rbent={best_score['rbent']*100:.1f}%, "
+                     f"RMSD={best_score['rmsd']:.3f}Å, "
+                     f"dipole={best_score.get('dipole') or 0.0:+.3f}, "
+                     f"bondZ={(best_score['geom']['bond_rmsz'] if best_score.get('geom') else 0.0):.2f})\n")
+
         if _best_meta is not None:
             fr_used_str = ', '.join(f'fr{int(d) if d == int(d) else d}'
                                      for d in _best_meta['fr_used'])
@@ -4720,9 +5053,10 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
             # ~90% post-fill and read like the fill silently no-op'd.
             n_in_rows  = len(gemmi.read_mtz_file(mtz_path).array)
             n_out_rows = len(gemmi.read_mtz_file(mtz_filled).array)
-            print(f'  filled {n_out_rows - n_in_rows} missing SG-ASU rows '
-                  f'(empty FP, work-set FreeR) → {n_out_rows} total rows '
-                  f'for refinement', flush=True)
+            print(f'  padded {n_out_rows - n_in_rows} missing SG-ASU rows '
+                  f'with HKL + work-set FreeR only (FP left NaN — refmac '
+                  f'generates FC/FWT from the model, Fobs unchanged) → '
+                  f'{n_out_rows} total rows in MTZ', flush=True)
             mtz_path_for_refmac = mtz_filled
         except Exception as e:
             print(f'  _pad_mtz_to_full_asu failed ({e!r}); aborting',
@@ -4925,12 +5259,18 @@ def _rot_deviation_deg(R_a, R_b):
 
 
 def _shift_mtz_origin(mtz_in, t_frac, mtz_out):
-    """Apply F'(H) = exp(-2πi H·t) F(H) to every (F, PHI) column pair in mtz_in.
-    All other columns (intensities, sigF, FREE flag) pass through unchanged.
-    Pure phase rotation — preserves all column relationships, no re-refinement."""
+    """Apply F'(H) = exp(+2πi H·t) F(H) to every (F, PHI) column pair in
+    mtz_in — the structure-factor transformation for a real-space shift
+    of atoms by +t_cart (matches VALIDATE_ALTINDEX.md and pairs correctly
+    with _apply_cart_transform_to_pdb(R=I, t_cart), which moves atoms to
+    p' = p + t_cart).  Previous versions used -2πi h·t, which moved the
+    map by -t_cart while atoms moved by +t_cart, mis-aligning display
+    PDBs from their unbent maps by 2·t_cart (typically ~1-3 Å in the
+    CA production).  All other columns (intensities, sigF, FREE flag)
+    pass through unchanged.  Pure phase rotation — no re-refinement."""
     mtz = gemmi.read_mtz_file(mtz_in)
     miller = mtz.make_miller_array().astype(np.float64)        # (N, 3)
-    delta_phi_deg = (-360.0 * (miller @ np.asarray(t_frac, dtype=np.float64))
+    delta_phi_deg = (360.0 * (miller @ np.asarray(t_frac, dtype=np.float64))
                      ).astype(np.float32)
 
     # Find (F, PHI) pairs by column type
@@ -5601,8 +5941,50 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
 
     Returns dict with mov_pdb_out, mov_mtz_out, action, R_frac, t_frac,
     drot_deg, rmsd_after.
+
+    Writes ``<outdir>/resolve_altindex.log`` with the full trace + final
+    action / R / t / drot / rmsd_after, regardless of the action taken.
     """
     os.makedirs(outdir, exist_ok=True)
+
+    # ── Log capture: tee every user-facing line into a buffer that is
+    # dumped to `outdir/resolve_altindex.log` at every return path. ─────
+    _log_lines = []
+    def _log(msg):
+        _log_lines.append(str(msg))
+        if verbose:
+            print(msg, flush=True)
+    def _write_log_and_return(result):
+        try:
+            with open(os.path.join(outdir, 'resolve_altindex.log'), 'w') as fh:
+                fh.write(f"# resolve_altindex log\n")
+                fh.write(f"# mov_pdb : {mov_pdb}\n")
+                fh.write(f"# ref_pdb : {ref_pdb}\n")
+                fh.write(f"# mov_mtz : {mov_mtz}\n")
+                fh.write(f"# outdir  : {outdir}\n")
+                fh.write("\n".join(_log_lines) + "\n\n")
+                fh.write(f"# ── Result ────────────────────────────────\n")
+                for k in ('action', 'drot_deg', 'rmsd_after'):
+                    v = result.get(k)
+                    if v is not None:
+                        fh.write(f"# {k:<12} = {v}\n")
+                Rf = result.get('R_frac')
+                tf = result.get('t_frac')
+                if Rf is not None:
+                    fh.write(f"# R_frac       =\n"
+                             f"#   [[{Rf[0][0]:+.6f} {Rf[0][1]:+.6f} {Rf[0][2]:+.6f}]\n"
+                             f"#    [{Rf[1][0]:+.6f} {Rf[1][1]:+.6f} {Rf[1][2]:+.6f}]\n"
+                             f"#    [{Rf[2][0]:+.6f} {Rf[2][1]:+.6f} {Rf[2][2]:+.6f}]]\n")
+                if tf is not None:
+                    fh.write(f"# t_frac       = [{tf[0]:+.6f} {tf[1]:+.6f} {tf[2]:+.6f}]\n")
+                fh.write(f"# mov_pdb_out  = {result.get('mov_pdb_out')}\n")
+                fh.write(f"# mov_mtz_out  = {result.get('mov_mtz_out')}\n")
+        except Exception as _e:
+            if verbose:
+                print(f"  (warning: failed to write resolve_altindex.log: {_e})",
+                      flush=True)
+        return result
+
     mov_st = gemmi.read_pdb(mov_pdb)
     ref_st = gemmi.read_pdb(ref_pdb)
     mov_st.setup_entities()
@@ -5621,13 +6003,10 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         s_mtz_stem = os.path.splitext(os.path.basename(mov_mtz))[0]
         s_pdb = os.path.join(outdir, f'{s_pdb_stem}_stretched.pdb')
         s_mtz = os.path.join(outdir, f'{s_mtz_stem}_stretched.mtz')
-        if verbose:
-            print(f"resolve_altindex: cells differ — stretching moving into "
-                  f"ref cell (fractions preserved)", flush=True)
-            print(f"  moving cell:    {tuple(round(x, 3) for x in mov_st.cell.parameters)}",
-                  flush=True)
-            print(f"  ref    cell:    {tuple(round(x, 3) for x in ref_st.cell.parameters)}",
-                  flush=True)
+        _log(f"resolve_altindex: cells differ — stretching moving into "
+             f"ref cell (fractions preserved)")
+        _log(f"  moving cell:    {tuple(round(x, 3) for x in mov_st.cell.parameters)}")
+        _log(f"  ref    cell:    {tuple(round(x, 3) for x in ref_st.cell.parameters)}")
         _stretch_pdb_to_cell(mov_pdb, ref_st.cell, s_pdb)
         _relabel_mtz_cell(mov_mtz, ref_st.cell, s_mtz)
         mov_pdb = s_pdb
@@ -5638,17 +6017,14 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
 
     A_cart, B_cart = _collect_matched_ca(mov_st, ref_st)
     if len(A_cart) < 3:
-        if verbose:
-            print(f"resolve_altindex: <3 CA matches; skipping", flush=True)
-        return _no_op_resolve_result(mov_pdb, mov_mtz)
+        _log(f"resolve_altindex: <3 CA matches; skipping")
+        return _write_log_and_return(_no_op_resolve_result(mov_pdb, mov_mtz))
 
     rmsd_base = float(np.sqrt(np.mean(np.sum((A_cart - B_cart) ** 2, axis=1))))
     R_lsq, t_lsq, rmsd_lsq = _kabsch(A_cart, B_cart)
 
-    if verbose:
-        print(f"resolve_altindex: {len(A_cart)} CA pairs  "
-              f"baseline RMSD {rmsd_base:.2f} A  LSQ {rmsd_lsq:.2f} A",
-              flush=True)
+    _log(f"resolve_altindex: {len(A_cart)} CA pairs  "
+         f"baseline RMSD {rmsd_base:.2f} A  LSQ {rmsd_lsq:.2f} A")
 
     # ── cross-cell: relax metric tolerance for the altindex enumeration ─────
     # For cross-cell pairs (stretched=True), the natural alt-cell op is
@@ -5666,9 +6042,8 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
     sg_name = mov_st.spacegroup_hm
     sg = gemmi.find_spacegroup_by_name(sg_name)
     if sg is None:
-        if verbose:
-            print(f"resolve_altindex: unknown SG {sg_name!r}; skipping", flush=True)
-        return _no_op_resolve_result(mov_pdb, mov_mtz)
+        _log(f"resolve_altindex: unknown SG {sg_name!r}; skipping")
+        return _write_log_and_return(_no_op_resolve_result(mov_pdb, mov_mtz))
 
     O, Finv = _ortho_pair(cell)
     G = O.T @ O
@@ -5737,26 +6112,25 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                 break
 
     if rmsd_top >= improve_threshold * rmsd_base:
-        if verbose:
-            print(f"  best discrete op: rmsd={rmsd_top:.2f} A vs baseline "
-                  f"{rmsd_base:.2f} A — no improvement, skipping", flush=True)
+        _log(f"  best discrete op: rmsd={rmsd_top:.2f} A vs baseline "
+             f"{rmsd_base:.2f} A — no improvement, skipping")
         if stretched:
-            return _finish_after_stretch_only(mov_pdb, mov_mtz, outdir,
-                                              refine_cycles, fill_asu,
-                                              drot_deg, rmsd_base, verbose)
-        return _no_op_resolve_result(mov_pdb, mov_mtz,
-                                     drot=drot_deg, rmsd=rmsd_base)
+            return _write_log_and_return(_finish_after_stretch_only(
+                mov_pdb, mov_mtz, outdir, refine_cycles, fill_asu,
+                drot_deg, rmsd_base, verbose))
+        return _write_log_and_return(_no_op_resolve_result(mov_pdb, mov_mtz,
+                                                            drot=drot_deg,
+                                                            rmsd=rmsd_base))
 
     if is_identity_R and is_zero_t:
-        if verbose:
-            print(f"  best discrete op is identity — no transform needed",
-                  flush=True)
+        _log(f"  best discrete op is identity — no transform needed")
         if stretched:
-            return _finish_after_stretch_only(mov_pdb, mov_mtz, outdir,
-                                              refine_cycles, fill_asu,
-                                              drot_deg, rmsd_top, verbose)
-        return _no_op_resolve_result(mov_pdb, mov_mtz,
-                                     drot=drot_deg, rmsd=rmsd_top)
+            return _write_log_and_return(_finish_after_stretch_only(
+                mov_pdb, mov_mtz, outdir, refine_cycles, fill_asu,
+                drot_deg, rmsd_top, verbose))
+        return _write_log_and_return(_no_op_resolve_result(mov_pdb, mov_mtz,
+                                                            drot=drot_deg,
+                                                            rmsd=rmsd_top))
 
     mov_stem = os.path.splitext(os.path.basename(mov_pdb))[0]
     mtz_stem = os.path.splitext(os.path.basename(mov_mtz))[0]
@@ -5780,14 +6154,14 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                                      out_pdb, ref_cell=cell)
         R_frac_int = np.round(R_frac).astype(int)
         _apply_op_to_mtz(mov_mtz, R_frac_int, t_frac, out_mtz)
-        if verbose:
-            print(f"  action=sg_op_origin  R is an in-SG symop  "
-                  f"t_frac={t_frac}  rmsd_after={rmsd_top:.2f} A", flush=True)
-            print(f"  applied (R, t) to PDB (cartesian) and to MTZ "
-                  f"(F-space, no re-refinement)", flush=True)
-        return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
-                    action=action, R_frac=R_frac, t_frac=t_frac,
-                    drot_deg=drot_deg, rmsd_after=rmsd_top)
+        _log(f"  action=sg_op_origin  R is an in-SG symop  "
+             f"t_frac={t_frac}  rmsd_after={rmsd_top:.2f} A")
+        _log(f"  applied (R, t) to PDB (cartesian) and to MTZ "
+             f"(F-space, no re-refinement)")
+        return _write_log_and_return(dict(
+            mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
+            action=action, R_frac=R_frac, t_frac=t_frac,
+            drot_deg=drot_deg, rmsd_after=rmsd_top))
 
     if is_identity_R:
         # Origin-only: translate PDB, phase-shift MTZ.  No re-refinement.
@@ -5797,12 +6171,12 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         _apply_cart_transform_to_pdb(mov_pdb, R_cart, t_cart_opt, out_pdb,
                                      ref_cell=cell)
         _shift_mtz_origin(mov_mtz, t_frac, out_mtz)
-        if verbose:
-            print(f"  action=origin_only  t_frac={t_frac}  "
-                  f"rmsd_after={rmsd_top:.2f} A", flush=True)
-        return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
-                    action=action, R_frac=R_frac, t_frac=t_frac,
-                    drot_deg=drot_deg, rmsd_after=rmsd_top)
+        _log(f"  action=origin_only  t_frac={t_frac}  "
+             f"rmsd_after={rmsd_top:.2f} A")
+        return _write_log_and_return(dict(
+            mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
+            action=action, R_frac=R_frac, t_frac=t_frac,
+            drot_deg=drot_deg, rmsd_after=rmsd_top))
 
     # Altindex (R != I, with or without origin shift): transform PDB, reindex
     # MTZ Fobs, re-refine.
@@ -5816,12 +6190,11 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         raise ValueError(f"R_frac not integer: {R_frac}")
     _reindex_mtz_fobs(mov_mtz, R_frac_int, pre_mtz)
 
-    if verbose:
-        print(f"  action=altindex_refine  drot={drot_deg:.2f} deg  "
-              f"rmsd_after={rmsd_top:.2f} A", flush=True)
-        print(f"  R_frac =\n{R_frac_int}\n  t_frac = {t_frac}", flush=True)
-        print(f"  re-refining {os.path.basename(pre_pdb)} against "
-              f"{os.path.basename(pre_mtz)} ...", flush=True)
+    _log(f"  action=altindex_refine  drot={drot_deg:.2f} deg  "
+         f"rmsd_after={rmsd_top:.2f} A")
+    _log(f"  R_frac =\n{R_frac_int}\n  t_frac = {t_frac}")
+    _log(f"  re-refining {os.path.basename(pre_pdb)} against "
+         f"{os.path.basename(pre_mtz)} ...")
 
     # Re-refinement of the altindex-reindexed MTZ: reindex generally drops
     # ~half the reflections (the reindex is a SG-asymmetric reshuffle, and
@@ -5831,9 +6204,10 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                                        n_cycles=refine_cycles,
                                        fill_asu=fill_asu)
 
-    return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
-                action=action, R_frac=R_frac, t_frac=t_frac,
-                drot_deg=drot_deg, rmsd_after=rmsd_top)
+    return _write_log_and_return(dict(
+        mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
+        action=action, R_frac=R_frac, t_frac=t_frac,
+        drot_deg=drot_deg, rmsd_after=rmsd_top))
 
 
 def main():
