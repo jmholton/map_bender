@@ -3857,6 +3857,7 @@ def fitreso_scan(
     subtract='ref', atom_sel='all',
     bound_by_obs=True, pnn_mode=None,
     preserve_mov_numbering=True,
+    scan_all_fr=False,
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -4458,6 +4459,7 @@ def fitreso_scan(
     # same SVD per iter), but eliminates the redundant coarse-iter work each
     # separate call repeats.  For lipox (~4× cell expansion, ~6700 P1 atoms)
     # this cuts fr5 wall time from days to hours.
+    _early_stop_reason = [None]     # written by _fr_callback, read by log footer
     if verbose:
         print('-' * 122, flush=True)
     if fitreso_list:
@@ -4517,6 +4519,17 @@ def fitreso_scan(
                            hkls, AB_xyz, active, snr,
                            ref_h['cell'], ref_h['cell'], 'xyz', rmsd)
 
+        # Early-stop machinery (default: scan_all_fr=False).  When the
+        # combined `score` column has risen for 2 consecutive fr-rows
+        # relative to the running argmin, stop the progressive fit — we've
+        # already passed the score minimum and further fine-fitreso rows
+        # take much longer while adding no value.  `scan_all_fr=True`
+        # disables this and runs the full 8-row fr schedule (used by the
+        # test gamut for reference).
+        class _EarlyStop(Exception):
+            pass
+        _stop_reason = _early_stop_reason
+
         def _fr_callback(iter_i, nhkls, n_canon, rmsd,
                          hkls_now, AB_xyz, active, snr):
             t_cum = time.time() - t_fit0
@@ -4532,27 +4545,61 @@ def fitreso_scan(
                 _save_fr(thr, hkls_now, AB_xyz, active, snr, rmsd, t_cum)
                 fr_done.add(thr)
 
-        bend_fit_progressive(
-            mov_pdb, ref_pdb,
-            fitreso_start=20.0, fitreso_end=fr_min,
-            drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
-            outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel, bound_by_obs=bound_by_obs, pnn_mode=pnn_mode,
-            verbose=False,
-            iter_callback=_fr_callback,
-            precomputed_origin=precomputed_origin,
-            iteration_schedule=schedule,
-        )
+            # Early-stop check.  Runs after each fr-row is saved; needs at
+            # least 3 fr-rows before it can trigger (need a baseline + 2
+            # worse-than-baseline in a row).
+            if scan_all_fr:
+                return
+            fr_scored = [r for r in _log_rows
+                         if r['label'].startswith('fr')
+                         and r.get('S') is not None]
+            if len(fr_scored) < 3:
+                return
+            best_S = min(r['S'] for r in fr_scored)
+            tol    = max(1e-4, 0.01 * abs(best_S))     # 1% relative tolerance
+            # Count consecutive tail rows worse than best (beyond tol).
+            n_worse = 0
+            for r in reversed(fr_scored):
+                if r['S'] > best_S + tol:
+                    n_worse += 1
+                else:
+                    break
+            if n_worse >= 2:
+                _stop_reason[0] = (
+                    f"score rose above argmin {best_S:.3f} for {n_worse} "
+                    f"consecutive rows — skipping fr-rows finer than "
+                    f"{fr_scored[-1]['label']}")
+                raise _EarlyStop()
 
-        # od_margin stopped us before reaching some thresholds → snapshot
-        # those with the final iter's state (the deepest fit we got, same as
-        # what a separate fitreso_end=thr call would produce under the same
-        # OD stop).
-        for thr in fr_thresholds_desc:
-            if thr in fr_done:
-                continue
-            if final_state[0] is not None:
-                _save_fr(thr, *final_state[0])
-                fr_done.add(thr)
+        try:
+            bend_fit_progressive(
+                mov_pdb, ref_pdb,
+                fitreso_start=20.0, fitreso_end=fr_min,
+                drop_snr=drop_snr, batch_hkls=batch_hkls, od_margin=od_margin,
+                outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel, bound_by_obs=bound_by_obs, pnn_mode=pnn_mode,
+                verbose=False,
+                iter_callback=_fr_callback,
+                precomputed_origin=precomputed_origin,
+                iteration_schedule=schedule,
+            )
+        except _EarlyStop:
+            if verbose:
+                print(f'  early-stop: {_stop_reason[0]}', flush=True)
+
+        # od_margin (or early-stop) stopped us before reaching some
+        # thresholds → for the OD-stop case, snapshot those with the final
+        # iter's state (the deepest fit we got, same as what a separate
+        # fitreso_end=thr call would produce under the same OD stop).
+        # For early-stop, DO NOT snapshot — the whole point is those rows
+        # aren't worth computing, and filling them with the deepest state
+        # would just clone the argmin row's fit under a lie of a label.
+        if _stop_reason[0] is None:
+            for thr in fr_thresholds_desc:
+                if thr in fr_done:
+                    continue
+                if final_state[0] is not None:
+                    _save_fr(thr, *final_state[0])
+                    fr_done.add(thr)
 
     # ── Section 4: best — parabola fit of Rbent vs 1/d², re-run at vertex ────
     # Across all systems, Rbent has a clear U-shape vs fitreso: dropping with
@@ -4774,6 +4821,9 @@ def fitreso_scan(
                      f"{r['peak_dist']:>5.2f}Å  "
                      f"{pab_s:>9}  {r['t']:>4.0f}s\n")
 
+        if _early_stop_reason[0] is not None:
+            fh.write(f"\n# early-stop: {_early_stop_reason[0]}\n")
+
         # ── Alternative d_opt pick from argmin(score) across fr-rows ──────
         fr_score_rows = [r for r in _log_rows
                          if r['label'].startswith('fr') and r.get('S') is not None]
@@ -4785,6 +4835,42 @@ def fitreso_scan(
                      f"RMSD={best_score['rmsd']:.3f}Å, "
                      f"dipole={best_score.get('dipole') or 0.0:+.3f}, "
                      f"bondZ={(best_score['geom']['bond_rmsz'] if best_score.get('geom') else 0.0):.2f})\n")
+
+            # Replay early-stop rule over the fr rows so debug/full runs
+            # still show where the (default) early-stop would have fired
+            # and which row it would have picked as d_opt.  Same rule as
+            # the live callback: after each row, if the *last 2* rows are
+            # worse than the current running min by >1% relative, stop.
+            _run_best_S   = float('inf')
+            _run_best_row = None
+            for _i, _r in enumerate(fr_score_rows):
+                _tol = max(1e-4, 0.01 * abs(_run_best_S)
+                                if _run_best_S != float('inf') else 1e-4)
+                if _r['S'] < _run_best_S - _tol:
+                    _run_best_S = _r['S']
+                    _run_best_row = _r
+                _seen = fr_score_rows[:_i+1]
+                if len(_seen) >= 3:
+                    _n_worse = 0
+                    for _rt in reversed(_seen):
+                        if _rt['S'] > _run_best_S + _tol:
+                            _n_worse += 1
+                        else:
+                            break
+                    if _n_worse >= 2:
+                        _same = (_run_best_row['label'] == best_score['label'])
+                        _agree = ' (same as full-scan argmin)' if _same else \
+                                 f' (full-scan argmin was {best_score["label"]})'
+                        fh.write(f"# early-stop would have fired at "
+                                 f"{_r['label']} — picked "
+                                 f"{_run_best_row['label']} score="
+                                 f"{_run_best_S:.3f}{_agree}\n")
+                        break
+            else:
+                fh.write(f"# early-stop would NOT have fired — every row "
+                         f"stayed within 1% of the running argmin "
+                         f"({best_score['label']} score="
+                         f"{best_score['S']:.3f})\n")
 
         if _best_meta is not None:
             fr_used_str = ', '.join(f'fr{int(d) if d == int(d) else d}'

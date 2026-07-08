@@ -205,7 +205,7 @@ foreach spec ( \
 
     echo ""
     echo "==> [`printf '%2d' $i`/11] $label  ($sys $movp -> $refp, fill_asu=$fill, subtract=$sub)"
-    ( cd $sys && rm -rf $scan && srun -c $NCPUS --job-name=$label ccp4-python -c "import sys; sys.path.insert(0,'..'); from bendfinder import fitreso_scan; fitreso_scan(mov_pdb='$movp', ref_pdb='$refp', mov_mtz='$movm', ref_mtz='$refm', scan_dir='$scan', run_refinement_flag=True, refine_cycles=5, fill_asu=$fill, subtract='$sub')" ) >& $log
+    ( cd $sys && rm -rf $scan && srun -c $NCPUS --job-name=$label ccp4-python -c "import sys; sys.path.insert(0,'..'); from bendfinder import fitreso_scan; fitreso_scan(mov_pdb='$movp', ref_pdb='$refp', mov_mtz='$movm', ref_mtz='$refm', scan_dir='$scan', run_refinement_flag=True, refine_cycles=5, fill_asu=$fill, subtract='$sub', scan_all_fr=True)" ) >& $log
 
     if (! -e $sys/$scan/scan_fitreso.log) then
         echo "    FAIL  $sys/$scan/scan_fitreso.log not written (see $log)"

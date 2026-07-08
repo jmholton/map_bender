@@ -1021,29 +1021,31 @@ a PASS/FAIL table with per-test metrics:
    loose-tol altindex; see "Cross-cell pairs" section above).
 11. Porin altalign + refmac on the R 3 2 :R output
 
-Each example writes to `<sys>/scan_test*/` (separate from the canonical
-`scan_fitreso/` reference runs).  Per-test logs land in
-`test_results_<timestamp>/`.  Script cd's up if invoked from inside
-`map_bender/`; exits 2 if the working area can't be found, exits 1 if
-any test fails.
+Each example writes to `<sys>/scan_fitreso/` (or
+`raddam/scan_fitreso_5kxl/` etc. for the raddam variants — the
+`$tag` suffix disambiguates within a shared system dir).  The runner
+`rm -rf`s the target subdir before each srun, so re-runs start
+clean.  Per-test logs land in `test_results_<timestamp>/`.  Script
+cd's up if invoked from inside `map_bender/`; exits 2 if the working
+area can't be found, exits 1 if any test fails.
 
 Run as `./run_all_tests.com` from the working area.
 
 ## Empirical results (fitreso scans)
 
-All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `bound_by_obs=True`, `pnn_mode='softpnna_kth'`, `batch_hkls=100`, `atom_sel='all'`).  **June 2026 refresh (ridge default)** — the two stacked regularizers active by default are the Tikhonov ridge (Wiener-filtered SVD bounded by the observed CA shift energy, [Field-bounded SVD ridge](#field-bounded-svd-ridge-bound_by_obstrue)) and the Holm step-down softPnna per-HKL weight ([SNR weighting](#snr-weighting-pnn--softpnna)) plus the RMSD-baseline best filter.  With the ridge active the fr5 row is no longer a catastrophe risk (lipox fr5 dropped from 230 Å pre-ridge to 0.591 Å); the **best** row remains the practical deliverable.
+All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_snr=0`, `bound_by_obs=True`, `pnn_mode='softpnna_kth'`, `batch_hkls=100`, `atom_sel='all'`, `scan_all_fr=True` for gamut reproducibility).  **July 2026 refresh** — same defaults as June 2026, plus the new dipole + combined-score columns (see [Combined d_opt score](#combined-d_opt-score) above) and the sign-fixed `_shift_mtz_origin`.  All 11 gamut tests PASS from raw inputs.
 
-| System | Space group | fr5 RMSD | fr5 Rbent | fr5 bondZ | best RMSD | best Rbent | best bondZ | d_opt | subtract |
-|--------|------------|----------|-----------|-----------|-----------|-----------|-----------|-------|----------|
-| Lyso 3aw6→3aw7 | P4₃2₁2 | 0.183 Å | 31.2% | 3.10 | 0.100 Å | 29.0% | 2.70 | 11.25 Å | ref |
-| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 0.247 Å | 39.1% | 3.82 | 0.192 Å | 37.9% | 3.16 | 15.45 Å | ref |
-| Raddam 5kxk→5kxl | P4₃2₁2 | 0.112 Å | 11.9% | 1.51 | 0.114 Å | 11.2% | 1.19 | 20 Å (clamped) | bent |
-| Raddam 5kxk→5kxm | P4₃2₁2 | 0.076 Å | 10.4% | 1.36 | 0.078 Å | 9.9%  | 1.20 | 17.21 Å | bent |
-| Raddam 5kxk→5kxn | P4₃2₁2 | 0.090 Å | 18.1% | 1.44 | 0.100 Å | 17.6% | 1.24 | 20 Å (clamped) | bent |
-| Myoglobin 1mbo→1a6m | P2₁ | 0.139 Å | 52.8% | 2.66 | 0.107 Å | 52.5% | 2.90 | 9.06 Å | ref |
-| Insulin 4fg3→4e7u | H3 | 0.920 Å | 62.5% | 21.60² | 0.944 Å | 63.4% | 19.39² | 8.15 Å | ref (`fill_asu=True`) |
-| Porin 3poq→3pou | H 3 2 | (altalign+R32:R; refmac R=0.46) | | | | | | | ref |
-| Lipox 9o4s→9o4t | P2₁ | 0.591 Å¹ | 54.4% | 7.80 | 0.323 Å | 52.7% | 6.97 | 16.03 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
+| System | Space group | fr5 RMSD | fr5 Rbent | fr5 bondZ | best RMSD | best Rbent | best bondZ | best dipole | best score | d_opt | subtract |
+|--------|------------|----------|-----------|-----------|-----------|-----------|-----------|-----------|-----------|-------|----------|
+| Lyso 3aw6→3aw7 | P4₃2₁2 | 0.183 Å | 31.2% | 3.10 | 0.100 Å | 29.0% | 2.70 | +0.141 | 0.455 | 11.25 Å | ref |
+| DHFR 1rx2→1rx1 | P2₁2₁2₁ | 0.247 Å | 39.1% | 3.82 | 0.192 Å | 37.9% | 3.16 | +0.133 | 0.572 | 15.42 Å | ref |
+| Raddam 5kxk→5kxl | P4₃2₁2 | 0.112 Å | 11.9% | 1.51 | 0.114 Å | 11.2% | 1.19 | +0.017 | 0.141 | 20 Å (clamped) | bent |
+| Raddam 5kxk→5kxm | P4₃2₁2 | 0.076 Å | 10.4% | 1.36 | 0.078 Å | 9.9%  | 1.20 | +0.099 | 0.167 | 17.21 Å | bent |
+| Raddam 5kxk→5kxn | P4₃2₁2 | 0.091 Å | 18.1% | 1.46 | 0.100 Å | 17.6% | 1.23 | −0.012 | 0.198 | 20 Å (clamped) | bent |
+| Myoglobin 1mbo→1a6m | P2₁ | 0.139 Å | 52.8% | 2.66 | 0.107 Å | 52.5% | 2.90 | +0.024 | 0.643 | 9.06 Å | ref |
+| Insulin 4fg3→4e7u | H3 | 0.925 Å | 62.5% | 21.58² | 1.014 Å | 63.2% | 19.99² | +0.000 | 1.683 | 8.15 Å | ref (`fill_asu=True`) |
+| Porin 3poq→3pou | H 3 2 | (altalign+R32:R; refmac R=0.46) | | | | | | | | | ref |
+| Lipox 9o4s→9o4t | P2₁ | 0.591 Å¹ | 54.4% | 7.80 | 0.323 Å | 52.7% | 6.97 | −0.037 | 0.858 | 16.03 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
 
 ¹ Pre-ridge lipox fr5 was 230 Å — the field ringed catastrophically
 outside the fit population.  With `bound_by_obs=True` (default) the
@@ -1065,15 +1067,25 @@ purely low-frequency.  Myoglobin and insulin gain nothing from the
 parabola (myoglobin's curve plateaus at fr8; insulin's T→R shift
 exceeds the smooth-PSDVF model so no fitreso choice helps).
 
-All "from-raw" runs in `<system>/scan_fitreso/` (June 2026 gamut,
+All "from-raw" runs in `<system>/scan_fitreso/` (July 2026 gamut,
 `fill_asu=True` propagated through refmac and altindex re-refinement,
 Tikhonov ridge (`bound_by_obs=True`) + softPnna_kth Pnn weighting +
-RMSD-baseline best filter active).  Self-test runs:
-`test_symm_all_sgs.py` 65/65 PASS (max violation 2.72e-13 Å);
-`magdoff/test_magdoff.py` Test 2 recovery 0.069/0.038 (constrained/
-unconstrained) — about 2× looser than the pre-Pnn reference because
-softPnna damps even synthetic-data HKLs at modest SNR, but still
-well within "PASS" envelope.
+RMSD-baseline best filter + sign-fixed `_shift_mtz_origin` active).
+Self-test runs: `test_symm_all_sgs.py` 65/65 PASS (max violation
+2.72e-13 Å); `magdoff/test_magdoff.py` Test 2 recovery 0.069/0.038
+(constrained/unconstrained) — about 2× looser than the pre-Pnn
+reference because softPnna damps even synthetic-data HKLs at modest
+SNR, but still well within "PASS" envelope.
+
+**Combined-score commentary** (added July 2026): the `best dipole`
+column shows σ²-weighted per-peak dipole content at the parabola-picked
+d_opt, and `best score` is `Rbent + 0.1·RMSD + 0.5·max(0,dipole) +
+0.05·max(0,bondZ−1)`.  For most systems `argmin(score)` over fr rows
+lands on the same d_opt as the RMSD-baseline parabola.  When they
+disagree, dipole is usually the tiebreaker — the score penalises the
+fine-fitreso ringing regime that Rbent alone doesn't capture.  Raddam
+5kxm's fr5 `dipole=+0.624` is the outlier in the gamut; the argmin
+score correctly picks fr20 (`score=0.142`) instead of anywhere finer.
 
 Rbent values are post-F-space (k+B) scaling (compute_riso F-LS).  See per-
 system README files in `lyso/`, `dhfr/`, `raddam/` for invocation details
@@ -1122,7 +1134,7 @@ Notes:
   displacement matches a genuine low-frequency shift between the two
   crystal forms; later iterations damp the same mode to ~1 Å as
   higher-order HKLs absorb part of the signal.
-- **Porin** end-to-end from raw inputs (`scan_test/`, May 2026): the
+- **Porin** end-to-end from raw inputs (`scan_fitreso/`, May 2026): the
   in-bendfinder altindex resolution (the basis-change enumeration in
   [`_get_altindex_ops`](#basis-change-altindex-enumeration-_get_altindex_ops))
   picks the obverse↔reverse 2-fold and re-refines the moving model.
