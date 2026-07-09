@@ -390,6 +390,46 @@ but it *mildly* degrades every axis simultaneously — the combined
 score is designed to catch that multi-axis drift where any single
 metric would call it a wash.
 
+### Early-stop (`scan_all_fr`, `early_stop_tol`, `early_stop_n`)
+
+The default `fitreso_scan(scan_all_fr=False)` monitors the `score`
+column and **stops the fr-row scan** once the combined score has
+risen for `early_stop_n` (default 2) consecutive rows past its
+running argmin, by more than `early_stop_tol` (default 0.01 =
+1% relative to `|score_min|`).  Saves the expensive fine-fitreso
+rows (fr8/fr7/fr6/fr5 can each take minutes for large cells) when
+the score has clearly bottomed out coarser.
+
+`run_all_tests.com` passes `scan_all_fr=True` to keep the gamut
+runs comprehensive.  Every log — including full-scan runs — carries
+a footer line
+
+    # early-stop would have fired at frN — picked frM score=X.XXX
+        (same as full-scan argmin) [tol=0.01, n=2]
+
+or, when the score never rises enough to trigger,
+
+    # early-stop would NOT have fired — every row stayed within
+      1% of the running argmin (frM score=X.XXX) [tol=0.01, n=2]
+
+so we can audit the early-stop rule against full-scan data without
+having to re-run.
+
+Both the tolerance and the consecutive-worse count are exposed as
+Python kwargs and CLI keys:
+
+```
+fitreso_scan(..., scan_all_fr=False,
+             early_stop_tol=0.01, early_stop_n=2)
+```
+CLI form: `scan_all_fr=true early_stop_tol=0.02 early_stop_n=3`.
+Empirical calibration (July 2026 gamut, `tol=0.01, n=2`): early-stop
+fires as expected on datasets with a real score minimum (e.g.
+JJD95 1-6-100kGy stops at fr12 after fr20 argmin, saving 5 fine
+rows); does NOT fire on "flat" datasets where every row is within
+1% of the min (8sf1: all 8 rows stay within a 0.796–0.812 band
+around argmin=fr15 score=0.792).
+
 ### Best d_opt parabola fit
 
 Across every example system the Rbent-vs-fitreso curve is a clear U: it

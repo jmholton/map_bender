@@ -28,6 +28,16 @@ Parameters:
     scan_dir=DIR      run full fitreso scan and write outputs to DIR
     subtract=ref      diff = bent − ref (default; positive peak = density in
                       bent absent from ref).  subtract=bent flips the sign.
+    scan_all_fr=false when False (default) the fitreso scan stops early once
+                      the combined `score` column has risen for early_stop_n
+                      consecutive rows past its running argmin (early_stop_tol
+                      relative tolerance).  scan_all_fr=true keeps all 8
+                      fr-rows (fr20..fr5) — reference behavior for the gamut.
+    early_stop_tol=0.01  early-stop relative tolerance around the running
+                      argmin score (default 1% = 0.01).  A row counts as
+                      "worse" only if `row.score > argmin.score * (1+tol)`.
+    early_stop_n=2    minimum consecutive worse rows to trigger early-stop
+                      (default 2 — one row's rise could be noise).
 
 Public API:
     from bendfinder import bend_fit, bend_apply_pdb, bend_apply_map
@@ -2957,6 +2967,9 @@ def _parse_args(argv):
         'sample_rate':    0.0,
         'scan_dir':       None,
         'subtract':       'ref',
+        'scan_all_fr':    False,
+        'early_stop_tol': 0.01,
+        'early_stop_n':   2,
     }
     for arg in argv:
         if arg.lower().endswith('.pdb'):
@@ -3018,14 +3031,23 @@ def _parse_args(argv):
                           f"{val!r}", file=sys.stderr)
                     sys.exit(2)
                 params['subtract'] = v
+            elif key in ('scan_all_fr', 'scan-all-fr'):
+                params['scan_all_fr'] = val.lower() not in ('false', '0', 'no')
+            elif key in ('early_stop_tol', 'early-stop-tol'):
+                params['early_stop_tol'] = float(val)
+            elif key in ('early_stop_n', 'early-stop-n'):
+                params['early_stop_n'] = int(val)
         elif arg in ('deltamaps', 'delta', 'nofit', 'run_refinement', 'refine',
-                     'fill_asu', 'fill-asu', '--fill-asu'):
+                     'fill_asu', 'fill-asu', '--fill-asu',
+                     'scan_all_fr', 'scan-all-fr', '--scan-all-fr'):
             if arg in ('deltamaps', 'delta'):
                 params['deltamaps'] = True
             elif arg in ('run_refinement', 'refine'):
                 params['run_refinement'] = True
             elif arg in ('fill_asu', 'fill-asu', '--fill-asu'):
                 params['fill_asu'] = True
+            elif arg in ('scan_all_fr', 'scan-all-fr', '--scan-all-fr'):
+                params['scan_all_fr'] = True
             # nofit: ignored — lstsq always fits
     # mapfile: tuple (mov, ref) if both maps given; bare path if one; None if none
     if map2 is not None:
@@ -3858,6 +3880,7 @@ def fitreso_scan(
     bound_by_obs=True, pnn_mode=None,
     preserve_mov_numbering=True,
     scan_all_fr=False,
+    early_stop_tol=0.01, early_stop_n=2,
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -4556,7 +4579,11 @@ def fitreso_scan(
             if len(fr_scored) < 3:
                 return
             best_S = min(r['S'] for r in fr_scored)
-            tol    = max(1e-4, 0.01 * abs(best_S))     # 1% relative tolerance
+            # Relative tolerance around the running argmin; rows within
+            # this fraction of the min don't count as "worse".  Default
+            # 1% (early_stop_tol=0.01) — tune coarser for looser
+            # stopping (0.02 = 2%), tighter for aggressive stopping.
+            tol    = max(1e-4, early_stop_tol * abs(best_S))
             # Count consecutive tail rows worse than best (beyond tol).
             n_worse = 0
             for r in reversed(fr_scored):
@@ -4564,7 +4591,7 @@ def fitreso_scan(
                     n_worse += 1
                 else:
                     break
-            if n_worse >= 2:
+            if n_worse >= early_stop_n:
                 _stop_reason[0] = (
                     f"score rose above argmin {best_S:.3f} for {n_worse} "
                     f"consecutive rows — skipping fr-rows finer than "
@@ -4844,33 +4871,35 @@ def fitreso_scan(
             _run_best_S   = float('inf')
             _run_best_row = None
             for _i, _r in enumerate(fr_score_rows):
-                _tol = max(1e-4, 0.01 * abs(_run_best_S)
+                _tol = max(1e-4, early_stop_tol * abs(_run_best_S)
                                 if _run_best_S != float('inf') else 1e-4)
                 if _r['S'] < _run_best_S - _tol:
                     _run_best_S = _r['S']
                     _run_best_row = _r
                 _seen = fr_score_rows[:_i+1]
-                if len(_seen) >= 3:
+                if len(_seen) >= early_stop_n + 1:
                     _n_worse = 0
                     for _rt in reversed(_seen):
                         if _rt['S'] > _run_best_S + _tol:
                             _n_worse += 1
                         else:
                             break
-                    if _n_worse >= 2:
+                    if _n_worse >= early_stop_n:
                         _same = (_run_best_row['label'] == best_score['label'])
                         _agree = ' (same as full-scan argmin)' if _same else \
                                  f' (full-scan argmin was {best_score["label"]})'
                         fh.write(f"# early-stop would have fired at "
                                  f"{_r['label']} — picked "
                                  f"{_run_best_row['label']} score="
-                                 f"{_run_best_S:.3f}{_agree}\n")
+                                 f"{_run_best_S:.3f}{_agree} "
+                                 f"[tol={early_stop_tol}, n={early_stop_n}]\n")
                         break
             else:
                 fh.write(f"# early-stop would NOT have fired — every row "
-                         f"stayed within 1% of the running argmin "
-                         f"({best_score['label']} score="
-                         f"{best_score['S']:.3f})\n")
+                         f"stayed within {100*early_stop_tol:g}% of the "
+                         f"running argmin ({best_score['label']} score="
+                         f"{best_score['S']:.3f}) "
+                         f"[tol={early_stop_tol}, n={early_stop_n}]\n")
 
         if _best_meta is not None:
             fr_used_str = ', '.join(f'fr{int(d) if d == int(d) else d}'
@@ -6331,7 +6360,10 @@ def main():
                      refine_cycles=p['refine_cycles'],
                      fill_asu=p['fill_asu'],
                      sample_rate=p['sample_rate'],
-                     subtract=p['subtract'])
+                     subtract=p['subtract'],
+                     scan_all_fr=p['scan_all_fr'],
+                     early_stop_tol=p['early_stop_tol'],
+                     early_stop_n=p['early_stop_n'])
         sys.exit(0)
 
     # ── Single-fit path: refinement (if requested) then altindex resolution ──
