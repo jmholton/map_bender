@@ -1208,3 +1208,67 @@ Notes:
   Mov's experimental Fobs is preserved end-to-end — no Fcalc
   substitution.  See [Cross-cell pairs](#cross-cell-pairs-resolve_altindex-cell-stretch--loose-tolerance-altindex)
   section above for the mechanism.
+
+## JJD95 aspartate decarboxylase dose series (out-of-repo)
+
+Data at `/home/jamesh/projects/map_bender/arwen/JJD95_dose_series_mtzs/`
+(not in git — too large for the repo).  5 dose points against the
+undamaged 30kGy: 1-6-100kGy, 1-9-100kGy, 160kGy, 260kGy, 440kGy.  All
+P 6₁ 2 2 with ~0.5-1% cell contractions vs 30kGy (30kGy cell
+71.00/71.00/216.13; refs 70.36-70.79/70.36-70.79/216.15-216.88), so
+`resolve_altindex` runs the cross-cell stretch + `altindex_refine`
+path on every entry.  Convention: mov=30kGy, ref=each higher dose,
+`subtract='bent'` (positive diff peaks = features appearing with
+dose, negative = features disappearing).
+
+**Input MTZs.**  Use the scalit-refined pairs, not the raw deposits
+or the FWT `.map` files:
+
+```
+mov: 30kGy_scaled_FREE_P6122_ref14.mtz  +  30kGy.pdb
+ref: <dose>_scaled_FREE_P6122_PHIC_scalit_ref1.{mtz,pdb}
+```
+
+Both mov and ref MTZs already carry FWT/PHWT + DELFWT/PHDELWT from
+scalit — `fitreso_scan` skips its own refmac (`run_refinement_flag`
+default False AND FWT is present) and the deposited refinement
+coefficients pass straight through.  Result: `scan_dir/ref.mtz` and
+`scan_dir/unbent.mtz` end-to-end carry FWT/DELFWT so Coot can
+display refmac-quality 2Fo-Fc and Fo-Fc for both the moving and
+reference structures alongside the bent map at every scan point.
+The `.map` input path skips refmac by design and produces F/PHI-only
+`ref.mtz`/`unbent.mtz` (no diff coefficients) — usable for the
+bend fit but not for standalone Coot diff-map display.
+
+**fill_asu required.**  The mov 30kGy MTZ is 96.6% SG-ASU complete
+(and refs 96.6-97.4%), below the 99% gate.  Cross-cell path re-refines
+the stretched mov inside `resolve_altindex`, which trips the gate.
+Pass `fill_asu=True`.
+
+**Full-fitreso results (July 2026, `scan_all_fr=True`, MTZ inputs):**
+
+| ref         | best RMSD | best Rbent | bondZ | dipole | score | d_opt          | early-stop |
+|-------------|-----------|------------|-------|--------|-------|----------------|------------|
+| 1-6-100kGy  | 0.092 Å   | 30.1%      | 1.62  | +0.005 | 0.344 | 20 Å (clamped) | fr12       |
+| 1-9-100kGy  | 0.107 Å   | 35.3%      | 1.67  | +0.015 | 0.404 | 20 Å (clamped) | fr12       |
+| 160kGy      | 0.115 Å   | 35.2%      | 1.55  | +0.000 | 0.391 | 20 Å (clamped) | fr12       |
+| 260kGy      | 0.151 Å   | 38.6%      | 2.04  | +0.000 | 0.453 | 6.78 Å         | fr12       |
+| 440kGy      | 0.098 Å   | 35.3%      | 1.62  | +0.000 | 0.393 | 6.00 Å (clamped) | fr12     |
+
+Every full-scan `argmin(score)` also lands at fr12 — the early-stop
+rule (`scan_all_fr=False`, default) picks the same row without
+running fr10/fr8/fr7/fr6.  260kGy and 440kGy do produce a real
+concave-up parabola vertex in the fine-fitreso band, so full-fitreso
+data pushes d_opt to 6-7 Å for those two; the argmin score still
+prefers fr20 for all 5, showing that beyond fr12 the field is
+mostly adding fine-scale detail that helps Rbent slightly but not
+enough to overcome bondZ + dipole penalties.
+
+Persistent A/5MET/SD(r) peak (+10 to +12σ) at every dose point is
+a sulfur that displaces between crystal forms rather than a
+radiolysis product — beyond what the smooth PSDVF can follow at
+this fitreso.  Outputs at `fitreso_scans_fullfr/<ref>/`.
+
+Launchers: `launch_fitreso_scans.sh` (default early-stop) and
+`launch_fitreso_scans_fullfr.sh` (full-fitreso, MTZ inputs,
+fill_asu=True).
