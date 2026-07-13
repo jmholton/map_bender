@@ -939,6 +939,72 @@ Insulin 4fg3→4e7u from raw, fill_fcalc=True:
 - bent.mtz at every scan point: 25,285 rows = full H 3 ASU at 1.23 Å.
 - Coot view: artifact-free.
 
+### sigmaA-weighted Fc fill (`fill_method='sigmaa'`)
+
+Principled alternative to the NaN-fill path.  See `SIGMAA_FC_FILL.md`
+for the method write-up; this section documents the wiring.
+
+`run_refinement(fill_asu=True, fill_method='sigmaa')` (CLI:
+`fill_method=sigmaa`; implies `fill_asu=true`) calls `_sigmaa_fill_mtz`
+instead of `_pad_mtz_to_full_asu`.  Pipeline:
+
+1. **Recompute Fc scaled to Fo** via `gemmi sfcalc --scale-to`.  Bulk
+   solvent + anisotropic scaling puts Fc on the observed amplitude
+   scale — this is the direct fix for the DHFR ~1/18-scale bug that
+   killed the raw `DensityCalculatorX` version (see "Why no longer
+   Fcalc values?" above).  Requires `gemmi` executable on PATH or
+   under `$CCP4/bin`; FP/SIGFP is auto-relabelled to F/SIGF into a
+   scratch copy first (sfcalc's `--scale-to` reads those labels by
+   default).
+2. **Per-shell σA / D / SigN / SigP on FREE==0** (falls back to all
+   working rows if the free set is degenerate).  Estimators (Read
+   1986, uncentered):
+   ```
+   σA   = Σ(Fo·Fc) / √(ΣFo² · ΣFc²)
+   D    = Σ(Fo·Fc) / ΣFc²
+   SigN = <Fo²>,   SigP = <Fc²>
+   ```
+3. **Fit `ln σA` (Luzzati, skip d > 5 Å — bulk-solvent-dominated) and
+   `ln SigN` (Wilson) linearly in s²**.  Both are ~Gaussian in real
+   space → linear in s².  Extrapolate past d_min → σA → 0 → D·Fc → 0:
+   the fill fades out on its own (self-limiting sharpening, no runaway
+   model features).  Per-shell σA/SigN inside the measured range use
+   the empirical shell values interpolated linearly; extrapolation
+   only uses the fit.
+4. **Fill missing rows** with FP = D·|Fc|, SIGFP = √((1-σA²)·SigN).
+   Present-row FP/SIGFP untouched — deposited Fobs is preserved.
+5. **Diagnostic columns** FC (F-type) + PHIC (P-type) emitted on
+   every SG-ASU row, holding the scaled Fc / phase from sfcalc.  D
+   is computed per-HKL as `σA · √(SigN)/|Fc|` so `D·|Fc|` reduces
+   exactly to `σA · √(SigN)` — the shell-average SigP fit only
+   controls σA/SigN, not the row-level fill magnitude.
+
+Selection:
+```
+fitreso_scan(..., fill_asu=True, fill_method='sigmaa')
+```
+CLI: `fill_method=sigmaa` (auto-sets `fill_asu=True`).  Default
+remains `fill_method='nan'` — the NaN-fill path is proven and
+scale-safe by construction (adds no Fobs population; refmac
+regenerates FWT for missing rows from its own model on the target
+scale).  `sigmaa` is the opt-in path when the caller wants filled
+FP/SIGFP columns on the deposited scale (e.g. for downstream tools
+that read FP directly, or for σA-weighted map building outside
+refmac).
+
+Threaded through `resolve_altindex`, `_finish_after_stretch_only`,
+and every `run_refinement` call site in `fitreso_scan`.  MTZ history
+records the fitted σA + Wilson slopes.
+
+**Standing constraint** (from prior sessions): *never switch to
+Fcalc when the user provided Fobs.*  The sigmaA fill is compatible
+with this — only *missing* rows get D·|Fc|; deposited Fobs is
+untouched.  D·Fc for missing rows is on the observed scale (via
+`--scale-to`), and its uncertainty √((1-σA²)·SigN) reflects genuine
+model-vs-truth deviation, so refmac's LS target treats it as a soft
+constraint that vanishes at high resolution where extrapolated σA
+→ 0.
+
 ## PSDVF.mtz amplitude units
 
 The `dX`, `dY`, `dZ` columns store the **amplitude of the fitted shift

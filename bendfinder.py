@@ -2964,6 +2964,7 @@ def _parse_args(argv):
         'run_refinement': False,
         'refine_cycles':  5,
         'fill_asu':     False,
+        'fill_method':  'nan',
         'sample_rate':    0.0,
         'scan_dir':       None,
         'subtract':       'ref',
@@ -3020,6 +3021,16 @@ def _parse_args(argv):
                 params['refine_cycles'] = int(val)
             elif key in ('fill_asu', 'fill-asu'):
                 params['fill_asu'] = val.lower() not in ('false', '0', 'no')
+            elif key in ('fill_method', 'fill-method'):
+                v = val.strip().lower()
+                if v not in ('nan', 'sigmaa'):
+                    print(f"ERROR: fill_method must be 'nan' or 'sigmaa', "
+                          f"got {val!r}", file=sys.stderr)
+                    sys.exit(2)
+                params['fill_method'] = v
+                # Choosing sigmaa implies opting into the fill itself.
+                if v == 'sigmaa':
+                    params['fill_asu'] = True
             elif key == 'sample_rate':
                 params['sample_rate'] = float(val)
             elif key == 'scan_dir':
@@ -3476,6 +3487,463 @@ def _pad_mtz_to_full_asu(in_mtz_path, out_mtz_path, d_min=None):
     return out_mtz_path
 
 
+# ─── sigmaA-weighted Fc fill (SIGMAA_FC_FILL.md) ──────────────────────────────
+# Principled version of `_pad_mtz_to_full_asu`.  The NaN-fill path leaves FP
+# empty and relies on refmac to regenerate FWT for missing rows from its
+# model.  This path instead:
+#
+#   1. Recomputes Fc via `gemmi sfcalc --scale-to` — bulk solvent + aniso
+#      scaling puts Fc on the Fo amplitude scale (fixes the DHFR ~1/18 raw
+#      DensityCalculatorX bug documented in CLAUDE.md).
+#   2. Estimates per-shell σA / D / SigN / SigP on FREE==0 (held-out).
+#   3. Fits ln σA (Luzzati) and ln SigN (Wilson) linearly in s²; extrapolates
+#      past d_min so extrapolated σA → 0 and D·Fc → 0 (self-limiting fill).
+#   4. Adds rows for every missing SG-ASU HKL with FP = D·|Fc|,
+#      SIGFP = √((1-σA²)·SigN).  Present rows leave Fo/SIGFP untouched.
+#   5. Emits diagnostic FC / PHIC columns on every SG-ASU HKL (scaled Fc + phi
+#      from sfcalc) so downstream can build maps directly.
+#
+# The blend F_best = (Fo/σo² + D·Fc/σD²) / (1/σo² + 1/σD²) is deferred — refmac
+# ingests the filled MTZ and produces its own FWT/PHWT downstream.
+
+def _relabel_mtz_fp_to_f(in_mtz_path, out_mtz_path):
+    """Copy MTZ with FP/SIGFP (or FOBS/SIGFOBS) relabeled to F/SIGF.
+
+    `gemmi sfcalc --scale-to` defaults to reading F/SIGF; deposited MTZs
+    typically carry FP/SIGFP.  This helper is a no-op copy when F/SIGF
+    already exist.
+    """
+    import shutil as _sh
+    _sh.copyfile(in_mtz_path, out_mtz_path)
+    mtz = gemmi.read_mtz_file(out_mtz_path)
+    lbls = {c.label for c in mtz.columns}
+    if 'F' in lbls and 'SIGF' in lbls:
+        return out_mtz_path
+    for c in mtz.columns:
+        if c.label in ('FP', 'FOBS') and 'F' not in lbls:
+            c.label = 'F'
+        elif c.label in ('SIGFP', 'SIGFOBS') and 'SIGF' not in lbls:
+            c.label = 'SIGF'
+    mtz.write_to_file(out_mtz_path)
+    return out_mtz_path
+
+
+def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
+                        verbose=True):
+    """Recompute Fc with bulk solvent + anisotropic scaling to ref_mtz's F.
+
+    Wraps `gemmi sfcalc --dmin=<d> --scale-to=<mtz>:F --to-mtz=<out>`.
+    Result MTZ has columns FC / PHIC on the ref-Fo amplitude scale, so
+    D·Fc is directly usable to fill missing rows without introducing a
+    second Fobs population (the ~1/18-scale bug that killed the raw
+    DensityCalculatorX approach on DHFR 1rx1/1rx2).
+
+    ref_mtz_path is relabeled to F/SIGF into a scratch file first if it
+    carries FP/SIGFP or FOBS/SIGFOBS — `--scale-to` doesn't accept
+    arbitrary labels through its default parser.
+    """
+    import shutil as _sh
+    gemmi_exe = (_sh.which('gemmi')
+                 or os.path.join(os.environ.get('CCP4', ''), 'bin', 'gemmi'))
+    if not (gemmi_exe and os.path.exists(gemmi_exe)):
+        raise RuntimeError('gemmi executable not found on PATH or $CCP4/bin')
+
+    mtz = gemmi.read_mtz_file(ref_mtz_path)
+    cols = {c.label for c in mtz.columns}
+    if not any(l in cols for l in ('F', 'FP', 'FOBS')):
+        raise RuntimeError(f'{ref_mtz_path}: no F/FP/FOBS amplitude column')
+    if d_min is None:
+        d_min = float(mtz.resolution_high())
+
+    # Relabel to F/SIGF (gemmi sfcalc --scale-to default labels) if needed.
+    scratch = out_fc_mtz + '.scale_input.mtz'
+    _relabel_mtz_fp_to_f(ref_mtz_path, scratch)
+
+    cmd = [gemmi_exe, 'sfcalc', f'--dmin={d_min:.4f}',
+           f'--scale-to={scratch}:F',
+           f'--to-mtz={out_fc_mtz}', pdb_path]
+    if verbose:
+        print(f'  gemmi sfcalc --scale-to → {os.path.basename(out_fc_mtz)}',
+              flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    log_path = out_fc_mtz + '.sfcalc.log'
+    with open(log_path, 'w') as _lf:
+        _lf.write(f'# cmd: {" ".join(cmd)}\n')
+        _lf.write(f'# returncode: {r.returncode}\n\n--- stdout ---\n')
+        _lf.write(r.stdout or '')
+        _lf.write('\n--- stderr ---\n')
+        _lf.write(r.stderr or '')
+    try:
+        os.remove(scratch)
+    except OSError:
+        pass
+    if r.returncode != 0 or not os.path.exists(out_fc_mtz):
+        raise RuntimeError(
+            f'gemmi sfcalc failed (rc={r.returncode}); see {log_path}')
+    return out_fc_mtz
+
+
+def _sigmaa_shell_stats(fo, fc, s2, free_flag, n_shells=20, use_free=True,
+                        min_per_shell=10):
+    """Per-shell σA, D, SigN, SigP estimators on FREE==0 (held-out).
+
+    Estimators (Read 1986, per-shell, uncentered):
+        σA    = Σ(Fo·Fc) / √(ΣFo² · ΣFc²)          (amplitude correlation)
+        D     = Σ(Fo·Fc) / ΣFc²                    (LS slope; the fill factor)
+        SigN  = <Fo²>                              (Wilson variance of Fo)
+        SigP  = <Fc²>                              (variance of Fc)
+
+    Only finite-Fo, finite-Fc, Fc>0 rows enter.  When `use_free` and a FreeR
+    column is provided, restricts to `free_flag == 0` (the held-out set) —
+    working-set σA is overfit-optimistic (8sf1: 0.958 free vs 0.971 working).
+    Falls back to all working rows if the free subset is too small.
+
+    Returns dict with s²_mid (Å⁻²), per-shell σA/D/SigN/SigP arrays (NaN in
+    under-populated shells), and the number of reflections used.
+    """
+    finite = np.isfinite(fo) & np.isfinite(fc) & (fc > 0)
+    mask = finite.copy()
+    n_used_free = 0
+    if use_free and free_flag is not None:
+        free_mask = mask & (free_flag == 0)
+        if free_mask.sum() >= 4 * n_shells * min_per_shell:
+            mask = free_mask
+            n_used_free = int(free_mask.sum())
+    fo_ = fo[mask]; fc_ = fc[mask]; s2_ = s2[mask]
+
+    edges = np.linspace(s2_.min(), s2_.max(), n_shells + 1)
+    mid = 0.5 * (edges[:-1] + edges[1:])
+    sigmaA = np.full(n_shells, np.nan)
+    D      = np.full(n_shells, np.nan)
+    SigN   = np.full(n_shells, np.nan)
+    SigP   = np.full(n_shells, np.nan)
+    n_per  = np.zeros(n_shells, dtype=int)
+    for i in range(n_shells):
+        m = (s2_ >= edges[i]) & (s2_ < edges[i+1])
+        if i == n_shells - 1:
+            m = (s2_ >= edges[i]) & (s2_ <= edges[i+1])
+        n_per[i] = int(m.sum())
+        if n_per[i] < min_per_shell:
+            continue
+        Fo_i = fo_[m]; Fc_i = fc_[m]
+        S_ffc  = float(np.sum(Fo_i * Fc_i))
+        S_fofo = float(np.sum(Fo_i ** 2))
+        S_fcfc = float(np.sum(Fc_i ** 2))
+        if S_fofo > 0 and S_fcfc > 0:
+            sigmaA[i] = S_ffc / np.sqrt(S_fofo * S_fcfc)
+            D[i]      = S_ffc / S_fcfc
+            SigN[i]   = S_fofo / n_per[i]
+            SigP[i]   = S_fcfc / n_per[i]
+    return dict(edges=edges, s2_mid=mid, sigmaA=sigmaA, D=D,
+                SigN=SigN, SigP=SigP, n_per=n_per,
+                n_used_free=n_used_free, n_used=int(mask.sum()))
+
+
+def _fit_sigmaa_wilson(stats, luzzati_d_max=5.0):
+    """Fit ln σA (Luzzati) and ln SigN (Wilson) linearly in s².
+
+    Both falloffs are ~Gaussian in real space → linear in s².  Fit on shells
+    with valid stats; skip d > `luzzati_d_max` Å for Luzzati (bulk-solvent
+    dominated at low res per Read).  Returns (sigmaA_fit, wilson_fit) where
+    each is (intercept, slope) in {ln σA = intercept + slope·s²} form; slope
+    is negative for Gaussian falloff.  None entries when the fit can't be
+    made (too few valid shells).
+    """
+    ok = np.isfinite(stats['sigmaA']) & (stats['sigmaA'] > 0)
+    s2 = stats['s2_mid']
+
+    sigmaA_fit = None
+    ok_luz = ok & (s2 > 1.0 / (luzzati_d_max ** 2))
+    if ok_luz.sum() >= 3:
+        x = s2[ok_luz]
+        y = np.log(stats['sigmaA'][ok_luz])
+        A = np.vstack([np.ones_like(x), x]).T
+        coefs, *_ = np.linalg.lstsq(A, y, rcond=None)
+        sigmaA_fit = (float(coefs[0]), float(coefs[1]))
+
+    wilson_fit = None
+    ok_w = ok & np.isfinite(stats['SigN']) & (stats['SigN'] > 0)
+    if ok_w.sum() >= 3:
+        x = s2[ok_w]
+        y = np.log(stats['SigN'][ok_w])
+        A = np.vstack([np.ones_like(x), x]).T
+        coefs, *_ = np.linalg.lstsq(A, y, rcond=None)
+        wilson_fit = (float(coefs[0]), float(coefs[1]))
+
+    return sigmaA_fit, wilson_fit
+
+
+def _eval_sigmaa_wilson(sigmaA_fit, wilson_fit, s2, sigmaA_stats=None,
+                       clip_lo=1e-3, clip_hi=1.0):
+    """Evaluate σA(s²) and SigN(s²) at arbitrary s² values.
+
+    Uses the fitted Luzzati/Wilson lines; σA clipped to [clip_lo, clip_hi].
+    D = σA · √(SigN / SigP) — SigP is known everywhere via Fc, so we return
+    (σA, SigN) here and let the caller multiply by √(SigN/SigP) row-wise.
+
+    If `sigmaA_stats` is provided and s² lies inside its measured range,
+    linearly interpolate the empirical per-shell σA/SigN instead of the fit
+    — cheaper than extrapolating.  Extrapolation always uses the fit.
+    """
+    if sigmaA_fit is None or wilson_fit is None:
+        raise RuntimeError('sigmaA / Wilson fit missing — cannot evaluate')
+    a_sa, b_sa = sigmaA_fit
+    a_w,  b_w  = wilson_fit
+    sigmaA = np.exp(a_sa + b_sa * s2)
+    SigN   = np.exp(a_w  + b_w  * s2)
+    if sigmaA_stats is not None:
+        smid = sigmaA_stats['s2_mid']
+        ok = (np.isfinite(sigmaA_stats['sigmaA'])
+              & (sigmaA_stats['sigmaA'] > 0))
+        if ok.sum() >= 2:
+            x = smid[ok]
+            in_range = (s2 >= x.min()) & (s2 <= x.max())
+            sigmaA_int = np.interp(s2, x, sigmaA_stats['sigmaA'][ok])
+            SigN_int   = np.interp(s2, x, sigmaA_stats['SigN'][ok])
+            sigmaA = np.where(in_range, sigmaA_int, sigmaA)
+            SigN   = np.where(in_range, SigN_int,   SigN)
+    sigmaA = np.clip(sigmaA, clip_lo, clip_hi)
+    SigN = np.maximum(SigN, 0.0)
+    return sigmaA, SigN
+
+
+def _sigmaa_fill_mtz(in_mtz_path, pdb_path, out_mtz_path, d_min=None,
+                    n_shells=20, luzzati_d_max=5.0, use_free=True,
+                    verbose=True, workdir=None):
+    """Fill missing SG-ASU rows with sigmaA-weighted D·|Fc| (Fo-scaled).
+
+    See SIGMAA_FC_FILL.md for method + rationale.  Pipeline:
+      1. `gemmi sfcalc --scale-to` → Fo-scaled Fc/PHIC for all SG-ASU HKLs.
+      2. Match input Fo ↔ Fc per canonical HKL; per-shell σA/D/SigN/SigP
+         on FREE==0 (held-out; falls back to working set if free is empty
+         or degenerate).
+      3. Fit ln σA (Luzzati, skip d > `luzzati_d_max` Å) + ln SigN (Wilson)
+         linearly in s².  Extrapolate past input d_min → σA → 0 → self-
+         limiting fill.
+      4. Missing HKLs get FP = D·|Fc|, SIGFP = √((1-σA²)·SigN),
+         FreeR = work-set default; other columns NaN.  Present rows leave
+         Fo/SIGFP untouched.
+      5. Add diagnostic columns FC (type F) + PHIC (type P) on every row,
+         holding the scaled Fc / phi from sfcalc.
+
+    Systematic absences are stripped from the input rows (they're zero by
+    symmetry).  Same convention as `_pad_mtz_to_full_asu`.
+
+    Requires:
+      - `gemmi` executable (for sfcalc --scale-to).
+      - Input MTZ with F/FP/FOBS amplitude column.
+      - Cell-consistent pdb_path (same cell as input MTZ; caller stretches
+        beforehand if needed).
+    """
+    if workdir is None:
+        workdir = os.path.dirname(os.path.abspath(out_mtz_path)) or '.'
+    os.makedirs(workdir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(out_mtz_path))[0]
+
+    mtz_in = gemmi.read_mtz_file(in_mtz_path)
+    cell = mtz_in.cell
+    sg   = mtz_in.spacegroup
+    data = np.array(mtz_in.array, copy=True)
+    lbls = mtz_in.column_labels()
+    types = [c.type for c in mtz_in.columns]
+    if d_min is None:
+        d_min = float(mtz_in.resolution_high())
+
+    F_lbl    = next((l for l in ('FP', 'F', 'FOBS')          if l in lbls), None)
+    SIG_lbl  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in lbls), None)
+    FREE_lbl = _pick_free_column(mtz_in)
+    if F_lbl is None:
+        raise RuntimeError(f'{in_mtz_path}: no F/FP/FOBS column — cannot fill')
+
+    # ── Recompute Fo-scaled Fc via gemmi sfcalc --scale-to.
+    fc_mtz_path = os.path.join(workdir, f'{stem}_fc_scaled.mtz')
+    _recompute_fc_scaled(pdb_path, in_mtz_path, fc_mtz_path,
+                        d_min=d_min, verbose=verbose)
+    mtz_fc = gemmi.read_mtz_file(fc_mtz_path)
+    fc_data = np.array(mtz_fc.array)
+    fc_lbls = mtz_fc.column_labels()
+    if 'FC' not in fc_lbls or 'PHIC' not in fc_lbls:
+        raise RuntimeError(f'{fc_mtz_path}: expected FC/PHIC columns from '
+                           f'sfcalc, got {sorted(fc_lbls)}')
+    fc_hkls  = fc_data[:, :3].astype(int)
+    fc_F     = fc_data[:, fc_lbls.index('FC')]
+    fc_PHI   = fc_data[:, fc_lbls.index('PHIC')]
+
+    # ── Canonicalize both HKL sets for matching.
+    ops = sg.operations()
+    R_ints = [np.round(R).astype(int)
+              for R, _ in get_proper_symops(sg.xhm())] or [np.eye(3, dtype=int)]
+
+    # Strip systematic absences from input.
+    in_hkls_raw = data[:, :3].astype(int)
+    keep_mask = np.array([not ops.is_systematically_absent(tuple(int(x) for x in h))
+                          for h in in_hkls_raw])
+    n_stripped = int((~keep_mask).sum())
+    if n_stripped:
+        data = data[keep_mask]
+    in_hkls = data[:, :3].astype(int)
+    in_canon = np.array([_canonical_hkl(tuple(int(x) for x in h), R_ints)
+                         for h in in_hkls])
+    in_canon_set = {tuple(int(x) for x in h) for h in in_canon}
+
+    fc_canon = np.array([_canonical_hkl(tuple(int(x) for x in h), R_ints)
+                         for h in fc_hkls])
+    fc_canon_to_idx = {tuple(int(x) for x in h): i
+                       for i, h in enumerate(fc_canon)}
+
+    # ── Match Fc onto input row order.  Any input row whose HKL doesn't
+    # appear in the sfcalc output (should not happen at same d_min, but
+    # guard anyway) gets Fc/PHIC = NaN and drops out of shell stats.
+    n_in = data.shape[0]
+    Fc_at_in  = np.full(n_in, np.nan)
+    PHI_at_in = np.full(n_in, np.nan)
+    for i, h in enumerate(in_canon):
+        idx = fc_canon_to_idx.get(tuple(int(x) for x in h))
+        if idx is not None:
+            Fc_at_in[i]  = fc_F[idx]
+            PHI_at_in[i] = fc_PHI[idx]
+
+    # ── Per-shell σA/D/SigN/SigP on FREE==0.  s² = 1/d² for each row.
+    Fo   = data[:, lbls.index(F_lbl)]
+    s2_in = np.array([1.0 / cell.calculate_d(tuple(int(x) for x in h)) ** 2
+                      for h in in_hkls])
+    free_in = (data[:, lbls.index(FREE_lbl)].astype(int)
+               if FREE_lbl is not None else None)
+    stats = _sigmaa_shell_stats(Fo, Fc_at_in, s2_in, free_in,
+                                n_shells=n_shells, use_free=use_free)
+    sigmaA_fit, wilson_fit = _fit_sigmaa_wilson(stats,
+                                                luzzati_d_max=luzzati_d_max)
+    if sigmaA_fit is None or wilson_fit is None:
+        raise RuntimeError('sigmaA/Wilson fit failed — too few valid shells.  '
+                           'Ensure input MTZ has enough finite Fo across '
+                           f'the resolution range (n_shells={n_shells}, '
+                           f'n_finite={int(np.isfinite(Fo).sum())}).')
+
+    if verbose:
+        n_valid = int((np.isfinite(stats['sigmaA'])
+                       & (stats['sigmaA'] > 0)).sum())
+        src = ('FREE==0' if stats['n_used_free']
+               else 'all working rows (free set empty/degenerate)')
+        a_sa, b_sa = sigmaA_fit
+        a_w,  b_w  = wilson_fit
+        rms_coord = float(np.sqrt(max(0.0, -b_sa) / (2.0 * np.pi ** 2)))
+        print(f'  sigmaA fit ({n_valid}/{n_shells} shells on {src}): '
+              f'ln σA = {a_sa:+.3f} + {b_sa:+.3f}·s²  '
+              f'(rms coord err ≈ {rms_coord:.2f} Å)', flush=True)
+        print(f'  Wilson fit: ln SigN = {a_w:+.3f} + {b_w:+.3f}·s²',
+              flush=True)
+
+    # ── Enumerate SG-ASU HKLs at d_min; identify missing.
+    cell_tuple = (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma)
+    asu_hkls = _enumerate_sg_asu_hkls(cell_tuple, sg, d_min)
+    missing = [tuple(int(x) for x in h) for h in asu_hkls
+               if tuple(int(x) for x in h) not in in_canon_set]
+
+    # Work-set default free flag.
+    free_default = None
+    if FREE_lbl:
+        col = data[:, lbls.index(FREE_lbl)]
+        finite = col[np.isfinite(col)].astype(int)
+        work_vals = finite[finite > 0]
+        if work_vals.size:
+            vals, counts = np.unique(work_vals, return_counts=True)
+            free_default = np.float32(int(vals[counts.argmax()]))
+        else:
+            free_default = np.float32(1)
+
+    # ── Build filled rows.  Evaluate σA/SigN per HKL, look up Fc/PHIC from
+    # the sfcalc output, compute FP = D·|Fc|, SIGFP = √((1-σA²)·SigN).
+    if missing:
+        miss_hkl = np.array(missing, dtype=np.int32)
+        miss_Fc   = np.full(len(missing), np.nan, dtype=np.float32)
+        miss_PHIC = np.full(len(missing), np.nan, dtype=np.float32)
+        for i, h in enumerate(missing):
+            idx = fc_canon_to_idx.get(h)
+            if idx is not None:
+                miss_Fc[i]   = fc_F[idx]
+                miss_PHIC[i] = fc_PHI[idx]
+
+        s2_miss = np.array([1.0 / cell.calculate_d(h) ** 2 for h in missing])
+        sigmaA_miss, SigN_miss = _eval_sigmaa_wilson(
+            sigmaA_fit, wilson_fit, s2_miss, sigmaA_stats=stats)
+        # D = σA · √(SigN/SigP) with SigP = |Fc|² locally (per-HKL, not shell
+        # average) — SigP is known everywhere from Fc so we use it directly
+        # rather than the shell-average SigP fit.  This makes D·Fc exactly
+        # σA·√(SigN)·sign(Fc), independent of the SigP shell binning.
+        with np.errstate(invalid='ignore', divide='ignore'):
+            D_miss = np.where(miss_Fc > 0,
+                              sigmaA_miss * np.sqrt(SigN_miss) / miss_Fc,
+                              0.0)
+        Fp_miss  = D_miss * miss_Fc      # = σA · √(SigN) · sign(Fc)
+        sigFp_miss = np.sqrt(np.maximum(1.0 - sigmaA_miss ** 2, 0.0)
+                             * np.maximum(SigN_miss, 0.0))
+    else:
+        miss_hkl = np.zeros((0, 3), dtype=np.int32)
+        Fp_miss = np.zeros(0, dtype=np.float32)
+        sigFp_miss = np.zeros(0, dtype=np.float32)
+        miss_Fc = np.zeros(0, dtype=np.float32)
+        miss_PHIC = np.zeros(0, dtype=np.float32)
+
+    # ── Assemble new rows in the existing column order + append 2 diagnostic
+    # columns (FC as F-type, PHIC as P-type) if not already present.
+    new_col_labels  = ['FC', 'PHIC']
+    new_col_types   = ['F', 'P']
+    add_labels = [(l, t) for l, t in zip(new_col_labels, new_col_types)
+                  if l not in lbls]
+
+    n_extra = len(add_labels)
+    ncol_out = data.shape[1] + n_extra
+    n_present = data.shape[0]
+    n_miss    = miss_hkl.shape[0]
+    out_data = np.full((n_present + n_miss, ncol_out), np.nan,
+                       dtype=np.float32)
+
+    # Copy present rows (input columns), then add present-row FC/PHIC.
+    out_data[:n_present, :data.shape[1]] = data
+    col_out_of = {lbl: i for i, lbl in enumerate(lbls)}
+    for j, (lbl, _t) in enumerate(add_labels):
+        col_out_of[lbl] = data.shape[1] + j
+    out_data[:n_present, col_out_of['FC']]   = Fc_at_in.astype(np.float32)
+    out_data[:n_present, col_out_of['PHIC']] = PHI_at_in.astype(np.float32)
+
+    # Missing rows: HKL, FP, SIGFP, FreeR, FC, PHIC; everything else NaN.
+    if n_miss:
+        out_data[n_present:, 0:3] = miss_hkl.astype(np.float32)
+        out_data[n_present:, col_out_of[F_lbl]]   = Fp_miss.astype(np.float32)
+        if SIG_lbl is not None:
+            out_data[n_present:, col_out_of[SIG_lbl]] = sigFp_miss.astype(np.float32)
+        if FREE_lbl is not None and free_default is not None:
+            out_data[n_present:, col_out_of[FREE_lbl]] = free_default
+        out_data[n_present:, col_out_of['FC']]   = miss_Fc.astype(np.float32)
+        out_data[n_present:, col_out_of['PHIC']] = miss_PHIC.astype(np.float32)
+
+    # ── Build the output MTZ.  Copy the input structure exactly (all
+    # column metadata, dataset, history) via a scratch clone, add the two
+    # new columns, then set the extended data array.
+    mtz_out = gemmi.read_mtz_file(in_mtz_path)
+    # Existing FC/PHIC in the input would collide — the sfcalc-scaled values
+    # take precedence.  If they already exist, we still write our fresh
+    # values into them (same column indices in col_out_of).
+    for lbl, t in add_labels:
+        # Attach to the first dataset (index 1 for CRYST-like MTZs; gemmi's
+        # `add_column` puts it at the end of the current column list).
+        dataset_id = mtz_out.datasets[-1].id if mtz_out.datasets else 0
+        mtz_out.add_column(lbl, t, dataset_id=dataset_id, expand_data=False)
+    mtz_out.set_data(out_data)
+    mtz_out.history = list(getattr(mtz_out, 'history', []) or [])
+    mtz_out.history.append(
+        f'BENDFINDER sigmaA-fill: added {n_miss} rows (of {len(asu_hkls)} '
+        f'SG-ASU total), stripped {n_stripped} systematic absences; '
+        f'σA fit ln σA = {sigmaA_fit[0]:+.3f} + {sigmaA_fit[1]:+.3f}·s², '
+        f'Wilson ln SigN = {wilson_fit[0]:+.3f} + {wilson_fit[1]:+.3f}·s²')
+    mtz_out.write_to_file(out_mtz_path)
+    if verbose:
+        print(f'  sigmaA-fill: added {n_miss} rows, stripped {n_stripped} '
+              f'absences → {os.path.basename(out_mtz_path)} '
+              f'({n_present + n_miss} total rows)', flush=True)
+    return out_mtz_path
+
+
 def _fft_box_d_min(cell_obj, NX, NY, NZ):
     """Resolution limit (Å) supported by an FFT grid (NX,NY,NZ) on `cell_obj`.
 
@@ -3868,7 +4336,7 @@ def fitreso_scan(
     mov_pdb, ref_pdb, mov_mtz, ref_mtz, scan_dir,
     f_col=None, phi_col=None,
     run_refinement_flag=False, refine_cycles=5,
-    fill_asu=False,
+    fill_asu=False, fill_method='nan',
     sample_rate=0.0,
     mov_fullcell=None,
     fitreso_list=(20, 15, 12, 10, 8, 7, 6, 5),
@@ -3966,7 +4434,8 @@ def fitreso_scan(
                 _ref_fut = _refmac_pool.submit(
                     run_refinement, ref_pdb, ref_mtz,
                     outdir=os.path.join(scan_dir, 'refine_ref'),
-                    n_cycles=refine_cycles, fill_asu=fill_asu)
+                    n_cycles=refine_cycles, fill_asu=fill_asu,
+                    fill_method=fill_method)
             if _need_premov_refmac:
                 # pre/ FFTs raw_mov_mtz to a map.  If FWT/PHWT aren't
                 # present, refmac one pass on raw mov against its own
@@ -3976,7 +4445,8 @@ def fitreso_scan(
                 _premov_fut = _refmac_pool.submit(
                     run_refinement, pre_mov_pdb, pre_mov_mtz,
                     outdir=os.path.join(scan_dir, 'refine_mov_raw'),
-                    n_cycles=refine_cycles, fill_asu=fill_asu)
+                    n_cycles=refine_cycles, fill_asu=fill_asu,
+                    fill_method=fill_method)
             if _ref_fut is not None:
                 ref_pdb, ref_mtz = _ref_fut.result()
             if _premov_fut is not None:
@@ -4121,7 +4591,7 @@ def fitreso_scan(
             resolve_altindex, mov_pdb, ref_pdb, mov_mtz,
             outdir=os.path.join(scan_dir, 'altindex_resolve'),
             refine_cycles=refine_cycles, verbose=verbose,
-            fill_asu=fill_asu)
+            fill_asu=fill_asu, fill_method=fill_method)
 
     # unbent.pdb: written further down (after hkl00 is set up) as a symlink
     # to hkl00/bent.pdb, keeping it in the same cell+frame as unbent.mtz
@@ -4365,7 +4835,8 @@ def fitreso_scan(
         mov_pdb, mov_mtz = run_refinement(
             mov_pdb, mov_mtz,
             outdir=os.path.join(scan_dir, 'refine_mov'),
-            n_cycles=refine_cycles, fill_asu=fill_asu)
+            n_cycles=refine_cycles, fill_asu=fill_asu,
+            fill_method=fill_method)
 
     # Load post-altindex mov density.  Default mov_fullcell to True for
     # CCP4 input (avoids ASU-boundary noise in diff_norm); MTZ input
@@ -5102,7 +5573,8 @@ def mtz_to_map_data(mtz_path, f_col, phi_col, sample_rate=0.0):
 
 
 def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
-                   fill_asu=False, completeness_threshold=0.99):
+                   fill_asu=False, fill_method='nan',
+                   completeness_threshold=0.99):
     """Run refmac5 or phenix.refine on pdb_path+mtz_path; return
     (refined_pdb_path, refined_mtz_path).
 
@@ -5115,16 +5587,28 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
     disordered residues during the run.
 
     fill_asu : if True, pad input MTZ to full SG-ASU coverage by adding
-                 HKL+work-set-FreeR rows (FP=NaN) for HKLs missing from
-                 the deposited dataset before refinement.  Refmac/phenix
-                 skip NaN-Fobs rows in the LSQ target but still emit
-                 FC/FWT/2FOFCWT for them from the model, so output map
-                 coefficients reach 100% SG-ASU coverage — important
-                 because refmac/phenix only emit FWT for HKLs present
+                 rows for HKLs missing from the deposited dataset before
+                 refinement.  Refmac/phenix only emit FWT for HKLs present
                  in input, so an incomplete input means an incomplete
                  bent.mtz downstream.  When False and input is below
                  `completeness_threshold` (default 99%), sys.exit(1)
                  with instructions.
+    fill_method : how to populate the filled rows.
+        'nan' (default) — HKL + work-set FreeR only; FP/SIGFP left NaN.
+                   Refmac skips NaN-Fobs rows in the LSQ target but still
+                   emits FC/FWT/2FOFCWT for them from the model on the
+                   refined scale.  Scale-safe by construction (no Fobs
+                   population added), matches the historical CLAUDE.md
+                   behaviour.
+        'sigmaa' — see SIGMAA_FC_FILL.md.  Recomputes Fc via
+                   `gemmi sfcalc --scale-to` (bulk solvent + aniso
+                   scaling onto the Fo scale), estimates per-shell σA
+                   and Wilson SigN on FREE==0, fits ln σA + ln SigN
+                   linearly in s², then fills each missing HKL with
+                   FP = D·|Fc|, SIGFP = √((1-σA²)·SigN).  Also emits
+                   diagnostic FC/PHIC columns on every row.  Fixes the
+                   raw-DensityCalculatorX ~1/18-scale bug flagged in
+                   CLAUDE.md.
     completeness_threshold : minimum SG-ASU completeness required when
                  fill_asu=False.
     """
@@ -5160,21 +5644,39 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
             sys.exit(1)
         mtz_filled = os.path.join(outdir, f'{stem}_filled.mtz')
         try:
-            _pad_mtz_to_full_asu(mtz_path, mtz_filled)
-            # Report row-count change, not Fobs completeness: the filled rows
-            # carry only HKL + FreeR (FP/SIGFP stay NaN by design — refmac /
-            # phenix generate Fcalc/FWT/2FOFCWT for them).  _mtz_completeness
-            # measures Fobs completeness so it would still print the input's
-            # ~90% post-fill and read like the fill silently no-op'd.
-            n_in_rows  = len(gemmi.read_mtz_file(mtz_path).array)
-            n_out_rows = len(gemmi.read_mtz_file(mtz_filled).array)
-            print(f'  padded {n_out_rows - n_in_rows} missing SG-ASU rows '
-                  f'with HKL + work-set FreeR only (FP left NaN — refmac '
-                  f'generates FC/FWT from the model, Fobs unchanged) → '
-                  f'{n_out_rows} total rows in MTZ', flush=True)
+            if fill_method == 'sigmaa':
+                _sigmaa_fill_mtz(mtz_path, pdb_path, mtz_filled,
+                                workdir=outdir, verbose=True)
+                # sigmaa fill logs its own per-shell summary; still report
+                # the row-count change for parity with the NaN path.
+                n_in_rows  = len(gemmi.read_mtz_file(mtz_path).array)
+                n_out_rows = len(gemmi.read_mtz_file(mtz_filled).array)
+                print(f'  sigmaA-fill added {n_out_rows - n_in_rows} SG-ASU '
+                      f'rows with FP=D·|Fc|, SIGFP=√((1-σA²)·SigN) on the '
+                      f'Fo scale (deposited Fobs untouched); FC/PHIC '
+                      f'diagnostic columns emitted → {n_out_rows} total rows',
+                      flush=True)
+            elif fill_method == 'nan':
+                _pad_mtz_to_full_asu(mtz_path, mtz_filled)
+                # Report row-count change, not Fobs completeness: the filled
+                # rows carry only HKL + FreeR (FP/SIGFP stay NaN by design —
+                # refmac / phenix generate Fcalc/FWT/2FOFCWT for them).
+                # _mtz_completeness measures Fobs completeness so it would
+                # still print the input's ~90% post-fill and read like the
+                # fill silently no-op'd.
+                n_in_rows  = len(gemmi.read_mtz_file(mtz_path).array)
+                n_out_rows = len(gemmi.read_mtz_file(mtz_filled).array)
+                print(f'  padded {n_out_rows - n_in_rows} missing SG-ASU rows '
+                      f'with HKL + work-set FreeR only (FP left NaN — refmac '
+                      f'generates FC/FWT from the model, Fobs unchanged) → '
+                      f'{n_out_rows} total rows in MTZ', flush=True)
+            else:
+                raise ValueError(
+                    f"fill_method must be 'nan' or 'sigmaa', got "
+                    f"{fill_method!r}")
             mtz_path_for_refmac = mtz_filled
         except Exception as e:
-            print(f'  _pad_mtz_to_full_asu failed ({e!r}); aborting',
+            print(f'  fill ({fill_method}) failed ({e!r}); aborting',
                   file=sys.stderr)
             sys.exit(1)
 
@@ -6023,7 +6525,8 @@ def _relabel_mtz_cell(in_mtz, target_cell, out_mtz):
 
 
 def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
-                               fill_asu, drot_deg, rmsd, verbose):
+                               fill_asu, fill_method, drot_deg, rmsd,
+                               verbose):
     """When cell-stretching alone aligned moving to ref (no discrete altindex
     needed), re-refine the stretched moving model+data under the new cell so
     FWT/PHWT are consistent with ref's cell metric.  The pre-stretch FWT/PHWT
@@ -6034,7 +6537,8 @@ def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
               f"under ref cell ...", flush=True)
     out_pdb, out_mtz = run_refinement(mov_pdb, mov_mtz, outdir=outdir,
                                        n_cycles=refine_cycles,
-                                       fill_asu=fill_asu)
+                                       fill_asu=fill_asu,
+                                       fill_method=fill_method)
     return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
                 action='cell_stretch_only', R_frac=np.eye(3),
                 t_frac=np.zeros(3), drot_deg=drot_deg, rmsd_after=rmsd)
@@ -6042,7 +6546,7 @@ def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
 
 def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                      refine_cycles=5, improve_threshold=0.7,
-                     verbose=True, fill_asu=False):
+                     verbose=True, fill_asu=False, fill_method='nan'):
     """Find (altindex × symop × origin) discrete transform that aligns mov onto ref.
 
     Strategy: Kabsch LSQ fit gives the continuous rigid-body answer; enumerate
@@ -6232,7 +6736,7 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         if stretched:
             return _write_log_and_return(_finish_after_stretch_only(
                 mov_pdb, mov_mtz, outdir, refine_cycles, fill_asu,
-                drot_deg, rmsd_base, verbose))
+                fill_method, drot_deg, rmsd_base, verbose))
         return _write_log_and_return(_no_op_resolve_result(mov_pdb, mov_mtz,
                                                             drot=drot_deg,
                                                             rmsd=rmsd_base))
@@ -6242,7 +6746,7 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         if stretched:
             return _write_log_and_return(_finish_after_stretch_only(
                 mov_pdb, mov_mtz, outdir, refine_cycles, fill_asu,
-                drot_deg, rmsd_top, verbose))
+                fill_method, drot_deg, rmsd_top, verbose))
         return _write_log_and_return(_no_op_resolve_result(mov_pdb, mov_mtz,
                                                             drot=drot_deg,
                                                             rmsd=rmsd_top))
@@ -6317,7 +6821,8 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
     # completeness gate inside run_refinement engages here too.
     out_pdb, out_mtz = run_refinement(pre_pdb, pre_mtz, outdir=outdir,
                                        n_cycles=refine_cycles,
-                                       fill_asu=fill_asu)
+                                       fill_asu=fill_asu,
+                                       fill_method=fill_method)
 
     return _write_log_and_return(dict(
         mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
@@ -6359,6 +6864,7 @@ def main():
                      run_refinement_flag=p['run_refinement'],
                      refine_cycles=p['refine_cycles'],
                      fill_asu=p['fill_asu'],
+                     fill_method=p['fill_method'],
                      sample_rate=p['sample_rate'],
                      subtract=p['subtract'],
                      scan_all_fr=p['scan_all_fr'],
@@ -6370,16 +6876,20 @@ def main():
     if mov_mtz and p['run_refinement']:
         pdb1, mov_mtz = run_refinement(pdb1, mov_mtz, outdir='refine_mov',
                                         n_cycles=p['refine_cycles'],
-                                        fill_asu=p['fill_asu'])
+                                        fill_asu=p['fill_asu'],
+                                        fill_method=p['fill_method'])
     if ref_mtz and p['run_refinement']:
         pdb2, ref_mtz = run_refinement(pdb2, ref_mtz, outdir='refine_ref',
                                         n_cycles=p['refine_cycles'],
-                                        fill_asu=p['fill_asu'])
+                                        fill_asu=p['fill_asu'],
+                                        fill_method=p['fill_method'])
 
     if mov_mtz:
         _res = resolve_altindex(pdb1, pdb2, mov_mtz,
                                  outdir='altindex_resolve',
-                                 refine_cycles=p['refine_cycles'])
+                                 refine_cycles=p['refine_cycles'],
+                                 fill_asu=p['fill_asu'],
+                                 fill_method=p['fill_method'])
         pdb1    = _res['mov_pdb_out']
         mov_mtz = _res['mov_mtz_out']
 
