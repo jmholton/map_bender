@@ -1,4 +1,4 @@
-#!/programs/ccp4-8.0/bin/ccp4-python
+#!/usr/bin/env ccp4-python
 """bendfinder.py — fit a Fourier shift field between two crystal forms.
 
 Usage (single fit):
@@ -7,6 +7,13 @@ Usage (single fit):
 
 Usage (fitreso scan):
     bendfinder.py moving.pdb reference.pdb moving.mtz reference.mtz scan_dir=DIR [key=value ...]
+
+Explicit slot assignment (order-independent, extension-routed):
+    bendfinder.py moving=X.pdb ref=Y.pdb mov_mtz=X.mtz ref_mtz=Y.mtz scan_dir=DIR [...]
+    Aliases: {moving, mov, mov_pdb, mov_mtz, mov_map} → moving side;
+             {ref, reference, ref_pdb, ref_mtz, ref_map} → reference side.
+    Bare positional filenames still work; explicit keys route into the
+    correct slot by extension and override the positional-order fallback.
 
 MTZ inputs are expected to be refinement outputs with likelihood-weighted 2Fo-Fc
 coefficients (FWT/PHWT from refmac or 2FOFCWT/PH2FOFCWT from phenix).
@@ -2972,26 +2979,53 @@ def _parse_args(argv):
         'early_stop_tol': 0.01,
         'early_stop_n':   2,
     }
+    # Optional explicit slot assignment via key=file: `moving=X.pdb`,
+    # `ref=Y.mtz`, etc.  When present these take precedence over the
+    # positional-order fallback.  Aliases: mov / moving / mov_pdb;
+    # ref / reference / ref_pdb.  Extension is checked to route into
+    # the correct slot (pdb / mtz / map).
+    _MOV_KEYS = {'moving', 'mov', 'mov_pdb', 'mov_mtz', 'mov_map',
+                 'moving_pdb', 'moving_mtz', 'moving_map'}
+    _REF_KEYS = {'ref', 'reference', 'ref_pdb', 'ref_mtz', 'ref_map',
+                 'reference_pdb', 'reference_mtz', 'reference_map'}
+
+    def _slot(path, side):
+        """Route `path` into the (pdb/mtz/map) slot matching its extension,
+        on the `side` (mov=1 or ref=2)."""
+        nonlocal pdb1, pdb2, mtz1, mtz2, map1, map2
+        lo = path.lower()
+        if lo.endswith('.pdb'):
+            if side == 1: pdb1 = path
+            else:         pdb2 = path
+        elif lo.endswith('.mtz'):
+            if side == 1: mtz1 = path
+            else:         mtz2 = path
+        elif lo.endswith(('.map', '.ccp4', '.mrc')):
+            if side == 1: map1 = path
+            else:         map2 = path
+        else:
+            print(f"ERROR: unrecognized file extension in {path!r} — "
+                  f"expected .pdb / .mtz / .map / .ccp4 / .mrc",
+                  file=sys.stderr)
+            sys.exit(2)
+
     for arg in argv:
-        if arg.lower().endswith('.pdb'):
-            if pdb1 is None:
-                pdb1 = arg
-            elif pdb2 is None:
-                pdb2 = arg
-        elif arg.lower().endswith(('.map', '.ccp4', '.mrc')):
-            if map1 is None:
-                map1 = arg
-            elif map2 is None:
-                map2 = arg
-        elif arg.lower().endswith('.mtz'):
-            if mtz1 is None:
-                mtz1 = arg
-            elif mtz2 is None:
-                mtz2 = arg
-        elif '=' in arg:
+        # Check for key=value form BEFORE the bare-extension branches, so
+        # explicit `moving=X.pdb` / `ref=Y.mtz` aren't consumed as positional
+        # PDB/MTZ args (the whole "moving=X.pdb" ends with ".pdb" too).
+        if '=' in arg:
             key, _, val = arg.partition('=')
             key = key.strip()
             val = val.strip()
+            key_lc = key.lower()
+            # Handle mov/ref explicit slots first — these are file paths
+            # to route into pdb/mtz/map by extension.
+            if key_lc in _MOV_KEYS:
+                _slot(val, 1)
+                continue
+            if key_lc in _REF_KEYS:
+                _slot(val, 2)
+                continue
             if key in ('nhkls', 'starthkls', 'maxhkls'):
                 params['nhkls'] = int(val)
             elif key == 'fitreso':
@@ -3048,6 +3082,24 @@ def _parse_args(argv):
                 params['early_stop_tol'] = float(val)
             elif key in ('early_stop_n', 'early-stop-n'):
                 params['early_stop_n'] = int(val)
+        # Positional fallback — bare filenames land in the first empty
+        # slot for their extension.  Runs AFTER the key=value branch so
+        # `moving=X.pdb` isn't misconsumed here.
+        elif arg.lower().endswith('.pdb'):
+            if pdb1 is None:
+                pdb1 = arg
+            elif pdb2 is None:
+                pdb2 = arg
+        elif arg.lower().endswith(('.map', '.ccp4', '.mrc')):
+            if map1 is None:
+                map1 = arg
+            elif map2 is None:
+                map2 = arg
+        elif arg.lower().endswith('.mtz'):
+            if mtz1 is None:
+                mtz1 = arg
+            elif mtz2 is None:
+                mtz2 = arg
         elif arg in ('deltamaps', 'delta', 'nofit', 'run_refinement', 'refine',
                      'fill_asu', 'fill-asu', '--fill-asu',
                      'scan_all_fr', 'scan-all-fr', '--scan-all-fr'):

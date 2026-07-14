@@ -1062,6 +1062,51 @@ scaled D·|Fc| in the deposit's amplitude column (e.g. downstream
 tools that read FP directly, or σA-weighted map building outside
 refmac).
 
+### Extra sigmaA test: carbonic anhydrase 8sf1 → 6klz (2026-07-14)
+
+Out-of-gamut sanity check on the exact CA pair from `SIGMAA_FC_FILL.md`
+— **mov = 8sf1 (1.70 Å)**, **ref = 6klz (0.90 Å)**, both P2₁ with
+~1.5% cell drift so the cross-cell stretch + `origin_only` altindex
+path engages.  Working dir: `claude/carbonic/`; scan_dir:
+`scan_fitreso_sigmaa/`.  Reproduces the prototype's per-shell σA
+fits verbatim:
+
+- **6klz** σA fit: `ln σA = −0.013 + 0.002·s²` — essentially FLAT
+  to the edge (rms coord err ≈ 0.00 Å).  Matches the prototype's
+  "sigmaA ~= 0.98-0.99 FLAT to the edge (slope ~0). Model reliable
+  everywhere -> D ~= 1, nothing to shrink/fill."  Only **31 rows**
+  filled out of 178,058 (99.98% complete PDB-REDO deposit).
+- **8sf1** shows the Luzzati falloff the prototype documented.
+- Cross-cell resolve: `action=origin_only`, `drot=0.00°`,
+  `t_frac=[−0.002, +0.037, +0.001]`, `rmsd_after=0.21 Å`.
+
+Scan result (all 8 fr rows completed):
+
+| row | RMSD (Å) | Rbent | k / B (Å²) | bondZ | notes |
+|-----|---------|-------|-----------|-------|-------|
+| pre | 1.540 | 73.8% | 1.279 / −12.82 | 1.04 | pre-align baseline |
+| hkl00 | 0.170 | 73.8% | 1.217 / −12.82 | 2.15 | post-align, zero shift |
+| fr20 | 0.119 | 73.0% | 1.216 / −12.98 | 2.10 |  |
+| fr12 | 0.094 | 72.7% | 1.215 / −13.04 | 2.15 |  |
+| fr10 | 0.097 | 72.6% | 1.215 / −13.05 | 2.28 |  |
+| fr8 | 0.100 | 72.7% | 1.216 / −13.02 | 2.15 |  |
+| fr5 | 0.105 | 72.6% | 1.217 / −13.02 | 2.21 | fine-fitreso saturated at 741 HKLs |
+| **best** | **0.100** | **72.6%** | 1.215 / −13.05 | 2.26 | d_opt = 8.24 Å |
+
+Persistent −80σ negative peak at A/301 ZN(r) — Zn²⁺ chemistry
+difference (present in 6klz's active site with slightly different
+coordination than 8sf1's).  Same "metal-site chemistry beyond the
+smooth PSDVF" motif as insulin's Zn.
+
+**Rbent plateau at ~73%** across every row is the resolution-band
+story: `compute_riso`'s k/B fit runs on the shared HKL set only
+(→ 1.70 Å), so the extra 1.70→0.90 Å content in 6klz's map is
+simply unused in the F-space comparison.  The fitted B = −13 Å²
+says the bent (mov, softer at high res) needs a ~13 Å² sharpening
+to match ref over the shared band — normal for a 0.9-vs-1.7 Å
+same-protein pair.  RMSD floor at 0.100 Å is the map-quality
+target achieved cleanly.
+
 ## PSDVF.mtz amplitude units
 
 The `dX`, `dY`, `dZ` columns store the **amplitude of the fitted shift
