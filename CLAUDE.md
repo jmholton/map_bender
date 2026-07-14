@@ -1005,6 +1005,63 @@ model-vs-truth deviation, so refmac's LS target treats it as a soft
 constraint that vanishes at high resolution where extrapolated σA
 → 0.
 
+**I-only inputs** (e.g. 1a6m.mtz — the RCSB cif2mtz output for
+myoglobin's ref is I/SIGI only): `_sigmaa_fill_mtz` auto-ctruncates
+to F/SIGF before proceeding.  σA needs amplitudes, not intensities,
+and running the French-Wilson step later inside refmac would leave
+the σA fit off by the Fo/√I scale.  Same fallback pattern
+`run_refinement` already applies for its own refmac step.  Requires
+`ctruncate` on PATH (or `$CCP4/bin`).
+
+### Gamut results — sigmaA fill vs nan fill (2026-07-14, 11/11 pass)
+
+`fill_method='sigmaa'` full gamut against the `fill_method='nan'`
+baseline table above.  Cells show *sigmaa / nan*.
+
+| System | fr5 RMSD (Å) | best RMSD (Å) | fr5 Rbent | best Rbent | d_opt (Å) |
+|--------|--------------|---------------|-----------|------------|-----------|
+| lyso | 0.182 / 0.183 | 0.100 / 0.100 | 31.9 / 31.2 | 29.8 / 29.0 | 11.22 / 11.25 |
+| dhfr | 0.247 / 0.247 | **0.186** / 0.192 | 40.6 / 39.1 | 39.3 / 37.9 | 14.89 / 15.42 |
+| raddam 5kxl | 0.112 / 0.112 | 0.114 / 0.114 | 11.9 / 11.9 | 11.2 / 11.2 | 20 / 20 |
+| raddam 5kxm | 0.076 / 0.076 | 0.078 / 0.078 | 10.4 / 10.4 | 9.9 / 9.9 | 17.21 / 17.21 |
+| raddam 5kxn | 0.091 / 0.091 | 0.100 / 0.100 | 18.1 / 18.1 | 17.6 / 17.6 | 20 / 20 |
+| myoglobin | 0.139 / 0.139 | 0.107 / 0.107 | 56.6 / 52.8 | 56.4 / 52.5 | 9.01 / 9.06 |
+| insulin | **0.889** / 0.925 | **0.974** / 1.014 | 66.5 / 62.5 | 66.8 / 63.2 | 8.18 / 8.15 |
+| lipox | 0.583 / 0.591 | 0.322 / 0.323 | 54.5 / 54.4 | 52.8 / 52.7 | 16.01 / 16.03 |
+| porin | — | (refmac R=0.466 / 0.46) | — | — | — |
+
+Also PASS: `test_symm_all_sgs` 65/65; `magdoff` Test2
+constrained=0.069 / unconstrained=0.038 (identical to nan gamut —
+synthetic data has no missing rows so the fill path never fires).
+
+**Reading.**
+- **Zero catastrophes** — no system diverges under sigmaA fill.  The
+  DHFR ~1/18-scale bug that killed the raw `DensityCalculatorX`
+  attempt is truly closed by `--scale-to`.
+- **Same-cell dose-series pairs (raddam, lyso)**: sigmaA and nan
+  results agree bit-for-bit.  Same-crystal same-res inputs give the
+  fill nothing to do.
+- **Cross-cell (lipox, myoglobin)**: within scan-grid noise of the
+  nan baseline.  Stretch + altindex_refine + sigmaA fill compose
+  cleanly.
+- **Conformational-change cases (dhfr, insulin)**: CA RMSD
+  *improves* slightly (dhfr best 0.192→0.186; insulin best
+  1.014→0.974, fr5 0.925→0.889) while Rbent climbs 1–4%.
+  Interpretation: refmac's overall scale/B model has to span the
+  deposited-obs population plus the σA-weighted D·Fc rows now on
+  the same scale — a wider scale range → slightly worse F-space R,
+  but the real-space model matches the reference *better*.
+- **Rbent ceiling**: the +0–4% Rbent uptick is systematic across
+  systems with missing rows to fill.  For CA-quality bend
+  refinement the RMSD/geometry columns are what matter — those are
+  neutral-to-slightly-improved.  If Rbent-as-a-comparison-number is
+  the target, stay on `fill_method='nan'`.
+
+Default remains `fill_method='nan'`.  Opt in when you want the
+scaled D·|Fc| in the deposit's amplitude column (e.g. downstream
+tools that read FP directly, or σA-weighted map building outside
+refmac).
+
 ## PSDVF.mtz amplitude units
 
 The `dX`, `dY`, `dZ` columns store the **amplitude of the fitted shift

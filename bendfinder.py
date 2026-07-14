@@ -3740,6 +3740,47 @@ def _sigmaa_fill_mtz(in_mtz_path, pdb_path, out_mtz_path, d_min=None,
     os.makedirs(workdir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(out_mtz_path))[0]
 
+    # If the input is I-only (e.g. RCSB raw deposits straight from cif2mtz —
+    # 1a6m.mtz is I/SIGI only), ctruncate to add F/SIGF first.  sigmaA
+    # needs amplitudes, not intensities, and mixing them (via a French-
+    # Wilson step done later inside refmac) means the σA fit would be off
+    # by the Fo/√I scale — safer to bring the fill onto the F scale
+    # explicitly here.  Same fallback pattern `run_refinement` already
+    # applies for I-only MTZs.
+    mtz_probe = gemmi.read_mtz_file(in_mtz_path)
+    probe_cols = {c.label for c in mtz_probe.columns}
+    if not any(l in probe_cols for l in ('FP', 'F', 'FOBS')):
+        i_lbl  = next((l for l in ('IMEAN', 'I', 'IOBS')          if l in probe_cols), None)
+        sigi   = next((l for l in ('SIGIMEAN', 'SIGI', 'SIGIOBS') if l in probe_cols), None)
+        if not (i_lbl and sigi):
+            raise RuntimeError(f'{in_mtz_path}: no F/FP/FOBS or I/IMEAN '
+                               f'columns — cannot fill (columns present: '
+                               f'{sorted(probe_cols)})')
+        import shutil as _sh
+        ctruncate = _sh.which('ctruncate') or os.path.join(
+            os.environ.get('CCP4', ''), 'bin', 'ctruncate')
+        if not (ctruncate and os.path.exists(ctruncate)):
+            raise RuntimeError('ctruncate not on PATH — cannot promote '
+                               f'{in_mtz_path} from I to F for sigmaA fill.  '
+                               f'Source the CCP4 setup or pre-convert the MTZ.')
+        mtz_F = os.path.join(workdir, f'{stem}_ctruncated.mtz')
+        if verbose:
+            print(f'  ctruncate {i_lbl}/{sigi} → F/SIGF ({os.path.basename(mtz_F)})',
+                  flush=True)
+        r0 = subprocess.run(
+            [ctruncate, '-hklin', in_mtz_path, '-hklout', mtz_F,
+             '-colin', f'/*/*/[{i_lbl},{sigi}]'],
+            capture_output=True, text=True)
+        log_path = mtz_F + '.ctruncate.log'
+        with open(log_path, 'w') as _lf:
+            _lf.write(f'# ctruncate returncode: {r0.returncode}\n\n')
+            _lf.write(r0.stdout or '')
+            _lf.write('\n--- stderr ---\n')
+            _lf.write(r0.stderr or '')
+        if r0.returncode != 0 or not os.path.exists(mtz_F):
+            raise RuntimeError(f'ctruncate failed (rc={r0.returncode}); see {log_path}')
+        in_mtz_path = mtz_F
+
     mtz_in = gemmi.read_mtz_file(in_mtz_path)
     cell = mtz_in.cell
     sg   = mtz_in.spacegroup
@@ -3753,7 +3794,8 @@ def _sigmaa_fill_mtz(in_mtz_path, pdb_path, out_mtz_path, d_min=None,
     SIG_lbl  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in lbls), None)
     FREE_lbl = _pick_free_column(mtz_in)
     if F_lbl is None:
-        raise RuntimeError(f'{in_mtz_path}: no F/FP/FOBS column — cannot fill')
+        raise RuntimeError(f'{in_mtz_path}: no F/FP/FOBS column — cannot fill '
+                           f'(columns present: {sorted(lbls)})')
 
     # ── Recompute Fo-scaled Fc via gemmi sfcalc --scale-to.
     fc_mtz_path = os.path.join(workdir, f'{stem}_fc_scaled.mtz')
