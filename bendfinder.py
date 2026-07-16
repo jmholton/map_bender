@@ -4548,19 +4548,64 @@ def fitreso_scan(
 
     # ── _load helper (used by both the ref/pre_mov phase below and the
     # post-altindex mov phase further down) ─────────────────────────────────
-    def _load(path, tag, fullcell=False):
+    #
+    # `exact_size` (optional): forces the returned density onto the given
+    # (nu, nv, nw) grid via zero-padded FFT.  When the mov and ref sides
+    # have different d_mins, we load BOTH onto the finer of the two
+    # grids — the coarser MTZ's missing HKLs then sit at exactly zero in
+    # its density, so subsequent forward-FFT of a bent map recovers
+    # exact zeros in the gap band (no cubic-interp leakage from an
+    # implicit coarse→fine resample later in the pipeline).  For CCP4
+    # map inputs with `exact_size` set, the incoming map is FFT'd, then
+    # inverse-FFT'd onto the target grid — same zero-pad principle.
+    def _load(path, tag, fullcell=False, exact_size=None):
         ext = os.path.splitext(path)[1].lower()
         if ext == '.mtz':
             fc, ph = detect_2fofc_cols(path, f_col, phi_col)
             if verbose:
-                print(f'  {tag}: {os.path.basename(path)}  columns {fc}/{ph}',
-                      flush=True)
-            data, hdr = mtz_to_map_data(path, fc, ph, sample_rate=sample_rate)
+                _size_note = (f'  (grid forced to ref exact_size={exact_size})'
+                              if exact_size else '')
+                print(f'  {tag}: {os.path.basename(path)}  columns {fc}/{ph}'
+                      f'{_size_note}', flush=True)
+            data, hdr = mtz_to_map_data(path, fc, ph, sample_rate=sample_rate,
+                                        exact_size=exact_size)
             return data, hdr, path, fc
+        # CCP4 map input.
         if fullcell:
             data, hdr = read_ccp4_fullcell(path)
         else:
             data, hdr = read_ccp4(path)
+        if (exact_size is not None
+                and tuple(data.shape) != tuple(
+                    (exact_size[2], exact_size[1], exact_size[0]))):
+            # Round-trip through F-space to land on the target grid: FFT
+            # the input map (band-limited by its own Nyquist), then
+            # inverse-FFT onto the target grid via zero-padded transform.
+            # Preserves band-limit; no cubic-interp cross-grid leakage.
+            # `_grid_xyz_fullcell` returns (NX, NY, NZ) in canonical axis
+            # order — matches gemmi.FloatGrid layout for the FFT.
+            _full = _grid_xyz_fullcell(data, hdr)
+            _map_grid = gemmi.FloatGrid(_full.astype(np.float32))
+            _map_grid.set_unit_cell(gemmi.UnitCell(*hdr['cell']))
+            _map_grid.spacegroup = (gemmi.find_spacegroup_by_number(
+                                       int(hdr.get('spacegroup', 1)))
+                                    or gemmi.SpaceGroup('P 1'))
+            _hkl_grid = gemmi.transform_map_to_f_phi(_map_grid)
+            _new_grid = _hkl_grid.transform_f_phi_to_map(
+                exact_size=(exact_size[0], exact_size[1], exact_size[2]))
+            _arr = np.array(_new_grid, copy=False)
+            _nu, _nv, _nw = _arr.shape
+            data = _arr.transpose(2, 1, 0).copy()
+            cell = _new_grid.unit_cell
+            hdr = dict(hdr)      # shallow copy
+            hdr.update(nc=_nu, nr=_nv, ns=_nw, nx=_nu, ny=_nv, nz=_nw,
+                       ncstart=0, nrstart=0, nsstart=0,
+                       mapc=1, mapr=2, maps=3,
+                       cell=(cell.a, cell.b, cell.c,
+                             cell.alpha, cell.beta, cell.gamma))
+            if verbose:
+                print(f'  {tag}: CCP4 map re-rendered onto ref '
+                      f'exact_size={exact_size}', flush=True)
         return data, hdr, None, None
 
     # ── Altindex-independent setup: ref density + pre_mov density + grids ──
@@ -4571,9 +4616,26 @@ def fitreso_scan(
     # none of altindex's outputs.
     ref_d, ref_h, ref_mtz_resolved, ref_f_col = _load(ref_mtz, 'ref')
 
+    # Grid unification: force EVERY subsequent map load onto ref's grid via
+    # zero-padded FFT of that MTZ (or, for CCP4 map inputs, an FFT-then-
+    # inverse-FFT round-trip).  When mov and ref have different d_mins,
+    # ref's grid is the finer of the two — placing mov on that grid means:
+    #  (a) the shift-field application (interpolate_map) does no cross-
+    #      grid resampling, so at hkl00 it's an identity that exactly
+    #      recovers mov's own Fs;
+    #  (b) the coarser side's HKLs past its own d_min are implicit zeros
+    #      in the density → forward-FFT of a bent map returns exact zero
+    #      amplitude in the gap band, not the cubic-interp leakage tail
+    #      that inflated Rbent to 73.8% at hkl00 on the CA pair.
+    ref_grid_shape = (ref_h['nx'], ref_h['ny'], ref_h['nz'])
+    if verbose:
+        print(f'  ref grid: {ref_grid_shape}  (used for all mov/ref map '
+              f'loads to avoid cross-grid leakage)', flush=True)
+
     pre_mov_fullcell = pre_mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc'))
     pre_mov_d, pre_mov_h, _, pre_mov_f_col = _load(
-        pre_mov_mtz, 'pre_mov', fullcell=pre_mov_fullcell)
+        pre_mov_mtz, 'pre_mov', fullcell=pre_mov_fullcell,
+        exact_size=ref_grid_shape)
     pre_mov_pad_mode = ('wrap' if pre_mov_mtz.lower().endswith('.mtz')
                                    or pre_mov_fullcell else 'reflect')
     # col_suffix — filename suffix for bent{col_suffix}.map / .mtz / diff etc.
@@ -4937,8 +4999,11 @@ def fitreso_scan(
     # ignores the flag (already full-cell).
     if mov_fullcell is None:
         mov_fullcell = mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc'))
-    mov_d, mov_h, mov_mtz_resolved, mov_f_col = _load(mov_mtz, 'mov',
-                                                        fullcell=mov_fullcell)
+    # Force onto ref's grid so shift-field interpolation is identity at
+    # hkl00 and the gap band (d_min_mov → d_min_ref) sits at exact zero.
+    mov_d, mov_h, mov_mtz_resolved, mov_f_col = _load(
+        mov_mtz, 'mov', fullcell=mov_fullcell,
+        exact_size=ref_grid_shape)
     col_suffix = ('' if (mov_f_col is None or mov_f_col in _CANONICAL_F)
                   else f'_{mov_f_col}')
     pad_mode   = ('wrap' if (mov_mtz_resolved is not None or mov_fullcell)
@@ -5641,14 +5706,27 @@ def detect_2fofc_cols(mtz_path, f_col=None, phi_col=None):
         f"or use run_refinement to generate FWT/PHWT first.")
 
 
-def mtz_to_map_data(mtz_path, f_col, phi_col, sample_rate=0.0):
+def mtz_to_map_data(mtz_path, f_col, phi_col, sample_rate=0.0,
+                    exact_size=None):
     """Inverse-FFT an MTZ F/PHI column pair; return (ndarray, header_dict).
 
     The returned header matches the read_ccp4 format: full unit cell
     (starts=0, mapc=1/mapr=2/maps=3).  No mov_fullcell workaround needed.
+
+    exact_size : optional (nu, nv, nw) tuple.  Forces gemmi to invert
+        onto a specific grid shape via zero-padded FFT — HKLs past this
+        MTZ's own d_min are implicitly treated as zero.  Use when both
+        sides of a mov/ref comparison must land on the SAME grid (the
+        finer of the two d_mins) to avoid cross-grid cubic-interp
+        leakage in the bent-vs-ref comparison (see fitreso_scan).
     """
     mtz  = gemmi.read_mtz_file(mtz_path)
-    grid = mtz.transform_f_phi_to_map(f_col, phi_col, sample_rate=sample_rate)
+    if exact_size is not None:
+        grid = mtz.transform_f_phi_to_map(f_col, phi_col,
+                                          exact_size=tuple(exact_size))
+    else:
+        grid = mtz.transform_f_phi_to_map(f_col, phi_col,
+                                          sample_rate=sample_rate)
     # gemmi gives (nu, nv, nw) = (na, nb, nc); CCP4 with MAPC=1/MAPR=2/MAPS=3
     # stores data as (sections=c, rows=b, cols=a) = (nw, nv, nu)
     arr  = np.array(grid, copy=False)
