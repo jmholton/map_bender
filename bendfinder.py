@@ -740,8 +740,22 @@ def _soft_pnn_weight_k(snr, N, k=1):
 
 
 def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5, bound_by_obs_frac=None,
-                   pnn_mode=None):
+                   pnn_mode=None, s2_canon=None, sobolev_lambda=0.0,
+                   sobolev_beta=1.0,
+                   wilson_cap_alpha=None, wilson_cap_snr_min=2.0):
     """Joint 3D lstsq with per-canonical-HKL Pnn weighting.
+
+    Sobolev smoothness prior (optional; opt-in via sobolev_lambda > 0):
+        Applied AFTER Pnn as a per-HKL multiplicative attenuation
+        `w_sob(m) = 1 / (1 + sobolev_lambda · (sobolev_beta · s²_m)^p)`
+        with p=1 (i.e. Wiener-shaped Lorentzian smoothness prior).
+        Requires `s2_canon` (canonical HKL |h|² in reciprocal Å⁻²).
+        Purpose: dampen high-|h| coefficients that PsdVF Wilson diagnostic
+        showed are noise-floor-dominated in the CA test case.  Composes
+        multiplicatively with the Pnn weight — high-|h| noise gets
+        double-suppressed; high-|h| high-SNR outliers survive if any.
+
+    Existing behaviour (drop_snr and bound_by_obs_frac) unchanged.
 
     X : (3N, 6M) symmetry-adapted design matrix
     b : (3N,)    interleaved shifts [Δx_0,Δy_0,Δz_0, Δx_1,...]
@@ -869,7 +883,66 @@ def fit_lstsq_symm(X, b, drop_snr=0.0, max_rounds=5, bound_by_obs_frac=None,
                         w[m_k] = _pnn_weight_chik(snr_a[m_k], int(k_val), k=6)
                 else:  # 'softpnna'
                     w = _soft_pnn_weight(snr_a, N_act)
-                params_full[col_mask] = (p_blk * w[:, None]).ravel()
+                # Optional Sobolev smoothness prior: post-hoc Lorentzian
+                # attenuation of high-|h| canonical HKLs.  s2_canon is
+                # the FULL canonical set's |h|²; index by `ai` for the
+                # currently-active subset.
+                if (s2_canon is not None
+                        and sobolev_lambda is not None
+                        and sobolev_lambda > 0):
+                    _s2 = np.asarray(s2_canon)[ai]
+                    _w_sob = 1.0 / (1.0 + float(sobolev_lambda) *
+                                    (float(sobolev_beta) * _s2))
+                    w = w * _w_sob
+                # Optional Wilson-envelope cap (SNR-conditional).  Fit
+                # ln|Δr|² = a + b·s² on high-SNR HKLs (survived Pnn well),
+                # then cap active HKLs whose |Δr|² lies > α·envelope AND
+                # whose raw SNR is below `wilson_cap_snr_min` (so
+                # high-SNR outliers are preserved as candidate legit
+                # signal).  Applied MULTIPLICATIVELY on top of Pnn +
+                # Sobolev.  Requires s2_canon; degrades to no-op
+                # without it.
+                if (wilson_cap_alpha is not None
+                        and wilson_cap_alpha > 0
+                        and s2_canon is not None):
+                    _s2 = np.asarray(s2_canon)[ai]
+                    # |Δr|² per active HKL after all prior weights.
+                    _p_now = (p_blk * w[:, None])
+                    _r2 = np.sum(_p_now.reshape(-1, 3, 2) ** 2,
+                                 axis=(1, 2))
+                    # Signal-only envelope fit (raw SNR > 3).  If too
+                    # few points, skip.  Requires |snr_a| already
+                    # computed above.
+                    _snr_abs = np.abs(snr_a)
+                    _hi = _snr_abs > 3.0
+                    _lo = _snr_abs < float(wilson_cap_snr_min)
+                    if _hi.sum() >= 5:
+                        _sig = _r2[_hi]
+                        _sig = np.maximum(_sig, 1e-30)
+                        _x = _s2[_hi]; _y = np.log(_sig)
+                        _slope, _intercept = np.polyfit(_x, _y, 1)
+                        # Envelope at each active HKL's s²:
+                        _env = np.exp(_intercept + _slope * _s2)
+                        _exceeds = _r2 > float(wilson_cap_alpha) * _env
+                        _needs_cap = _exceeds & _lo
+                        if _needs_cap.any():
+                            # Soft attenuation: scale offending HKLs so
+                            # r² ↓ to α·env exactly.  Preserves phase.
+                            with np.errstate(invalid='ignore',
+                                             divide='ignore'):
+                                _ratio = np.where(
+                                    _needs_cap,
+                                    np.sqrt(float(wilson_cap_alpha) * _env
+                                            / np.maximum(_r2, 1e-30)),
+                                    1.0)
+                            _p_now = _p_now * _ratio[:, None]
+                            params_full[col_mask] = _p_now.ravel()
+                        else:
+                            params_full[col_mask] = _p_now.ravel()
+                    else:
+                        params_full[col_mask] = _p_now.ravel()
+                else:
+                    params_full[col_mask] = (p_blk * w[:, None]).ravel()
             break
 
         params_full[col_mask] = sol
@@ -2495,7 +2568,9 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
                          bound_by_obs=False,
                          pnn_mode=None,
                          holdout_frac=0.0, holdout_seed=0,
-                         cv_callback=None):
+                         cv_callback=None,
+                         sobolev_lambda=0.0, sobolev_beta=1.0,
+                         wilson_cap_alpha=None, wilson_cap_snr_min=2.0):
     """Fit a Fourier shift field progressively, admitting HKLs coarsest-first.
 
     HKLs are admitted in batches from fitreso_start (coarsest, large d) down to
@@ -2776,9 +2851,24 @@ def bend_fit_progressive(pdb1_path, pdb2_path,
 
             X_symm = build_design_matrix_symm(frac_asu, canon_hkls, proper_ops,
                                                hkl_to_canon, hkl_all_ops)
+            # For Sobolev OR Wilson-cap: compute |h|² (Å⁻²) per canonical
+            # HKL using ref cell's reciprocal-cartesian mapping.  cell1
+            # is a tuple (a,b,c,α,β,γ) here; wrap in gemmi to get
+            # frac.mat.
+            _s2_canon = None
+            if ((sobolev_lambda and sobolev_lambda > 0)
+                    or (wilson_cap_alpha and wilson_cap_alpha > 0)):
+                _cell_g = gemmi.UnitCell(*cell1)
+                _M_frac = np.array(_cell_g.frac.mat.tolist())
+                _canon_orth = canon_hkls.astype(float) @ _M_frac
+                _s2_canon = np.sum(_canon_orth ** 2, axis=1)
             params, active_c, snr_c = fit_lstsq_symm(
                 X_symm, shifts_flat, drop_snr=drop_snr,
-                bound_by_obs_frac=obs_max_frac, pnn_mode=pnn_mode)
+                bound_by_obs_frac=obs_max_frac, pnn_mode=pnn_mode,
+                s2_canon=_s2_canon, sobolev_lambda=sobolev_lambda,
+                sobolev_beta=sobolev_beta,
+                wilson_cap_alpha=wilson_cap_alpha,
+                wilson_cap_snr_min=wilson_cap_snr_min)
             AB_xyz = expand_ab_canon(params, active_c, canon_hkls, hkls_now,
                                      hkl_to_canon, hkl_all_ops, proper_ops)
 
@@ -4228,7 +4318,7 @@ def _map2mtz(mapfile, mtzfile):
 
 def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col,
                             mtzfile, anisotropic=False, n_cycles=4,
-                            subtract='ref'):
+                            subtract='ref', d_min_cap=None):
     """FFT bent_map; F-space fit (k, B) of bent → ref MTZ; compute scaled bent
     F + F-space DELFWT; write bent.mtz; return (diff_real, riso, k, B).
 
@@ -4238,6 +4328,14 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
                'bent' → diff = ref − bent_scaled
                         positive peak = density present in ref but absent (or
                         weaker) in bent
+
+    d_min_cap : optional (Å).  When set, restrict the k+B fit AND the
+        reported Riso to reflections with d ≥ d_min_cap.  DELFWT is also
+        forced to zero for HKLs at d < d_min_cap so the inverse-FFT
+        difference map is band-limited to the shared observation range
+        of mov and ref — otherwise ref-side model-derived FWT paints
+        atom-shaped features into the diff map in the gap band.
+        Use in fitreso_scan with cap = max(mov_dmin_orig, ref_dmin_orig).
 
     diff_real is the inverse-FFT of the F-space diff on ref's grid — i.e. the
     residual density after absorbing the resolution-dependent scale.  See
@@ -4282,8 +4380,18 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
     h_orth = hkl.astype(float) @ M_frac
     s_sq   = np.sum(h_orth ** 2, axis=1)
 
+    # d_min cap for the FIT (Riso reported below is over the same set).
+    # DELFWT is capped separately just before the inverse-FFT so we retain
+    # the FULL HKL row set for bent.mtz's amplitude columns (FDM/PHIDM)
+    # — clients who want the map-coefficient view still see everything.
+    if d_min_cap is not None and d_min_cap > 0:
+        _s_thresh = 1.0 / (float(d_min_cap) ** 2)
+        _in_band = s_sq <= _s_thresh + 1e-8
+    else:
+        _in_band = np.ones(len(rF), dtype=bool)
+
     # ── Fit (k, B) [or (k, V) anisotropic] via F-space LS, iterated
-    use = np.ones(len(rF), dtype=bool)
+    use = _in_band.copy()
     if not anisotropic:
         params = np.array([np.log(max(np.dot(rF, bF) / np.dot(bF, bF), 1e-10)), 0.0])
         def _scale_fn(p, m=None):
@@ -4318,7 +4426,13 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         B_fit = float(4.0 * np.trace(_Vmat(params)) / 3.0)
 
     bF_scaled = scale * bF
-    riso = float(np.sum(np.abs(rF - bF_scaled)) / np.sum(np.abs(rF)))
+    # Report Riso over the shared band only when a cap is set — otherwise
+    # unrelated model-vs-nothing contributions dominate the sum.
+    if _in_band.any() and not _in_band.all():
+        riso = float(np.sum(np.abs(rF[_in_band] - bF_scaled[_in_band]))
+                     / max(np.sum(np.abs(rF[_in_band])), 1e-30))
+    else:
+        riso = float(np.sum(np.abs(rF - bF_scaled)) / np.sum(np.abs(rF)))
 
     # ── F-space diff (sign controlled by `subtract`)
     ref_c       = rF        * np.exp(1j * np.radians(rPH))
@@ -4329,6 +4443,14 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         diff_c = ref_c - bent_c_scl           # positive peak = ref has more
     diff_F      = np.abs(diff_c).astype(np.float32)
     diff_PH     = np.degrees(np.angle(diff_c)).astype(np.float32)
+
+    # Kill DELFWT past the d_min cap so the inverse-FFT diff map is
+    # band-limited to the shared observation range (fixes "holes inside
+    # peaks" from ref-side model FWT painting atom-shaped features into
+    # the diff in the gap band).
+    if d_min_cap is not None and d_min_cap > 0 and not _in_band.all():
+        diff_F[~_in_band] = 0.0
+        diff_PH[~_in_band] = 0.0
 
     # ── Write bent.mtz with scaled FDM and F-space DELFWT
     out = gemmi.Mtz(with_base=True)
@@ -4443,6 +4565,9 @@ def fitreso_scan(
     preserve_mov_numbering=True,
     scan_all_fr=False,
     early_stop_tol=0.01, early_stop_n=2,
+    holdout_frac=0.0, holdout_seed=0,
+    sobolev_lambda=0.0, sobolev_beta=1.0,
+    wilson_cap_alpha=None, wilson_cap_snr_min=2.0,
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -4632,6 +4757,34 @@ def fitreso_scan(
         print(f'  ref grid: {ref_grid_shape}  (used for all mov/ref map '
               f'loads to avoid cross-grid leakage)', flush=True)
 
+    # ── Capture the RAW input d_mins for the R-factor / diff-map cap.
+    # After the grid unification above, bent FDM is honestly zero in the
+    # gap band (d_min_mov < d < d_min_ref).  But compute_riso and
+    # _fspace_scale_and_diff still SUM over the whole HKL range by
+    # default — comparing "0" (from mov, correct) to "model amplitude"
+    # (from ref FWT) contributes R=1 per HKL for hundreds of thousands
+    # of HKLs.  Cap the fit and the reported R at the coarser d_min so
+    # the number reflects the physically meaningful shared band.
+    def _mtz_dmin(path):
+        try:
+            if path and path.lower().endswith('.mtz'):
+                return float(gemmi.read_mtz_file(path).resolution_high())
+        except Exception:
+            pass
+        return None
+    _mov_dmin_orig = _mtz_dmin(raw_mov_mtz_in)
+    _ref_dmin_orig = _mtz_dmin(ref_mtz)
+    if _mov_dmin_orig is not None and _ref_dmin_orig is not None:
+        d_cap = max(_mov_dmin_orig, _ref_dmin_orig)
+    else:
+        d_cap = _mov_dmin_orig or _ref_dmin_orig       # None if both maps
+    if verbose:
+        _cap_note = (f'  R-factor / diff-map cap: d ≥ {d_cap:.3f} Å '
+                     f'(mov d_min = {_mov_dmin_orig}, ref d_min = '
+                     f'{_ref_dmin_orig})' if d_cap else
+                     '  R-factor / diff-map cap: disabled (map inputs)')
+        print(_cap_note, flush=True)
+
     pre_mov_fullcell = pre_mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc'))
     pre_mov_d, pre_mov_h, _, pre_mov_f_col = _load(
         pre_mov_mtz, 'pre_mov', fullcell=pre_mov_fullcell,
@@ -4783,6 +4936,22 @@ def fitreso_scan(
     # Accumulate one dict per scan point for the final scan_fitreso.log table
     _log_rows = []
 
+    # Cross-validation callback: bend_fit_progressive calls this every
+    # iteration when holdout_frac > 0.  We stash the latest (eff_reso,
+    # n_hkls, train, hold, hold_prefit, hold_ca, hold_ca_prefit) so
+    # _save_point can attach it to the matching row.  Keyed by iter_i;
+    # _save_point looks up by n_hkls/eff_reso.  Only holds the latest
+    # entry per iter — simple and safe since callbacks fire sequentially.
+    _cv_state = {}
+    def _cv_callback(iter_i, eff_reso, n_hkls, n_canon, rmsd,
+                     train_rmsd, hold_rmsd, hold_prefit,
+                     hold_ca_rmsd, hold_ca_prefit, n_hold):
+        _cv_state['latest'] = dict(
+            iter_i=iter_i, eff_reso=eff_reso, n_hkls=n_hkls, n_canon=n_canon,
+            train_rmsd=train_rmsd, hold_rmsd=hold_rmsd,
+            hold_prefit=hold_prefit, hold_ca_rmsd=hold_ca_rmsd,
+            hold_ca_prefit=hold_ca_prefit, n_hold=n_hold)
+
     def _save_point(label, outdir, bent_map, rmsd_before, rmsd_after,
                     n_active, t_elapsed, hkls=None, AB_xyz=None):
         bent_map_name    = f'bent{col_suffix}.map'
@@ -4811,7 +4980,8 @@ def fitreso_scan(
         bent_mtz_path = f'{outdir}/{bent_mtz_name}'
         diff, riso, kF, B = _fspace_scale_and_diff(
             bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
-            bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract)
+            bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract,
+            d_min_cap=d_cap)
         if diff is None:
             # F-space path failed (too few matched reflections) — fall back to
             # z-scored real-space diff (matches the requested sign convention)
@@ -4822,7 +4992,8 @@ def fitreso_scan(
             riso, kF, B = compute_riso(riso_ref_mtz, riso_ref_col,
                                        bent_mtz_path, 'FDM',
                                        n_cycles=riso_n_cycles,
-                                       sigma_cut=riso_sigma_cut)
+                                       sigma_cut=riso_sigma_cut,
+                                       d_min=d_cap)
         diff_norm = diff / diff.std()
         write_ccp4(f'{outdir}/{diffnorm_name}', diff_norm, ref_h)
         # Rbend = R-factor of bent map vs hkl00-resampled map (how much bending
@@ -4834,7 +5005,8 @@ def fitreso_scan(
             rbend, _, _ = compute_riso(_unbent_bent[0], 'FDM',
                                         f'{outdir}/{bent_mtz_name}', 'FDM',
                                         n_cycles=riso_n_cycles,
-                                        sigma_cut=riso_sigma_cut)
+                                        sigma_cut=riso_sigma_cut,
+                                        d_min=d_cap)
         peaks = _scan_find_peaks(diff_norm, ref_h, atoms, M)
         # largest peak by absolute σ (sign preserved)
         p_top = peaks['pos'] if abs(peaks['pos'][0]) >= abs(peaks['neg'][0]) else peaks['neg']
@@ -4877,13 +5049,17 @@ def fitreso_scan(
                    f"{rbent_str:>6}  {rbend_str:>6}  {geom_str:>13}  "
                    f"{p_top[0]:>+7.2f}σ  {atom_str:>20} {p_top[2]:.2f}Å  "
                    f"[{t_elapsed:.0f}s]")
+        # Attach latest cross-validation snapshot (if holdout_frac > 0),
+        # cleared after use so a subsequent point without an updated CV
+        # entry doesn't inherit stale numbers.
+        _cv = _cv_state.pop('latest', None)
         _log_rows.append(dict(label=label, rmsd=rmsd_after, n_active=n_active,
                               rbent=riso, rbend=rbend, k=kF, B=B,
                               peak_sigma=p_top[0], peak_atom=atom_str,
                               peak_dist=p_top[2], peak_idx=p_top[3],
                               geom=geom,
                               dipole=dipole, S=S,
-                              t=t_elapsed, row_str=row_str))
+                              t=t_elapsed, row_str=row_str, cv=_cv))
         if verbose:
             print(row_str, flush=True)
 
@@ -4918,7 +5094,8 @@ def fitreso_scan(
     pre_bent_mtz_path = f'{outdir_pre}/{pre_bent_mtz_name}'
     pre_diff, pre_riso, pre_kF, pre_B = _fspace_scale_and_diff(
         pre_bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
-        pre_bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract)
+        pre_bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract,
+        d_min_cap=d_cap)
     if pre_diff is None:
         ref_n  = (ref_d        - ref_d.mean())        / ref_d.std()
         bent_n = (pre_bent_map - pre_bent_map.mean()) / pre_bent_map.std()
@@ -4926,7 +5103,8 @@ def fitreso_scan(
         _write_scan_mtz(pre_bent_map, pre_diff, ref_h, pre_bent_mtz_path)
         pre_riso, pre_kF, pre_B = compute_riso(
             riso_ref_mtz, riso_ref_col, pre_bent_mtz_path, 'FDM',
-            n_cycles=riso_n_cycles, sigma_cut=riso_sigma_cut)
+            n_cycles=riso_n_cycles, sigma_cut=riso_sigma_cut,
+            d_min=d_cap)
     pre_diff_norm = pre_diff / pre_diff.std()
     write_ccp4(f'{outdir_pre}/{pre_diff_name}', pre_diff_norm, ref_h)
     pre_peaks  = _scan_find_peaks(pre_diff_norm, ref_h, pre_atoms, M)
@@ -5100,6 +5278,11 @@ def fitreso_scan(
         verbose=False,
         iter_callback=_hkl_callback,
         precomputed_origin=precomputed_origin,
+        holdout_frac=holdout_frac, holdout_seed=holdout_seed,
+        cv_callback=_cv_callback,
+        sobolev_lambda=sobolev_lambda, sobolev_beta=sobolev_beta,
+        wilson_cap_alpha=wilson_cap_alpha,
+        wilson_cap_snr_min=wilson_cap_snr_min,
     )
 
     # ── Section 3: fr<N> — resolution scans (single progressive call) ─────────
@@ -5238,6 +5421,11 @@ def fitreso_scan(
                 iter_callback=_fr_callback,
                 precomputed_origin=precomputed_origin,
                 iteration_schedule=schedule,
+                holdout_frac=holdout_frac, holdout_seed=holdout_seed,
+                cv_callback=_cv_callback,
+                sobolev_lambda=sobolev_lambda, sobolev_beta=sobolev_beta,
+                wilson_cap_alpha=wilson_cap_alpha,
+                wilson_cap_snr_min=wilson_cap_snr_min,
             )
         except _EarlyStop:
             if verbose:
@@ -5369,6 +5557,11 @@ def fitreso_scan(
             outlier_sigma=outlier_sigma, b_sigma=b_sigma, atom_sel=atom_sel, bound_by_obs=bound_by_obs, pnn_mode=pnn_mode,
             verbose=False,
             precomputed_origin=precomputed_origin,
+            holdout_frac=holdout_frac, holdout_seed=holdout_seed,
+            cv_callback=_cv_callback,
+            sobolev_lambda=sobolev_lambda, sobolev_beta=sobolev_beta,
+            wilson_cap_alpha=wilson_cap_alpha,
+            wilson_cap_snr_min=wilson_cap_snr_min,
         )
         t_fit = time.time() - t0
         dim_list = list(result.dimensions)
@@ -5443,11 +5636,14 @@ def fitreso_scan(
         fh.write(f"# score   : combined d_opt score, score = Rbent + 0.1·RMSD + 0.5·max(0,dipole)\n")
         fh.write(f"#           + 0.05·max(0,bondZ−1).  Lower = better; argmin(score) across fr-rows\n")
         fh.write(f"#           is an alternative d_opt pick that combines fit / geometry / align.\n\n")
+        _has_cv = any((r.get('cv') is not None) for r in _log_rows)
+        _cv_hdr = f"  {'train':>5}  {'hold':>5}  {'hprfit':>6}" if _has_cv else ''
         hdr = (f"{'label':>7}  {'RMSD':>6}  {'active':>6}  "
                f"{'Rbent':>6}  {'Rbend':>6}  "
                f"{'k':>6}  {'B(Å²)':>7}  "
                f"{'bondZ':>7}/{'angZ':>5}  "
-               f"{'dipole':>7}  {'score':>6}  "
+               f"{'dipole':>7}  {'score':>6}"
+               f"{_cv_hdr}  "
                f"{'peak':>7}  {'atom':>20}  {'dist':>6}  "
                f"{'pre@peak':>9}  {'t(s)':>5}\n")
         fh.write(hdr)
@@ -5469,11 +5665,18 @@ def fitreso_scan(
             S_s    = f"{S_val:>6.3f}" if S_val is not None else f"{'—':>6}"
             pab    = r.get('pre_at_peak_sigma')
             pab_s  = f"{pab:>+7.2f}σ" if pab is not None else f"{'—':>9}"
+            _cv = r.get('cv') if _has_cv else None
+            if _cv is not None:
+                _cv_s = (f"  {_cv['train_rmsd']:5.3f}  {_cv['hold_rmsd']:5.3f}"
+                         f"  {_cv['hold_prefit']:6.3f}")
+            else:
+                _cv_s = ('  ' + ' '.join(['-----']*3) if _has_cv else '')
             fh.write(f"{r['label']:>7}  {rmsd_s:>6}  {r['n_active']:>6d}  "
                      f"{rbe_s:>6}  {rbd_s:>6}  "
                      f"{k_s:>6}  {B_s:>7}  "
                      f"{g_s}  "
-                     f"{dip_s}  {S_s}  "
+                     f"{dip_s}  {S_s}"
+                     f"{_cv_s}  "
                      f"{r['peak_sigma']:>+7.2f}σ  {r['peak_atom']:>20}  "
                      f"{r['peak_dist']:>5.2f}Å  "
                      f"{pab_s:>9}  {r['t']:>4.0f}s\n")
@@ -5545,9 +5748,17 @@ def fitreso_scan(
 
 
 def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
-                 n_cycles=4, sigma_cut=float('inf'), anisotropic=False):
+                 n_cycles=4, sigma_cut=float('inf'), anisotropic=False,
+                 d_min=None):
     """Scale F_test to F_ref with k + isotropic (default) or anisotropic B;
     return (riso, k, B_iso_eq) or (None, None, None).
+
+    d_min : optional (Å).  When set, restrict the k+B fit AND the reported
+        Riso to reflections with d ≥ d_min.  Use in fitreso_scan to cap
+        the comparison at max(mov_dmin_orig, ref_dmin_orig) — outside that
+        band, one side is honest zero (mov, band-limited) and the other
+        is model-informed (ref FWT); comparing them gives an R = 1.0 per
+        HKL that inflates the sum without carrying any physical meaning.
 
     Model (same as CCP4 scaleit):
 
@@ -5612,6 +5823,18 @@ def compute_riso(ref_mtz_path, ref_col, test_mtz_path, test_col,
         M_frac = np.array(cell.frac.mat.tolist())
         h_orth = hkl @ M_frac           # (N, 3)
         s_sq   = np.sum(h_orth ** 2, axis=1)   # 1/d²
+
+        # d_min cap.  Any HKL with d < d_min sits past the shared
+        # observation band and contributes only meaningless (0-vs-model)
+        # or (model-vs-model) residuals — drop them here so the fit AND
+        # the reported R factor honestly reflect the shared band only.
+        if d_min is not None and d_min > 0:
+            s_thresh = 1.0 / (float(d_min) ** 2)
+            keep_d = s_sq <= s_thresh + 1e-8    # tolerance for boundary rounding
+            if keep_d.sum() < 10:
+                return None, None, None
+            hkl = hkl[keep_d]; r = r[keep_d]; t = t[keep_d]
+            h_orth = h_orth[keep_d]; s_sq = s_sq[keep_d]
 
         use = np.ones(len(r), dtype=bool)
 
