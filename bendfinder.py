@@ -4050,17 +4050,42 @@ def _sigmaa_fill_mtz(in_mtz_path, pdb_path, out_mtz_path, d_min=None,
         s2_miss = np.array([1.0 / cell.calculate_d(h) ** 2 for h in missing])
         sigmaA_miss, SigN_miss = _eval_sigmaa_wilson(
             sigmaA_fit, wilson_fit, s2_miss, sigmaA_stats=stats)
-        # D = σA · √(SigN/SigP) with SigP = |Fc|² locally (per-HKL, not shell
-        # average) — SigP is known everywhere from Fc so we use it directly
-        # rather than the shell-average SigP fit.  This makes D·Fc exactly
-        # σA·√(SigN)·sign(Fc), independent of the SigP shell binning.
-        with np.errstate(invalid='ignore', divide='ignore'):
-            D_miss = np.where(miss_Fc > 0,
-                              sigmaA_miss * np.sqrt(SigN_miss) / miss_Fc,
-                              0.0)
-        Fp_miss  = D_miss * miss_Fc      # = σA · √(SigN) · sign(Fc)
-        sigFp_miss = np.sqrt(np.maximum(1.0 - sigmaA_miss ** 2, 0.0)
-                             * np.maximum(SigN_miss, 0.0))
+        # NEVER put model-derived Fcalc values into FP — that would give
+        # refmac fake observations to refine against, biasing its rigid-
+        # body / bulk-solvent / aniso fits toward the model.  Standing
+        # constraint from earlier sessions: "never switch to Fcalc if the
+        # user provided Fobs."
+        #
+        # Instead:
+        # - Within-band rows (d ≥ input's own d_min): fill FP = σA·|Fc|
+        #   with SIGFP = √(1-σA²)·|Fc|.  σA here is FIT (not extrapolated)
+        #   on the working set, so the Bayesian σA-weighted D·|Fc| is
+        #   Read's prescribed fill for genuinely-missing observations
+        #   within the collected resolution range.  Refmac may use these
+        #   in the LS target, which is the standard σA framework.
+        # - Extension rows (d < input's own d_min, from cross-d_min pair):
+        #   FP/SIGFP left NaN.  Refmac's LS target sees only real Fobs.
+        #   The σA·|Fc| value is still emitted into the FC diagnostic
+        #   column so downstream map-building code can use it.  A RESO
+        #   directive in run_refinement forces refmac to process the
+        #   NaN-Fobs extension rows and emit model-only FWT for them.
+        input_dmin = float(mtz_in.resolution_high())
+        _miss_d = np.array([cell.calculate_d(h) for h in missing])
+        _within_mask = _miss_d >= (input_dmin - 1e-4)
+        n_within = int(_within_mask.sum())
+        n_extend = int((~_within_mask).sum())
+        if verbose and n_extend > 0:
+            print(f'  fill split: {n_within} within-band (d ≥ {input_dmin:.3f} Å, '
+                  f'FP=σA·|Fc|) + {n_extend} extension (d < {input_dmin:.3f} Å, '
+                  f'FP=NaN so refmac LS ignores; FC/PHIC still emitted)',
+                  flush=True)
+        Fp_miss    = sigmaA_miss * miss_Fc                           # σA·|Fc|
+        sigFp_miss = np.sqrt(np.maximum(1.0 - sigmaA_miss ** 2, 0.0)) * miss_Fc
+        # Blank FP/SIGFP for extension rows so refmac's LS target skips
+        # them.  Retain miss_Fc / miss_PHIC → FC/PHIC diagnostic columns
+        # for downstream use.
+        Fp_miss[~_within_mask]    = np.nan
+        sigFp_miss[~_within_mask] = np.nan
     else:
         miss_hkl = np.zeros((0, 3), dtype=np.int32)
         Fp_miss = np.zeros(0, dtype=np.float32)
@@ -4125,6 +4150,185 @@ def _sigmaa_fill_mtz(in_mtz_path, pdb_path, out_mtz_path, d_min=None,
         print(f'  sigmaA-fill: added {n_miss} rows, stripped {n_stripped} '
               f'absences → {os.path.basename(out_mtz_path)} '
               f'({n_present + n_miss} total rows)', flush=True)
+    return out_mtz_path
+
+
+def _extend_mov_fwt_post_refmac(mov_mtz_path, mov_pdb_path,
+                               ref_mtz_path, out_mtz_path,
+                               fill_dmin, ref_f_col='FWT', ref_phi_col='PHWT',
+                               mov_f_col='FWT', mov_phi_col='PHWT',
+                               verbose=True):
+    """Post-refmac extension of mov FWT past its own d_min via σA·|Fc|.
+
+    Runs AFTER refmac has produced mov's FWT/PHWT (against Fobs only).
+    Splices σA·|Fc|·exp(iφ_c) into mov's FWT column for HKLs at d < mov's
+    own d_min, up to `fill_dmin` (typically = ref's d_min).  Refmac's LS
+    target never sees these values — this is a pure map-coefficient
+    fill after the fit is settled.
+
+    Amplitudes are on REF's Fobs scale (via `gemmi sfcalc --scale-to
+    ref_mtz`).  This is deliberate: the extension is meant to be
+    directly interpretable alongside ref's FWT in the diff-map
+    calculation.  mov's within-band FWT (from refmac) stays on mov's
+    own Fo scale; the eventual F-space k+B fit in
+    `_fspace_scale_and_diff` rescales mov within-band to ref, so both
+    within-band and extension end up on ref scale for the diff.
+
+    σA is fit on mov's own data (within-band Fobs vs mov-scale Fc).
+    σA is scale-free so it applies equally to ref-scale Fc.
+
+    Standing constraint: NEVER give refmac Fcalc to refine against.
+    This function honors that by running post-refmac and writing only
+    to the FWT column (not FP).  Refmac's already-completed rigid-body
+    + bulk-solvent + aniso fit is unaffected.
+    """
+    import shutil as _sh
+    mtz_mov = gemmi.read_mtz_file(mov_mtz_path)
+    cell = mtz_mov.cell
+    sg   = mtz_mov.spacegroup
+    data = np.array(mtz_mov.array, copy=True)
+    lbls = mtz_mov.column_labels()
+    if mov_f_col not in lbls or mov_phi_col not in lbls:
+        raise RuntimeError(
+            f'{mov_mtz_path}: missing {mov_f_col}/{mov_phi_col} columns; '
+            f'available: {sorted(lbls)}')
+
+    mov_dmin_input = float(mtz_mov.resolution_high())
+    if fill_dmin is None or fill_dmin >= mov_dmin_input - 1e-3:
+        # Nothing to extend — mov already covers to fill_dmin or finer.
+        _sh.copyfile(mov_mtz_path, out_mtz_path)
+        return out_mtz_path
+
+    # ── 1. Compute Fc scaled to REF's Fobs, up to fill_dmin.
+    fc_mtz_path = out_mtz_path + '.fc_ref_scaled.mtz'
+    _recompute_fc_scaled(mov_pdb_path, ref_mtz_path, fc_mtz_path,
+                        d_min=fill_dmin, verbose=verbose)
+    mtz_fc = gemmi.read_mtz_file(fc_mtz_path)
+    fc_data = np.array(mtz_fc.array)
+    fc_lbls = mtz_fc.column_labels()
+    if 'FC' not in fc_lbls or 'PHIC' not in fc_lbls:
+        raise RuntimeError(f'{fc_mtz_path}: expected FC/PHIC columns from '
+                           f'sfcalc, got {sorted(fc_lbls)}')
+    fc_hkls  = fc_data[:, :3].astype(int)
+    fc_F     = fc_data[:, fc_lbls.index('FC')]
+    fc_PHI   = fc_data[:, fc_lbls.index('PHIC')]
+
+    # ── 2. Fit σA on mov's within-band data (mov Fobs vs mov-scale Fc).
+    #    σA is scale-free so we can use mov's Fc computed against mov MTZ.
+    F_lbl_mov = next((l for l in ('FP', 'F', 'FOBS') if l in lbls), None)
+    if F_lbl_mov is None:
+        raise RuntimeError(f'{mov_mtz_path}: no F/FP/FOBS column')
+    FREE_lbl_mov = _pick_free_column(mtz_mov)
+
+    mov_fc_path = out_mtz_path + '.fc_mov_scaled.mtz'
+    _recompute_fc_scaled(mov_pdb_path, mov_mtz_path, mov_fc_path,
+                        d_min=mov_dmin_input, verbose=False)
+    mtz_movfc = gemmi.read_mtz_file(mov_fc_path)
+    movfc_data = np.array(mtz_movfc.array)
+    movfc_lbls = mtz_movfc.column_labels()
+    movfc_hkls = movfc_data[:, :3].astype(int)
+    movfc_F    = movfc_data[:, movfc_lbls.index('FC')]
+
+    proper_ops = get_proper_symops(sg.xhm())
+    R_ints = [np.round(R).astype(int)
+              for R, _ in proper_ops] or [np.eye(3, dtype=int)]
+    movfc_canon = {tuple(_canonical_hkl(tuple(int(x) for x in h), R_ints)): i
+                   for i, h in enumerate(movfc_hkls)}
+    Fo_mov  = data[:, lbls.index(F_lbl_mov)]
+    hkl_mov = data[:, :3].astype(int)
+    Fc_at_mov = np.full(len(hkl_mov), np.nan)
+    for i, h in enumerate(hkl_mov):
+        key = tuple(_canonical_hkl(tuple(int(x) for x in h), R_ints))
+        idx = movfc_canon.get(key)
+        if idx is not None:
+            Fc_at_mov[i] = movfc_F[idx]
+    s2_mov = np.array([1.0 / cell.calculate_d(tuple(int(x) for x in h)) ** 2
+                       for h in hkl_mov])
+    free_mov = (data[:, lbls.index(FREE_lbl_mov)].astype(int)
+                if FREE_lbl_mov is not None else None)
+    stats = _sigmaa_shell_stats(Fo_mov, Fc_at_mov, s2_mov, free_mov,
+                                n_shells=20, use_free=True)
+    sigmaA_fit, wilson_fit = _fit_sigmaa_wilson(stats)
+    if sigmaA_fit is None:
+        raise RuntimeError('post-refmac extension: σA fit failed.')
+    if verbose:
+        a, b = sigmaA_fit
+        print(f'  post-refmac σA fit: ln σA = {a:+.3f} + {b:+.3f}·s²  '
+              f'(from mov within-band Fobs)', flush=True)
+
+    # ── 3. Enumerate SG-ASU HKLs up to fill_dmin; identify extension rows
+    #     (those past mov's own d_min AND not already in the mov MTZ).
+    ops = sg.operations()
+    in_canon_set = set()
+    for h in hkl_mov:
+        canon = _canonical_hkl(tuple(int(x) for x in h), R_ints)
+        in_canon_set.add(tuple(int(x) for x in canon))
+    cell_tuple = (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma)
+    asu_hkls = _enumerate_sg_asu_hkls(cell_tuple, sg, fill_dmin)
+    missing = [tuple(int(x) for x in h) for h in asu_hkls
+               if tuple(int(x) for x in h) not in in_canon_set]
+    if not missing:
+        if verbose:
+            print('  post-refmac extension: no missing rows to fill '
+                  '(mov already covers full SG-ASU to fill_dmin)',
+                  flush=True)
+        _sh.copyfile(mov_mtz_path, out_mtz_path)
+        return out_mtz_path
+
+    miss_hkl = np.array(missing, dtype=np.int32)
+
+    # Look up Fc/PHIC on ref-scale for extension HKLs.
+    fc_canon_to_idx = {tuple(_canonical_hkl(tuple(int(x) for x in h), R_ints)): i
+                       for i, h in enumerate(fc_hkls)}
+    miss_Fc   = np.full(len(missing), np.nan, dtype=np.float32)
+    miss_PHIC = np.full(len(missing), np.nan, dtype=np.float32)
+    for i, h in enumerate(missing):
+        key = tuple(_canonical_hkl(h, R_ints))
+        idx = fc_canon_to_idx.get(key)
+        if idx is not None:
+            miss_Fc[i]   = fc_F[idx]
+            miss_PHIC[i] = fc_PHI[idx]
+
+    # σA per HKL at extension s²
+    s2_miss = np.array([1.0 / cell.calculate_d(h) ** 2 for h in missing])
+    sigmaA_miss, _SigN_miss = _eval_sigmaa_wilson(
+        sigmaA_fit, wilson_fit, s2_miss, sigmaA_stats=stats)
+
+    # ── 4. Extension FWT = σA · |Fc|, phi = phi_c.
+    ext_FWT  = (sigmaA_miss * np.abs(miss_Fc)).astype(np.float32)
+    ext_PHWT = miss_PHIC.astype(np.float32)
+
+    # ── 5. Assemble output MTZ: original mov data + extension rows.
+    # Blank all non-FWT/PHWT columns for the new rows (NaN).  Downstream
+    # code should read FWT/PHWT for map building.  FP/SIGFP stay NaN so
+    # if the extended MTZ is ever fed back to refmac, its LS target
+    # still ignores the extension rows.
+    n_present = data.shape[0]
+    n_extra   = miss_hkl.shape[0]
+    out = np.full((n_present + n_extra, data.shape[1]),
+                  np.nan, dtype=np.float32)
+    out[:n_present, :] = data
+    out[n_present:, 0:3]                    = miss_hkl.astype(np.float32)
+    out[n_present:, lbls.index(mov_f_col)]   = ext_FWT
+    out[n_present:, lbls.index(mov_phi_col)] = ext_PHWT
+
+    mtz_out = gemmi.read_mtz_file(mov_mtz_path)
+    mtz_out.set_data(out)
+    mtz_out.history = list(getattr(mtz_out, 'history', []) or [])
+    mtz_out.history.append(
+        f'BENDFINDER post-refmac σA extension: added {n_extra} rows past '
+        f'{mov_dmin_input:.3f} Å out to {fill_dmin:.3f} Å; FWT = σA·|Fc| '
+        f'on ref-scale, PHWT = φ_c.  Refmac LS not touched.')
+    mtz_out.write_to_file(out_mtz_path)
+    # Cleanup scratch sfcalc outputs
+    for p in (fc_mtz_path, mov_fc_path, fc_mtz_path + '.sfcalc.log',
+              mov_fc_path + '.sfcalc.log'):
+        try: os.remove(p)
+        except OSError: pass
+    if verbose:
+        print(f'  post-refmac extension: {n_extra} rows added past '
+              f'{mov_dmin_input:.3f} Å (σA·|Fc| on ref scale, phi=φ_c) '
+              f'→ {os.path.basename(out_mtz_path)}', flush=True)
     return out_mtz_path
 
 
@@ -4639,12 +4843,36 @@ def fitreso_scan(
     # code path is identical.
     pre_mov_pdb = raw_mov_pdb_in
     pre_mov_mtz = raw_mov_mtz_in
+    # Capture RAW mov / ref d_mins early so the pre_mov-refmac gate can
+    # detect the sigmaA extension case (a fuller comment on the d_min /
+    # fill_dmin usage sits below where d_cap is set).
+    def _mtz_dmin_early(path):
+        try:
+            if path and path.lower().endswith('.mtz'):
+                return float(gemmi.read_mtz_file(path).resolution_high())
+        except Exception:
+            pass
+        return None
+    _mov_dmin_orig = _mtz_dmin_early(raw_mov_mtz_in)
+    _ref_dmin_orig = _mtz_dmin_early(ref_mtz)
+    if _mov_dmin_orig is not None and _ref_dmin_orig is not None:
+        d_cap    = max(_mov_dmin_orig, _ref_dmin_orig)
+        fill_dmin = min(_mov_dmin_orig, _ref_dmin_orig)
+    else:
+        d_cap    = _mov_dmin_orig or _ref_dmin_orig
+        fill_dmin = _mov_dmin_orig or _ref_dmin_orig
     _need_ref_refmac = (run_refinement_flag
                         and ref_mtz.lower().endswith('.mtz'))
+    # Pre-refmac refmac trigger: FWT missing.  We do NOT trigger refmac
+    # to extend the sigmaA fill past mov's own d_min — that would give
+    # refmac model-derived FP values to refine against (Fcalc leakage
+    # into the LS target).  The extension is done AFTER refmac by
+    # `_extend_mov_fwt_post_refmac`, which splices σA·|Fc|·exp(iφ_c)
+    # directly into the FWT column without touching refmac's LS.
     _need_premov_refmac = (run_refinement_flag
                            and pre_mov_mtz.lower().endswith('.mtz')
                            and 'FWT' not in {c.label for c in
-                               gemmi.read_mtz_file(pre_mov_mtz).columns})
+                                gemmi.read_mtz_file(pre_mov_mtz).columns})
     if _need_ref_refmac or _need_premov_refmac:
         from concurrent.futures import ThreadPoolExecutor as _TPE
         with _TPE(max_workers=2) as _refmac_pool:
@@ -4758,6 +4986,10 @@ def fitreso_scan(
               f'loads to avoid cross-grid leakage)', flush=True)
 
     # ── Capture the RAW input d_mins for the R-factor / diff-map cap.
+    # Also used to extend the sigmaA fill on the coarser side out to the
+    # finer d_min — with the σA·|Fc| formula (per-HKL, not shell √SigN)
+    # the fill amplitudes stay substantial across the gap band, so the
+    # bent map has real content past mov d_min instead of hard zeros.
     # After the grid unification above, bent FDM is honestly zero in the
     # gap band (d_min_mov < d < d_min_ref).  But compute_riso and
     # _fspace_scale_and_diff still SUM over the whole HKL range by
@@ -4765,25 +4997,18 @@ def fitreso_scan(
     # (from ref FWT) contributes R=1 per HKL for hundreds of thousands
     # of HKLs.  Cap the fit and the reported R at the coarser d_min so
     # the number reflects the physically meaningful shared band.
-    def _mtz_dmin(path):
-        try:
-            if path and path.lower().endswith('.mtz'):
-                return float(gemmi.read_mtz_file(path).resolution_high())
-        except Exception:
-            pass
-        return None
-    _mov_dmin_orig = _mtz_dmin(raw_mov_mtz_in)
-    _ref_dmin_orig = _mtz_dmin(ref_mtz)
-    if _mov_dmin_orig is not None and _ref_dmin_orig is not None:
-        d_cap = max(_mov_dmin_orig, _ref_dmin_orig)
-    else:
-        d_cap = _mov_dmin_orig or _ref_dmin_orig       # None if both maps
+    # (d_cap / fill_dmin / _mov_dmin_orig / _ref_dmin_orig captured earlier
+    # for pre_mov-refmac gating; verbose logging done here so it appears
+    # in-line with the other altindex-related setup output.)
     if verbose:
         _cap_note = (f'  R-factor / diff-map cap: d ≥ {d_cap:.3f} Å '
                      f'(mov d_min = {_mov_dmin_orig}, ref d_min = '
                      f'{_ref_dmin_orig})' if d_cap else
                      '  R-factor / diff-map cap: disabled (map inputs)')
         print(_cap_note, flush=True)
+        if fill_dmin != d_cap:
+            print(f'  sigmaA fill extends to finer d_min = {fill_dmin:.3f} Å '
+                  f'(coarser side gets σA·|Fc| in the gap band)', flush=True)
 
     pre_mov_fullcell = pre_mov_mtz.lower().endswith(('.map', '.ccp4', '.mrc'))
     pre_mov_d, pre_mov_h, _, pre_mov_f_col = _load(
@@ -5171,6 +5396,30 @@ def fitreso_scan(
             outdir=os.path.join(scan_dir, 'refine_mov'),
             n_cycles=refine_cycles, fill_asu=fill_asu,
             fill_method=fill_method)
+
+    # ── Post-refmac σA extension of mov FWT past its own d_min ──────────
+    # When fill_method='sigmaa' and fill_dmin is finer than mov's own
+    # d_min, splice σA·|Fc|·exp(iφ_c) into the FWT column for the gap
+    # band.  Refmac's LS never sees these values — the extension is
+    # applied AFTER refmac's fit is settled.  On ref's Fo scale (via
+    # `gemmi sfcalc --scale-to ref_mtz`) so the extension amplitudes
+    # naturally join the downstream diff-map calculation.
+    if (fill_method == 'sigmaa' and fill_dmin is not None
+            and mov_mtz.lower().endswith('.mtz')
+            and _mov_dmin_orig is not None
+            and fill_dmin < _mov_dmin_orig - 1e-3
+            and ref_mtz.lower().endswith('.mtz')
+            and 'FWT' in {c.label for c in gemmi.read_mtz_file(mov_mtz).columns}):
+        _ext_out = os.path.join(scan_dir, 'mov_fwt_extended.mtz')
+        try:
+            _extend_mov_fwt_post_refmac(
+                mov_mtz, mov_pdb, ref_mtz, _ext_out,
+                fill_dmin=fill_dmin, verbose=verbose)
+            mov_mtz = _ext_out
+        except Exception as e:
+            if verbose:
+                print(f'  post-refmac σA extension failed ({e!r}); '
+                      f'continuing with un-extended mov MTZ', flush=True)
 
     # Load post-altindex mov density.  Default mov_fullcell to True for
     # CCP4 input (avoids ASU-boundary noise in diff_norm); MTZ input
@@ -5968,7 +6217,7 @@ def mtz_to_map_data(mtz_path, f_col, phi_col, sample_rate=0.0,
 
 
 def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
-                   fill_asu=False, fill_method='nan',
+                   fill_asu=False, fill_method='nan', fill_dmin=None,
                    completeness_threshold=0.99):
     """Run refmac5 or phenix.refine on pdb_path+mtz_path; return
     (refined_pdb_path, refined_mtz_path).
@@ -6041,13 +6290,14 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
         try:
             if fill_method == 'sigmaa':
                 _sigmaa_fill_mtz(mtz_path, pdb_path, mtz_filled,
+                                d_min=fill_dmin,
                                 workdir=outdir, verbose=True)
                 # sigmaa fill logs its own per-shell summary; still report
                 # the row-count change for parity with the NaN path.
                 n_in_rows  = len(gemmi.read_mtz_file(mtz_path).array)
                 n_out_rows = len(gemmi.read_mtz_file(mtz_filled).array)
                 print(f'  sigmaA-fill added {n_out_rows - n_in_rows} SG-ASU '
-                      f'rows with FP=D·|Fc|, SIGFP=√((1-σA²)·SigN) on the '
+                      f'rows with FP=σA·|Fc|, SIGFP=√(1-σA²)·|Fc| on the '
                       f'Fo scale (deposited Fobs untouched); FC/PHIC '
                       f'diagnostic columns emitted → {n_out_rows} total rows',
                       flush=True)
@@ -6140,9 +6390,25 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
         # unknown ligands (no restraints needed).  We only need refmac to
         # produce clean FWT/PHWT/SIGFP-scaled output; the input PDB is
         # already at the correct geometry.
+        #
+        # RESO directive: when fill_dmin is finer than the input MTZ's own
+        # d_min (cross-d_min pair with sigmaA extension), tell refmac to
+        # process out to fill_dmin explicitly.  Without this refmac's
+        # auto-detected resolution range would truncate at the input's
+        # observed d_min and silently drop the NaN-FP extension rows,
+        # meaning no model-only FWT gets emitted for them.  With RESO,
+        # refmac keeps the rows and generates FC/FWT from the model
+        # (2m·Fo term is zero for NaN Fo → FWT ≈ D·Fc, model-only).
+        _reso_line = ''
+        if fill_dmin is not None:
+            _in_dmin = float(gemmi.read_mtz_file(mtz_path_for_refmac)
+                                    .resolution_high())
+            if fill_dmin < _in_dmin - 1e-3:
+                _reso_line = f'RESO 100 {fill_dmin:.3f}\n'
         script = (f'REFI TYPE RIGID\n'
                   f'NCYC {n_cycles}\n'
                   f'LABIN {labin}\n'
+                  f'{_reso_line}'
                   f'END\n')
         cmd    = [refmac, 'xyzin', pdb_path, 'xyzout', out_pdb,
                   'hklin', mtz_path_for_refmac, 'hklout', out_mtz]
@@ -6920,8 +7186,8 @@ def _relabel_mtz_cell(in_mtz, target_cell, out_mtz):
 
 
 def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
-                               fill_asu, fill_method, drot_deg, rmsd,
-                               verbose):
+                               fill_asu, fill_method, fill_dmin,
+                               drot_deg, rmsd, verbose):
     """When cell-stretching alone aligned moving to ref (no discrete altindex
     needed), re-refine the stretched moving model+data under the new cell so
     FWT/PHWT are consistent with ref's cell metric.  The pre-stretch FWT/PHWT
@@ -6933,7 +7199,8 @@ def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
     out_pdb, out_mtz = run_refinement(mov_pdb, mov_mtz, outdir=outdir,
                                        n_cycles=refine_cycles,
                                        fill_asu=fill_asu,
-                                       fill_method=fill_method)
+                                       fill_method=fill_method,
+                                       fill_dmin=fill_dmin)
     return dict(mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
                 action='cell_stretch_only', R_frac=np.eye(3),
                 t_frac=np.zeros(3), drot_deg=drot_deg, rmsd_after=rmsd)
@@ -6941,7 +7208,8 @@ def _finish_after_stretch_only(mov_pdb, mov_mtz, outdir, refine_cycles,
 
 def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
                      refine_cycles=5, improve_threshold=0.7,
-                     verbose=True, fill_asu=False, fill_method='nan'):
+                     verbose=True, fill_asu=False, fill_method='nan',
+                     fill_dmin=None):
     """Find (altindex × symop × origin) discrete transform that aligns mov onto ref.
 
     Strategy: Kabsch LSQ fit gives the continuous rigid-body answer; enumerate
@@ -7131,7 +7399,7 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         if stretched:
             return _write_log_and_return(_finish_after_stretch_only(
                 mov_pdb, mov_mtz, outdir, refine_cycles, fill_asu,
-                fill_method, drot_deg, rmsd_base, verbose))
+                fill_method, fill_dmin, drot_deg, rmsd_base, verbose))
         return _write_log_and_return(_no_op_resolve_result(mov_pdb, mov_mtz,
                                                             drot=drot_deg,
                                                             rmsd=rmsd_base))
@@ -7141,7 +7409,7 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
         if stretched:
             return _write_log_and_return(_finish_after_stretch_only(
                 mov_pdb, mov_mtz, outdir, refine_cycles, fill_asu,
-                fill_method, drot_deg, rmsd_top, verbose))
+                fill_method, fill_dmin, drot_deg, rmsd_top, verbose))
         return _write_log_and_return(_no_op_resolve_result(mov_pdb, mov_mtz,
                                                             drot=drot_deg,
                                                             rmsd=rmsd_top))
@@ -7217,7 +7485,8 @@ def resolve_altindex(mov_pdb, ref_pdb, mov_mtz, outdir,
     out_pdb, out_mtz = run_refinement(pre_pdb, pre_mtz, outdir=outdir,
                                        n_cycles=refine_cycles,
                                        fill_asu=fill_asu,
-                                       fill_method=fill_method)
+                                       fill_method=fill_method,
+                                       fill_dmin=fill_dmin)
 
     return _write_log_and_return(dict(
         mov_pdb_out=out_pdb, mov_mtz_out=out_mtz,
