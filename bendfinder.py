@@ -3671,18 +3671,30 @@ def _relabel_mtz_fp_to_f(in_mtz_path, out_mtz_path):
 
 
 def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
-                        verbose=True):
-    """Recompute Fc with bulk solvent + anisotropic scaling to ref_mtz's F.
+                        target_col=None, verbose=True):
+    """Recompute Fc with bulk solvent + anisotropic scaling to a target
+    column in ref_mtz.
 
-    Wraps `gemmi sfcalc --dmin=<d> --scale-to=<mtz>:F --to-mtz=<out>`.
-    Result MTZ has columns FC / PHIC on the ref-Fo amplitude scale, so
-    D·Fc is directly usable to fill missing rows without introducing a
-    second Fobs population (the ~1/18-scale bug that killed the raw
-    DensityCalculatorX approach on DHFR 1rx1/1rx2).
+    Wraps `gemmi sfcalc --dmin=<d> --scale-to=<mtz>:<col> --to-mtz=<out>`.
 
-    ref_mtz_path is relabeled to F/SIGF into a scratch file first if it
-    carries FP/SIGFP or FOBS/SIGFOBS — `--scale-to` doesn't accept
-    arbitrary labels through its default parser.
+    target_col : which column of `ref_mtz_path` to scale gemmi's Fcalc to.
+        None (default) → auto-detect: prefer `FC` or `FC_ALL_LS` (refmac's
+        UNWEIGHTED total on-Fobs-scale model — scale should come out ≈ 1
+        as a sanity check that gemmi's bulk-solvent fit matches refmac's).
+        Falls back to `F`/`FP`/`FOBS` (Fobs).
+
+        DO NOT use `FC_ALL` — refmac's `FC_ALL` = D · (Fcalc + Fpart) is
+        already σA/ML-weighted (Murshudov 2003).  Using it as the scale
+        target would double-count the D weighting: `sfcalc --scale-to
+        FC_ALL` fits gemmi's Fcalc to a D-weighted target → scale factor
+        ends up ≈ D (< 1), and downstream σA fits done against `FC_ALL`
+        become circular.  Use the unweighted total (`FC` / `FC_ALL_LS`)
+        or Fobs instead.
+
+        Rationale for preferring the unweighted total: reproduces
+        refmac's own k_sol/B_sol/aniso rather than refitting bulk solvent
+        from scratch (small but real difference in the extension band
+        where fits may diverge slightly).
     """
     import shutil as _sh
     gemmi_exe = (_sh.which('gemmi')
@@ -3692,21 +3704,37 @@ def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
 
     mtz = gemmi.read_mtz_file(ref_mtz_path)
     cols = {c.label for c in mtz.columns}
-    if not any(l in cols for l in ('F', 'FP', 'FOBS')):
-        raise RuntimeError(f'{ref_mtz_path}: no F/FP/FOBS amplitude column')
+    if target_col is None:
+        # Auto-detect: prefer refmac's UNWEIGHTED total (FC = FC_ALL_LS);
+        # never FC_ALL (D-weighted).  Fall back to Fobs.
+        for cand in ('FC_ALL_LS', 'FC', 'F', 'FP', 'FOBS'):
+            if cand in cols:
+                target_col = cand
+                break
+    if target_col is None or target_col not in cols:
+        raise RuntimeError(f'{ref_mtz_path}: no suitable scale-to column '
+                           f'(looked for FC_ALL_LS/FC_ALL/F/FP/FOBS); have '
+                           f'{sorted(cols)}')
     if d_min is None:
         d_min = float(mtz.resolution_high())
 
-    # Relabel to F/SIGF (gemmi sfcalc --scale-to default labels) if needed.
-    scratch = out_fc_mtz + '.scale_input.mtz'
-    _relabel_mtz_fp_to_f(ref_mtz_path, scratch)
+    # gemmi sfcalc --scale-to expects the target column to be present in
+    # the MTZ.  If it's FP/FOBS, relabel to F for the default parser;
+    # FC_ALL[_LS] and F pass through directly.
+    if target_col in ('FP', 'FOBS'):
+        scratch = out_fc_mtz + '.scale_input.mtz'
+        _relabel_mtz_fp_to_f(ref_mtz_path, scratch)
+        scale_col_expr = f'{scratch}:F'
+    else:
+        scratch = None
+        scale_col_expr = f'{ref_mtz_path}:{target_col}'
 
     cmd = [gemmi_exe, 'sfcalc', f'--dmin={d_min:.4f}',
-           f'--scale-to={scratch}:F',
+           f'--scale-to={scale_col_expr}',
            f'--to-mtz={out_fc_mtz}', pdb_path]
     if verbose:
-        print(f'  gemmi sfcalc --scale-to → {os.path.basename(out_fc_mtz)}',
-              flush=True)
+        print(f'  gemmi sfcalc --scale-to={target_col} → '
+              f'{os.path.basename(out_fc_mtz)}', flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True)
     log_path = out_fc_mtz + '.sfcalc.log'
     with open(log_path, 'w') as _lf:
@@ -3715,10 +3743,11 @@ def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
         _lf.write(r.stdout or '')
         _lf.write('\n--- stderr ---\n')
         _lf.write(r.stderr or '')
-    try:
-        os.remove(scratch)
-    except OSError:
-        pass
+    if scratch is not None:
+        try:
+            os.remove(scratch)
+        except OSError:
+            pass
     if r.returncode != 0 or not os.path.exists(out_fc_mtz):
         raise RuntimeError(
             f'gemmi sfcalc failed (rc={r.returncode}); see {log_path}')
@@ -3727,21 +3756,33 @@ def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
 
 def _sigmaa_shell_stats(fo, fc, s2, free_flag, n_shells=20, use_free=True,
                         min_per_shell=10):
-    """Per-shell σA, D, SigN, SigP estimators on FREE==0 (held-out).
+    """Per-shell "σA" estimators on FREE==0 (held-out).
 
-    Estimators (Read 1986, per-shell, uncentered):
-        σA    = Σ(Fo·Fc) / √(ΣFo² · ΣFc²)          (amplitude correlation)
-        D     = Σ(Fo·Fc) / ΣFc²                    (LS slope; the fill factor)
-        SigN  = <Fo²>                              (Wilson variance of Fo)
-        SigP  = <Fc²>                              (variance of Fc)
+    NOTE ON "σA": what this returns is the AMPLITUDE CORRELATION
+        σA_amp(shell) = Σ(Fo·Fc) / √(ΣFo² · ΣFc²)
+    NOT the "traditional" σA (Read 1986, Cowtan 2005, Murshudov 2003)
+    computed by maximum-likelihood integration over phases.  The two
+    agree in the limit σA → 1 (low-resolution, well-refined structure)
+    but diverge as phases dephase — the ML σA accounts for the phase
+    distribution analytically while the amplitude correlation ignores
+    it.  Refmac's ML σA is authoritative; consider adding a hook to
+    read it from refmac's log or from the FOM/D columns if higher
+    accuracy is needed in the high-s² tail.
 
-    Only finite-Fo, finite-Fc, Fc>0 rows enter.  When `use_free` and a FreeR
-    column is provided, restricts to `free_flag == 0` (the held-out set) —
-    working-set σA is overfit-optimistic (8sf1: 0.958 free vs 0.971 working).
-    Falls back to all working rows if the free subset is too small.
+    Only finite-Fo, finite-Fc, Fc>0 rows enter.  When `use_free` and a
+    FreeR column is provided, restricts to `free_flag == 0` (the
+    held-out set) — working-set σA is overfit-optimistic (8sf1: 0.958
+    free vs 0.971 working).  Falls back to all working rows if the free
+    subset is too small.
 
-    Returns dict with s²_mid (Å⁻²), per-shell σA/D/SigN/SigP arrays (NaN in
-    under-populated shells), and the number of reflections used.
+    Also returned (vestigial, only sigmaA is used by the current fill):
+        D     = Σ(Fo·Fc) / ΣFc²        (LS slope; the "fill factor" in
+                                        the earlier σA·√SigN version)
+        SigN  = <Fo²>                  (Wilson variance of Fo)
+        SigP  = <Fc²>                  (variance of Fc)
+
+    Returns dict with s²_mid (Å⁻²), per-shell σA/D/SigN/SigP arrays
+    (NaN in under-populated shells), and the number of reflections used.
     """
     finite = np.isfinite(fo) & np.isfinite(fc) & (fc > 0)
     mask = finite.copy()
@@ -4166,21 +4207,31 @@ def _extend_mov_fwt_post_refmac(mov_mtz_path, mov_pdb_path,
     target never sees these values — this is a pure map-coefficient
     fill after the fit is settled.
 
-    Amplitudes are on REF's Fobs scale (via `gemmi sfcalc --scale-to
-    ref_mtz`).  This is deliberate: the extension is meant to be
-    directly interpretable alongside ref's FWT in the diff-map
-    calculation.  mov's within-band FWT (from refmac) stays on mov's
-    own Fo scale; the eventual F-space k+B fit in
-    `_fspace_scale_and_diff` rescales mov within-band to ref, so both
-    within-band and extension end up on ref scale for the diff.
+    Amplitudes are on MOV's own Fo scale (via `gemmi sfcalc --scale-to
+    mov_mtz:FC_ALL[_LS]` where possible) — keeps the extension coherent
+    with mov's within-band FWT from refmac.  A cross-scale ref-side
+    extension caused a ~5× amplitude discontinuity at the boundary that
+    ruined the map (unbent.mtz looked horrible in Coot).  The downstream
+    `_fspace_scale_and_diff` k+B fit takes care of the mov→ref scale
+    for the diff-map calculation.
 
-    σA is fit on mov's own data (within-band Fobs vs mov-scale Fc).
-    σA is scale-free so it applies equally to ref-scale Fc.
+    Scaling target for gemmi's Fcalc: refmac's `FC_ALL_LS` (or `FC_ALL`
+    if `_LS` not emitted).  That gives scale ≈ 1 as a sanity check that
+    we're reproducing refmac's internal model rather than refitting bulk
+    solvent from scratch.  For non-refmac inputs (phenix) we fall back
+    to `--scale-to mov_mtz:F` (Fobs), same as historical behavior.
+
+    σA is fit on mov's own within-band data using refmac's model column
+    (`FC_ALL` / `FC_ALL_LS`) directly for the "Fc" side of the
+    correlation — refmac-consistent σA.  Shell averaging is used only
+    to get statistically-reliable σA-per-shell; the fill formula
+    itself is per-HKL σA·|Fc| (no shell SigN/SigP — that was a
+    leftover from an earlier σA·√SigN version).
 
     Standing constraint: NEVER give refmac Fcalc to refine against.
     This function honors that by running post-refmac and writing only
-    to the FWT column (not FP).  Refmac's already-completed rigid-body
-    + bulk-solvent + aniso fit is unaffected.
+    to the FWT/PHWT columns (not FP/SIGFP).  Refmac's already-completed
+    rigid-body + bulk-solvent + aniso fit is unaffected.
     """
     import shutil as _sh
     mtz_mov = gemmi.read_mtz_file(mov_mtz_path)
@@ -4199,9 +4250,12 @@ def _extend_mov_fwt_post_refmac(mov_mtz_path, mov_pdb_path,
         _sh.copyfile(mov_mtz_path, out_mtz_path)
         return out_mtz_path
 
-    # ── 1. Compute Fc scaled to REF's Fobs, up to fill_dmin.
-    fc_mtz_path = out_mtz_path + '.fc_ref_scaled.mtz'
-    _recompute_fc_scaled(mov_pdb_path, ref_mtz_path, fc_mtz_path,
+    # ── 1. Compute gemmi Fcalc scaled to refmac's model column (FC_ALL_LS
+    # or FC_ALL, whichever is present), extended out to fill_dmin.
+    # `_recompute_fc_scaled` auto-detects FC_ALL_LS → FC_ALL → F fallback.
+    # Ideal outcome: scale=1 (gemmi's Fcalc matches refmac's model).
+    fc_mtz_path = out_mtz_path + '.fc_refmac_scaled.mtz'
+    _recompute_fc_scaled(mov_pdb_path, mov_mtz_path, fc_mtz_path,
                         d_min=fill_dmin, verbose=verbose)
     mtz_fc = gemmi.read_mtz_file(fc_mtz_path)
     fc_data = np.array(mtz_fc.array)
@@ -4213,35 +4267,46 @@ def _extend_mov_fwt_post_refmac(mov_mtz_path, mov_pdb_path,
     fc_F     = fc_data[:, fc_lbls.index('FC')]
     fc_PHI   = fc_data[:, fc_lbls.index('PHIC')]
 
-    # ── 2. Fit σA on mov's within-band data (mov Fobs vs mov-scale Fc).
-    #    σA is scale-free so we can use mov's Fc computed against mov MTZ.
+    # ── 2. Fit σA on mov's within-band data.  Use refmac's model column
+    # (`FC_ALL_LS` / `FC_ALL`) DIRECTLY for the Fc side of the correlation
+    # — refmac-consistent σA, no need to re-run gemmi sfcalc for this
+    # purpose.  Falls back to gemmi's Fcalc if neither refmac column
+    # is present (non-refmac input).
     F_lbl_mov = next((l for l in ('FP', 'F', 'FOBS') if l in lbls), None)
     if F_lbl_mov is None:
         raise RuntimeError(f'{mov_mtz_path}: no F/FP/FOBS column')
     FREE_lbl_mov = _pick_free_column(mtz_mov)
 
-    mov_fc_path = out_mtz_path + '.fc_mov_scaled.mtz'
-    _recompute_fc_scaled(mov_pdb_path, mov_mtz_path, mov_fc_path,
-                        d_min=mov_dmin_input, verbose=False)
-    mtz_movfc = gemmi.read_mtz_file(mov_fc_path)
-    movfc_data = np.array(mtz_movfc.array)
-    movfc_lbls = mtz_movfc.column_labels()
-    movfc_hkls = movfc_data[:, :3].astype(int)
-    movfc_F    = movfc_data[:, movfc_lbls.index('FC')]
-
     proper_ops = get_proper_symops(sg.xhm())
     R_ints = [np.round(R).astype(int)
               for R, _ in proper_ops] or [np.eye(3, dtype=int)]
-    movfc_canon = {tuple(_canonical_hkl(tuple(int(x) for x in h), R_ints)): i
-                   for i, h in enumerate(movfc_hkls)}
+
     Fo_mov  = data[:, lbls.index(F_lbl_mov)]
     hkl_mov = data[:, :3].astype(int)
-    Fc_at_mov = np.full(len(hkl_mov), np.nan)
-    for i, h in enumerate(hkl_mov):
-        key = tuple(_canonical_hkl(tuple(int(x) for x in h), R_ints))
-        idx = movfc_canon.get(key)
-        if idx is not None:
-            Fc_at_mov[i] = movfc_F[idx]
+    # σA fit source: prefer refmac's UNWEIGHTED total (FC or FC_ALL_LS).
+    # NEVER use FC_ALL — it's already D-weighted (Murshudov 2003), and
+    # using it in the amplitude correlation would double-count σA and
+    # give a spuriously inflated fit.
+    refmac_fc_col = next((l for l in ('FC_ALL_LS', 'FC') if l in lbls), None)
+    if refmac_fc_col is not None:
+        Fc_at_mov = data[:, lbls.index(refmac_fc_col)]
+        if verbose:
+            print(f'  σA fit uses refmac {refmac_fc_col} directly '
+                  f'(unweighted; mov scale)', flush=True)
+    else:
+        # Fall back: use gemmi's sfcalc output (already computed at step 1),
+        # match by canonicalized HKL.
+        fc_canon = {tuple(_canonical_hkl(tuple(int(x) for x in h), R_ints)): i
+                    for i, h in enumerate(fc_hkls)}
+        Fc_at_mov = np.full(len(hkl_mov), np.nan)
+        for i, h in enumerate(hkl_mov):
+            key = tuple(_canonical_hkl(tuple(int(x) for x in h), R_ints))
+            idx = fc_canon.get(key)
+            if idx is not None:
+                Fc_at_mov[i] = fc_F[idx]
+        if verbose:
+            print('  σA fit uses gemmi Fcalc (no refmac FC_ALL[_LS] found)',
+                  flush=True)
     s2_mov = np.array([1.0 / cell.calculate_d(tuple(int(x) for x in h)) ** 2
                        for h in hkl_mov])
     free_mov = (data[:, lbls.index(FREE_lbl_mov)].astype(int)
@@ -4318,16 +4383,15 @@ def _extend_mov_fwt_post_refmac(mov_mtz_path, mov_pdb_path,
     mtz_out.history.append(
         f'BENDFINDER post-refmac σA extension: added {n_extra} rows past '
         f'{mov_dmin_input:.3f} Å out to {fill_dmin:.3f} Å; FWT = σA·|Fc| '
-        f'on ref-scale, PHWT = φ_c.  Refmac LS not touched.')
+        f'on mov scale, PHWT = φ_c.  Refmac LS not touched.')
     mtz_out.write_to_file(out_mtz_path)
     # Cleanup scratch sfcalc outputs
-    for p in (fc_mtz_path, mov_fc_path, fc_mtz_path + '.sfcalc.log',
-              mov_fc_path + '.sfcalc.log'):
+    for p in (fc_mtz_path, fc_mtz_path + '.sfcalc.log'):
         try: os.remove(p)
         except OSError: pass
     if verbose:
         print(f'  post-refmac extension: {n_extra} rows added past '
-              f'{mov_dmin_input:.3f} Å (σA·|Fc| on ref scale, phi=φ_c) '
+              f'{mov_dmin_input:.3f} Å (σA·|Fc| on mov scale, phi=φ_c) '
               f'→ {os.path.basename(out_mtz_path)}', flush=True)
     return out_mtz_path
 
