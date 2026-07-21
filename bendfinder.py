@@ -4584,9 +4584,182 @@ def _map2mtz(mapfile, mtzfile):
     mtz.write_to_file(mtzfile)
 
 
+def _wilson_env_fit(mtz_path, col, d_max_fit=5.0, n_shells=30):
+    """Fit ln⟨|col|²⟩ = ln A + slope · s² by OLS on shells with data.
+
+    For signal columns (F/FP/FOBS): skip d > d_max_fit (bulk-solvent-
+    dominated inner shells).  For noise columns (SIG*): use every shell.
+
+    Returns dict with:
+      lnA, slope   : coefficients of the fitted line (slope is negative for
+                     Wilson envelopes)
+      s2_max       : outermost s² with data
+      val_max      : median ⟨|col|²⟩ over the outermost 3 shells — used as
+                     the extrapolation floor past s2_max for noise columns
+                     (SIGF plateaus once counting statistics dominate, does
+                     not decay like the straight-line Wilson would predict).
+    Returns None if fewer than 3 populated shells or col missing.
+    """
+    mtz = gemmi.read_mtz_file(mtz_path)
+    lbls = mtz.column_labels()
+    if col not in lbls:
+        return None
+    data = np.array(mtz.array)
+    hkls = data[:, :3].astype(int)
+    F = data[:, lbls.index(col)]
+    cell = mtz.cell
+    d = np.array([cell.calculate_d([int(x) for x in h]) for h in hkls])
+    s2_all = 1.0 / d**2
+    ok = np.isfinite(F) & (F > 0)
+    s2 = s2_all[ok]; F = F[ok]
+    if len(s2) < 3 * 5:
+        return None
+    edges = np.linspace(s2.min(), s2.max(), n_shells + 1)
+    idx = np.clip(np.digitize(s2, edges) - 1, 0, n_shells - 1)
+    ms, ss = [], []
+    for k in range(n_shells):
+        m = idx == k
+        if m.sum() < 5: continue
+        ms.append(float(np.mean(F[m]**2)))
+        ss.append(float(0.5 * (edges[k] + edges[k+1])))
+    if len(ms) < 3:
+        return None
+    ss = np.array(ss); ms = np.array(ms)
+    is_signal = col.upper().startswith(('F', 'I')) and \
+                not col.upper().startswith(('SIG',))
+    if is_signal:
+        fit_mask = ss > (1.0 / d_max_fit**2)
+        if fit_mask.sum() < 3:
+            fit_mask = np.ones(len(ss), dtype=bool)
+    else:
+        fit_mask = np.ones(len(ss), dtype=bool)
+    A_mat = np.vstack([np.ones(fit_mask.sum()), ss[fit_mask]]).T
+    coef, *_ = np.linalg.lstsq(A_mat, np.log(ms[fit_mask]), rcond=None)
+    lnA, slope = float(coef[0]), float(coef[1])
+    n_outer = min(3, len(ms))
+    val_max = float(np.median(ms[-n_outer:]))
+    return dict(lnA=lnA, slope=slope,
+                s2_max=float(ss.max()), val_max=val_max)
+
+
+def _make_snr_weight_fn(mov_mtz_path, ref_mtz_path,
+                        F_col=None, S_col=None, N=1, pnn_mode='strict',
+                        verbose=True):
+    """Build a callable  snr_weight_fn(s²_array) → weight_array  in [0, 1].
+
+    Uses Wilson envelopes of |F|² and |σ|² on both mov and ref MTZs to
+    derive a per-HKL SNR from smooth resolution-dependent estimates,
+    then converts to a Pnn weight.
+
+    Past each side's σ-envelope range, |σ|² is held at the outer-shell
+    floor (SIGF plateaus at the detector/counting-statistics noise
+    floor).  Past each side's F-envelope range, |F|² keeps extrapolating
+    linearly (F really does fall off exponentially).  Net effect:
+    SNR → 0 smoothly past each side's d_min → w → 0 automatically.
+
+    Weight uses `min(snr_mov, snr_ref)` — the more conservative side.
+    On the shared band both are high → w ≈ 1.  Past mov d_min, snr_mov
+    crashes → w ≈ 0.
+
+    N : Bonferroni-style multiple-testing size passed to `Pnn(SNR, N)`.
+        **Default = 1**: per-HKL data reliability with NO multiple-testing
+        correction, because each MTZ row is an independent Fo±SIGF
+        measurement (not a joint fit like the shift-field AB coefficients,
+        where N = number of canonical HKLs is correct).  Larger N pulls
+        the transition to higher SNR thresholds (Bonferroni-strict); use
+        when you want to be conservative about admitting weak data.
+    pnn_mode : 'strict' | 'soft'.
+        'strict' (default): w = erf(SNR/√2)^N — the canonical single-
+            observation "not-just-noise" probability.  At N=1 this is
+            the classical crystallographic form (SNR=2 → w=0.95, matches
+            the "SNR ≥ 2 = data" convention exactly).
+        'soft' : polynomial-approximation softPnn.  Designed for the
+            AB-coefficient joint-fit case with large N; at small N it
+            comes out stricter than 'strict', so prefer 'strict' here.
+
+    Returns None if column detection or envelope fits fail.
+    """
+    if pnn_mode not in ('strict', 'soft'):
+        raise ValueError(f"pnn_mode must be 'strict' or 'soft', got {pnn_mode!r}")
+    def _pick(cols, candidates):
+        for c in candidates:
+            if c in cols: return c
+        return None
+    try:
+        mov = gemmi.read_mtz_file(mov_mtz_path)
+        ref = gemmi.read_mtz_file(ref_mtz_path)
+    except Exception:
+        return None
+    mov_labs = {c.label for c in mov.columns}
+    ref_labs = {c.label for c in ref.columns}
+    if F_col is None:
+        F_col = _pick(mov_labs & ref_labs, ('FP', 'F', 'FOBS'))
+    if S_col is None:
+        S_col = _pick(mov_labs & ref_labs, ('SIGFP', 'SIGF', 'SIGFOBS'))
+    if F_col is None or S_col is None:
+        if verbose:
+            print('  SNR weighting off: no F/SIGF pair in both MTZs',
+                  flush=True)
+        return None
+    mov_F = _wilson_env_fit(mov_mtz_path, F_col)
+    mov_S = _wilson_env_fit(mov_mtz_path, S_col)
+    ref_F = _wilson_env_fit(ref_mtz_path, F_col)
+    ref_S = _wilson_env_fit(ref_mtz_path, S_col)
+    if any(x is None for x in (mov_F, mov_S, ref_F, ref_S)):
+        if verbose:
+            print('  SNR weighting off: Wilson envelope fit failed',
+                  flush=True)
+        return None
+    if N is None:
+        N = 1   # per-HKL, no multiple-testing correction (each Fo±SIGF
+                # is an independent measurement, not a joint fit).
+    _pnn_fn = _pnn_weight if pnn_mode == 'strict' else _soft_pnn_weight
+    if verbose:
+        print(f'  SNR-weight Wilson fits: '
+              f'mov Bo={-mov_F["slope"]:.1f}/Be={-mov_S["slope"]:.1f}, '
+              f'ref Bo={-ref_F["slope"]:.1f}/Be={-ref_S["slope"]:.1f}, '
+              f'σ floor mov={np.sqrt(mov_S["val_max"]):.3f} '
+              f'ref={np.sqrt(ref_S["val_max"]):.3f}, N={N}, '
+              f'pnn_mode={pnn_mode}', flush=True)
+
+    def _snr(s2, F_env, S_env):
+        s2 = np.asarray(s2, dtype=float)
+        F2 = np.exp(F_env['lnA'] + F_env['slope'] * s2)
+        S2_line = np.exp(S_env['lnA'] + S_env['slope'] * s2)
+        S2 = np.where(s2 > S_env['s2_max'], S_env['val_max'], S2_line)
+        S2 = np.maximum(S2, 1e-30)
+        return np.sqrt(np.maximum(F2, 1e-30) / S2)
+
+    def snr_weight_fn(s2):
+        snr_mov = _snr(s2, mov_F, mov_S)
+        snr_ref = _snr(s2, ref_F, ref_S)
+        return np.clip(_pnn_fn(np.minimum(snr_mov, snr_ref), N), 0.0, 1.0)
+
+    # Attach envelope dicts + Pnn helpers so callers wanting per-HKL
+    # (not smooth-per-s²) weights — e.g. delta-SNR DELFWT apodization —
+    # can compute w = Pnn(|F|/σ, N) themselves.  Attribute-style rather
+    # than a bundle so existing callers that just call snr_weight_fn(s²)
+    # keep working.
+    snr_weight_fn.envelopes = dict(mov_F=mov_F, mov_S=mov_S,
+                                    ref_F=ref_F, ref_S=ref_S)
+    snr_weight_fn.pnn_fn = _pnn_fn
+    snr_weight_fn.N = N
+    return snr_weight_fn
+
+
+def _wilson_eval_sig(env_dict, s2):
+    """Evaluate a σ Wilson envelope at s² array, holding at outer-shell
+    floor past the fit range.  Companion to `_make_snr_weight_fn`."""
+    s2 = np.asarray(s2, dtype=float)
+    S2_line = np.exp(env_dict['lnA'] + env_dict['slope'] * s2)
+    S2 = np.where(s2 > env_dict['s2_max'], env_dict['val_max'], S2_line)
+    return np.sqrt(np.maximum(S2, 1e-30))
+
+
 def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col,
                             mtzfile, anisotropic=False, n_cycles=4,
-                            subtract='ref', d_min_cap=None):
+                            subtract='ref', d_min_cap=None,
+                            snr_weight_fn=None, delta_snr=False):
     """FFT bent_map; F-space fit (k, B) of bent → ref MTZ; compute scaled bent
     F + F-space DELFWT; write bent.mtz; return (diff_real, riso, k, B).
 
@@ -4604,6 +4777,39 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         of mov and ref — otherwise ref-side model-derived FWT paints
         atom-shaped features into the diff map in the gap band.
         Use in fitreso_scan with cap = max(mov_dmin_orig, ref_dmin_orig).
+
+    snr_weight_fn : optional callable  w = snr_weight_fn(s²_array) → [0,1].
+        When set, replaces the rectangular d_min_cap with a smooth SNR-
+        based apodization.  Effects:
+          - LM k+B fit uses w as least-squares weight (noise-dominated
+            outer-shell HKLs get near-zero leverage).
+          - Rbent reported as a w-weighted R-factor.
+          - FDM and DELFWT multiplied by w before writing bent.mtz —
+            smooth fadeout past mov d_min instead of the rectangular
+            window that caused sinc/series-termination ringing in
+            diff_norm.map.
+        See `_make_snr_weight_fn` for the Wilson-envelope-based
+        construction.  When None (default), the d_min_cap path is used.
+    delta_snr : if True and snr_weight_fn carries envelope attributes
+        (`envelopes`, `pnn_fn`, `N` set by `_make_snr_weight_fn`), split
+        the map-coefficient apodization into three physically distinct
+        weights:
+          - w_lm = Pnn(min(snr_mov, snr_ref), N)  → LM k+B fit + Rbent
+            (both-sides reliable → align amplitudes on shared band).
+          - w_bF = Pnn(bF/σ_mov, N)               → FDM per-HKL apodization
+            (bent map = mov side; suppress HKLs where mov's own amplitude
+            is not significant).
+          - w_delta = Pnn(|ΔF|/σ_Δ, N),
+            σ_Δ = √((scale·σ_mov)² + σ_ref²)      → DELFWT apodization
+            (diff-map coefficient significance; the *diff* needs to
+            exceed the *diff's* Gaussian-added noise).
+        The three-weight scheme suppresses the sinc-like ripples that
+        arise from applying one smooth-per-s² apodization to both FDM
+        and DELFWT — the ΔF weight follows the significance of the
+        difference itself, so it stays high near real features (Zn,
+        binding sites) and low in "quiet" bands where both models
+        agree.  Matches the σA-weighted `m·Fo − D·Fc` logic in spirit
+        but with data-derived σ envelopes instead of ML integration.
 
     diff_real is the inverse-FFT of the F-space diff on ref's grid — i.e. the
     residual density after absorbing the resolution-dependent scale.  See
@@ -4658,6 +4864,21 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
     else:
         _in_band = np.ones(len(rF), dtype=bool)
 
+    # ── SNR-based per-HKL weight (soft alternative to _in_band).  When
+    # snr_weight_fn is provided, w becomes the LM residual weight, the
+    # Rbent weighting, and the FDM/DELFWT F-space apodization filter.
+    # Replaces the rectangular d_min_cap window with a smooth roll-off
+    # from softPnn(SNR).
+    w_snr = None
+    if snr_weight_fn is not None:
+        try:
+            w_snr = np.asarray(snr_weight_fn(s_sq), dtype=float)
+            w_snr = np.clip(w_snr, 0.0, 1.0)
+            if w_snr.shape != rF.shape:
+                w_snr = None
+        except Exception:
+            w_snr = None
+
     # ── Fit (k, B) [or (k, V) anisotropic] via F-space LS, iterated
     use = _in_band.copy()
     if not anisotropic:
@@ -4680,8 +4901,16 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
 
     for _ in range(n_cycles):
         try:
-            res = least_squares(lambda p: rF[use] - _scale_fn(p, use) * bF[use],
-                                 params, method='lm', max_nfev=200)
+            if w_snr is not None:
+                # SNR-weighted LM: residual · w has near-zero weight for
+                # noise-dominated HKLs.  No mask — every HKL enters.
+                res = least_squares(
+                    lambda p: w_snr * (rF - _scale_fn(p) * bF),
+                    params, method='lm', max_nfev=200)
+            else:
+                res = least_squares(
+                    lambda p: rF[use] - _scale_fn(p, use) * bF[use],
+                    params, method='lm', max_nfev=200)
             params = res.x
         except Exception:
             break
@@ -4694,9 +4923,12 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         B_fit = float(4.0 * np.trace(_Vmat(params)) / 3.0)
 
     bF_scaled = scale * bF
-    # Report Riso over the shared band only when a cap is set — otherwise
-    # unrelated model-vs-nothing contributions dominate the sum.
-    if _in_band.any() and not _in_band.all():
+    # Report Riso as w-weighted (SNR path) OR over the shared band
+    # (legacy d_cap path) OR over everything (unbounded fallback).
+    if w_snr is not None:
+        riso = float(np.sum(w_snr * np.abs(rF - bF_scaled))
+                     / max(np.sum(w_snr * np.abs(rF)), 1e-30))
+    elif _in_band.any() and not _in_band.all():
         riso = float(np.sum(np.abs(rF[_in_band] - bF_scaled[_in_band]))
                      / max(np.sum(np.abs(rF[_in_band])), 1e-30))
     else:
@@ -4712,11 +4944,34 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
     diff_F      = np.abs(diff_c).astype(np.float32)
     diff_PH     = np.degrees(np.angle(diff_c)).astype(np.float32)
 
-    # Kill DELFWT past the d_min cap so the inverse-FFT diff map is
-    # band-limited to the shared observation range (fixes "holes inside
-    # peaks" from ref-side model FWT painting atom-shaped features into
-    # the diff in the gap band).
-    if d_min_cap is not None and d_min_cap > 0 and not _in_band.all():
+    if w_snr is not None:
+        # Delta-SNR three-weight scheme (opt-in via `delta_snr=True`
+        # AND envelope attributes present on the closure): FDM gets
+        # mov-side per-HKL SNR weight; DELFWT gets diff-significance
+        # per-HKL weight; LM+Rbent (already done above) used min-SNR.
+        _envs = getattr(snr_weight_fn, 'envelopes', None)
+        _pnn  = getattr(snr_weight_fn, 'pnn_fn',    None)
+        _N    = getattr(snr_weight_fn, 'N',         None)
+        if delta_snr and _envs is not None and _pnn is not None:
+            sig_mov   = _wilson_eval_sig(_envs['mov_S'], s_sq)
+            sig_ref   = _wilson_eval_sig(_envs['ref_S'], s_sq)
+            sig_bent  = scale * sig_mov            # k+B scales noise with signal
+            sig_delta = np.sqrt(sig_bent**2 + sig_ref**2)
+            w_bF      = np.clip(_pnn(bF     / sig_mov,   _N), 0.0, 1.0)
+            w_del     = np.clip(_pnn(diff_F / sig_delta, _N), 0.0, 1.0)
+            bF_scaled = (bF_scaled * w_bF ).astype(np.float32)
+            diff_F    = (diff_F    * w_del).astype(np.float32)
+        else:
+            # Single-w path (post5/6/7): smooth SNR apodization of both
+            # bent (FDM) and diff (DELFWT).  Kills the rectangular
+            # d_cap window and its sinc ringing but couples FDM and
+            # DELFWT to the same taper.
+            bF_scaled = (bF_scaled * w_snr).astype(np.float32)
+            diff_F    = (diff_F    * w_snr).astype(np.float32)
+    elif d_min_cap is not None and d_min_cap > 0 and not _in_band.all():
+        # Legacy path: hard-zero past d_cap (fixes "holes inside peaks"
+        # from ref-side model FWT painting atom features into the diff
+        # gap band, at the cost of sinc ringing at the cap boundary).
         diff_F[~_in_band] = 0.0
         diff_PH[~_in_band] = 0.0
 
@@ -4836,6 +5091,8 @@ def fitreso_scan(
     holdout_frac=0.0, holdout_seed=0,
     sobolev_lambda=0.0, sobolev_beta=1.0,
     wilson_cap_alpha=None, wilson_cap_snr_min=2.0,
+    snr_weighted=False, snr_N=1, snr_pnn_mode='strict',
+    delta_snr=False,
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -4962,6 +5219,33 @@ def fitreso_scan(
                 ref_pdb, ref_mtz = _ref_fut.result()
             if _premov_fut is not None:
                 pre_mov_pdb, pre_mov_mtz = _premov_fut.result()
+
+    # ── SNR-based weight closure.  When snr_weighted=True and both sides
+    # carry F/SIGF columns (typical for MTZ inputs post-refmac), we fit
+    # Wilson envelopes on both and derive a smooth per-HKL
+    #   w = softPnn(SNR).
+    # Downstream `_fspace_scale_and_diff` calls receive this closure and
+    # use it in place of the rectangular d_min_cap window:
+    #   - LM k+B fit weighted by w (noisy outer shells lose leverage)
+    #   - Rbent reported as a w-weighted R-factor
+    #   - FDM and DELFWT multiplied by w before writing bent.mtz —
+    #     smooth SNR-based F-space apodization, no sinc/series-
+    #     termination ringing at the d_cap boundary and no k+B
+    #     extrapolation blow-up past mov's d_min.
+    # When snr_weighted=False (default), the legacy d_cap path runs
+    # unchanged.  Uses raw_mov_mtz_in for SIGF fitting so the extension-
+    # band synthetic SIGF from `_extend_mov_fwt_post_refmac` does not
+    # contaminate the Wilson envelope estimation.
+    _snr_weight_fn = None
+    if snr_weighted and raw_mov_mtz_in and ref_mtz.lower().endswith('.mtz'):
+        try:
+            _snr_weight_fn = _make_snr_weight_fn(
+                raw_mov_mtz_in, ref_mtz, N=snr_N,
+                pnn_mode=snr_pnn_mode, verbose=verbose)
+        except Exception as e:
+            if verbose:
+                print(f'  SNR weighting off: {e!r}', flush=True)
+            _snr_weight_fn = None
 
     # ── _load helper (used by both the ref/pre_mov phase below and the
     # post-altindex mov phase further down) ─────────────────────────────────
@@ -5270,7 +5554,8 @@ def fitreso_scan(
         diff, riso, kF, B = _fspace_scale_and_diff(
             bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
             bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract,
-            d_min_cap=d_cap)
+            d_min_cap=d_cap, snr_weight_fn=_snr_weight_fn,
+            delta_snr=delta_snr)
         if diff is None:
             # F-space path failed (too few matched reflections) — fall back to
             # z-scored real-space diff (matches the requested sign convention)
@@ -5384,7 +5669,8 @@ def fitreso_scan(
     pre_diff, pre_riso, pre_kF, pre_B = _fspace_scale_and_diff(
         pre_bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
         pre_bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract,
-        d_min_cap=d_cap)
+        d_min_cap=d_cap, snr_weight_fn=_snr_weight_fn,
+        delta_snr=delta_snr)
     if pre_diff is None:
         ref_n  = (ref_d        - ref_d.mean())        / ref_d.std()
         bent_n = (pre_bent_map - pre_bent_map.mean()) / pre_bent_map.std()
