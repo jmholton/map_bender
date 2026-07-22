@@ -4747,6 +4747,38 @@ def _make_snr_weight_fn(mov_mtz_path, ref_mtz_path,
     return snr_weight_fn
 
 
+def _delfwt_resolution_taper(s_sq, d_min, taper_width=0.15):
+    """Cosine window that fades DELFWT to zero past d_min.
+
+    Returns w(h) = 1 for d(h) ≥ d_min + taper_width/2
+                 = 0 for d(h) ≤ d_min − taper_width/2
+                 = cosine roll-off in the transition band.
+
+    Applied to DELFWT amplitudes so the diff map is band-limited to the
+    resolution range where the scale was actually fit (past that,
+    scaling is extrapolation and the diff between two independently-
+    refined models produces model-phase-difference spikes).  Cosine
+    taper avoids the sinc ringing of a rectangular d_min cap.
+
+    d_min : target resolution (Å) where DELFWT should fade to zero.
+    taper_width : width of the cosine roll-off (Å).  Larger = smoother
+        transition, less ringing but content bleeds past d_min.
+    """
+    if d_min is None or d_min <= 0:
+        return np.ones_like(s_sq)
+    d = 1.0 / np.sqrt(np.maximum(s_sq, 1e-30))
+    d_hi = float(d_min) + 0.5 * float(taper_width)
+    d_lo = max(1e-6, float(d_min) - 0.5 * float(taper_width))
+    w = np.ones_like(s_sq)
+    below = d < d_lo
+    trans = (d >= d_lo) & (d <= d_hi)
+    w[below] = 0.0
+    if d_hi > d_lo:
+        u = (d[trans] - d_lo) / (d_hi - d_lo)         # ∈ [0, 1]
+        w[trans] = 0.5 * (1.0 - np.cos(np.pi * u))
+    return w
+
+
 def _wilson_eval_sig(env_dict, s2):
     """Evaluate a σ Wilson envelope at s² array, holding at outer-shell
     floor past the fit range.  Companion to `_make_snr_weight_fn`."""
@@ -4759,7 +4791,9 @@ def _wilson_eval_sig(env_dict, s2):
 def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col,
                             mtzfile, anisotropic=False, n_cycles=4,
                             subtract='ref', d_min_cap=None,
-                            snr_weight_fn=None, delta_snr=False):
+                            snr_weight_fn=None, delta_snr=False,
+                            scale_target='fobs', scale_data=None,
+                            delfwt_dmin=None, delfwt_taper=0.15):
     """FFT bent_map; F-space fit (k, B) of bent → ref MTZ; compute scaled bent
     F + F-space DELFWT; write bent.mtz; return (diff_real, riso, k, B).
 
@@ -4777,6 +4811,41 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         of mov and ref — otherwise ref-side model-derived FWT paints
         atom-shaped features into the diff map in the gap band.
         Use in fitreso_scan with cap = max(mov_dmin_orig, ref_dmin_orig).
+
+    scale_target : 'fobs' (default) | 'fcalc' | 'fwt'.
+        'fobs' — fit the k+B scale on raw Fobs (FP/SIGFP), matched HKLs
+            only.  Weighted by 1/√(σ_ref² + σ_mov²) so noisy outer
+            shells lose leverage.  This is the honest Wilson-B fit
+            between the two crystals; matches diff.com's k+B result.
+            Naturally restricts the fit to the shared observation range
+            (mov FP is undefined past mov d_min).
+        'fcalc' — fit on Fcalc (FC_ALL_LS preferred, FC/FC_ALL as fall-
+            backs), unweighted total from the refined models on each
+            side.  Available everywhere (no d_min cutoff), free of
+            refmac ML-weighting artifacts.  Reflects the two structures'
+            overall B envelopes without observational-noise complications.
+            Still weighted by 1/√(σ_ref² + σ_mov²) using SIGFP if
+            available (same expected-noise proxy as 'fobs'; falls back
+            to unit weights if SIGFP is missing).
+        'fwt' — legacy: fit against ref_f_col (FWT) amplitudes.  On
+            cross-d_min pairs, refmac's FOM/D-weighting collapses mov
+            FWT in the outer shells (see fp_vs_fwt_wilson.png), driving
+            the LM to a compromise B between the honest Fo-Wilson-B
+            and the ML-weighted FWT tail Bo.
+
+        The scale (k, B) is applied to `bF` (FFT amplitudes of the bent
+        map — an FWT-based quantity) for FDM and DELFWT computation
+        regardless of `scale_target`.  Only the *fit target* changes.
+    scale_data : dict with per-HKL amplitude/sigma data aligned to ref
+        MTZ's HKL set (built by fitreso_scan from the raw MTZ inputs).
+        Required when `scale_target != 'fwt'`.  Keys:
+          fp_mov, fp_ref       : (n_hkl,) Fobs amplitudes (NaN if unmeasured)
+          sigfp_mov, sigfp_ref : (n_hkl,) SIGFP; used for LM weighting
+          fc_mov, fc_ref       : (n_hkl,) Fcalc amplitudes (unweighted
+                                 total, from FC_ALL_LS/FC).  Full-range
+                                 (defined everywhere).
+        HKLs are excluded from the fit where the target-side quantity
+        or its sigma is NaN or ≤ 0 on either side.
 
     snr_weight_fn : optional callable  w = snr_weight_fn(s²_array) → [0,1].
         When set, replaces the rectangular d_min_cap with a smooth SNR-
@@ -4879,6 +4948,71 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         except Exception:
             w_snr = None
 
+    # ── Fobs / Fcalc scaling.  When `scale_target != 'fwt'`, the LM fits
+    # amplitudes from `scale_data` (Fo or Fc columns) instead of FWT.
+    # Fobs-target: honest Wilson-B between the two crystals' raw Fo, only
+    # fittable where both sides have measurements (naturally restricts
+    # to the shared observation range).
+    # Fcalc-target: model-side unweighted total, defined everywhere,
+    # free of refmac ML weighting.  Reflects the structures' overall B
+    # difference without observational-noise interference.
+    # The fitted (k, B) is then applied to bF (FWT-based) for the map
+    # coefficients regardless of target.
+    _scale_active = (scale_target in ('fobs', 'fcalc')
+                     and scale_data is not None)
+    _scale_A_mov = _scale_A_ref = None   # LM-target amplitudes
+    _scale_w = None                       # per-HKL sigma weight for LM
+    _scale_mask = None                    # HKLs that enter the fit
+    if _scale_active:
+        try:
+            if scale_target == 'fobs':
+                _A_mov = np.asarray(scale_data['fp_mov'], dtype=float)
+                _A_ref = np.asarray(scale_data['fp_ref'], dtype=float)
+            else:  # fcalc
+                _A_mov = np.asarray(scale_data['fc_mov'], dtype=float)
+                _A_ref = np.asarray(scale_data['fc_ref'], dtype=float)
+            _sig_mov = np.asarray(scale_data.get('sigfp_mov',
+                                                  np.ones(len(_A_mov))),
+                                    dtype=float)
+            _sig_ref = np.asarray(scale_data.get('sigfp_ref',
+                                                  np.ones(len(_A_ref))),
+                                    dtype=float)
+        except Exception:
+            _scale_active = False
+        if _scale_active and len(_A_mov) == len(ref_hkl):
+            # Apply the same `ok` filter used above (rF > 0, bF > 0).
+            _A_mov, _A_ref = _A_mov[ok], _A_ref[ok]
+            _sig_mov, _sig_ref = _sig_mov[ok], _sig_ref[ok]
+            # For a log-space Wilson-B fit
+            #   ln(A_ref) − ln(scale·A_mov)
+            # error propagation gives σ_ln² = 1/SNR_ref² + 1/SNR_mov².
+            # The inverse-variance LM weight is therefore
+            #   w = 1 / √(1/SNR_ref² + 1/SNR_mov²)
+            # ≈ min(SNR_ref, SNR_mov) up to a factor of ~√2.  This is
+            # scale-invariant and dead-stable to anomalous σ patterns
+            # (some deposits have σ that *shrinks* with s², which
+            # naïve variance-inverse weighting would heavily
+            # over-weight in the outer noisy shell — see CA 8sf1).
+            # Verified to match diff.com's k+B on the CA pair.
+            _snr_mov = np.where((_sig_mov > 0) & np.isfinite(_sig_mov),
+                                _A_mov / _sig_mov, 0.0)
+            _snr_ref = np.where((_sig_ref > 0) & np.isfinite(_sig_ref),
+                                _A_ref / _sig_ref, 0.0)
+            _scale_mask = (np.isfinite(_A_mov) & np.isfinite(_A_ref)
+                           & (_A_mov > 0) & (_A_ref > 0)
+                           & (_snr_mov > 2.0) & (_snr_ref > 2.0))
+            if _scale_mask.sum() < 10:
+                _scale_active = False
+            else:
+                _inv_var_ln = np.where(
+                    (_snr_mov > 0) & (_snr_ref > 0),
+                    1.0 / np.sqrt(1.0 / _snr_ref**2 + 1.0 / _snr_mov**2),
+                    0.0)
+                _scale_w = _inv_var_ln
+                _scale_A_mov, _scale_A_ref = _A_mov, _A_ref
+        else:
+            _scale_active = False
+
     # ── Fit (k, B) [or (k, V) anisotropic] via F-space LS, iterated
     use = _in_band.copy()
     if not anisotropic:
@@ -4901,7 +5035,22 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
 
     for _ in range(n_cycles):
         try:
-            if w_snr is not None:
+            if _scale_active:
+                # Fobs- or Fcalc-targeted log-space Wilson-B fit:
+                #   residual = w · (ln A_ref − ln A_mov − ln scale)
+                # with w = 1/√(1/SNR_ref² + 1/SNR_mov²) (inverse-variance
+                # for the log residual).  Matches diff.com's k+B answer
+                # on the CA pair.  Scale is applied to bF (FWT) for the
+                # map coefficients regardless of target.
+                _sm = _scale_mask
+                _lnA_ref = np.log(_scale_A_ref[_sm])
+                _lnA_mov = np.log(_scale_A_mov[_sm])
+                _w      = _scale_w[_sm]
+                res = least_squares(
+                    lambda p: _w * (_lnA_ref - _lnA_mov -
+                                    np.log(_scale_fn(p, _sm))),
+                    params, method='lm', max_nfev=200)
+            elif w_snr is not None:
                 # SNR-weighted LM: residual · w has near-zero weight for
                 # noise-dominated HKLs.  No mask — every HKL enters.
                 res = least_squares(
@@ -4923,8 +5072,12 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         B_fit = float(4.0 * np.trace(_Vmat(params)) / 3.0)
 
     bF_scaled = scale * bF
-    # Report Riso as w-weighted (SNR path) OR over the shared band
-    # (legacy d_cap path) OR over everything (unbounded fallback).
+    # Report Rbent on the BENT MAP's FWT amplitudes vs ref FWT — this is
+    # a map-quality metric that changes as the shift field improves.
+    # (When _scale_active, the LM fit itself uses Fobs/Fcalc for the
+    # scale-B fit, but the reported R measures how well the bent MAP
+    # aligns to ref — a different, complementary quantity that would
+    # otherwise be scan-invariant under Fobs-target LM.)
     if w_snr is not None:
         riso = float(np.sum(w_snr * np.abs(rF - bF_scaled))
                      / max(np.sum(w_snr * np.abs(rF)), 1e-30))
@@ -4974,6 +5127,17 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
         # gap band, at the cost of sinc ringing at the cap boundary).
         diff_F[~_in_band] = 0.0
         diff_PH[~_in_band] = 0.0
+
+    # ── DELFWT resolution taper.  Past mov d_min (or wherever
+    # `delfwt_dmin` says), the diff between two independently-refined
+    # models is model-phase-difference-driven artifact — not physical
+    # chemistry.  A soft cosine taper across delfwt_dmin ± taper/2
+    # kills those spikes without introducing sinc ringing.  Applied
+    # AFTER the SNR / delta-SNR / d_cap apodization above, so it
+    # composes cleanly with them.
+    if delfwt_dmin is not None and delfwt_dmin > 0:
+        _res_taper = _delfwt_resolution_taper(s_sq, delfwt_dmin, delfwt_taper)
+        diff_F = (diff_F * _res_taper).astype(np.float32)
 
     # ── Write bent.mtz with scaled FDM and F-space DELFWT
     out = gemmi.Mtz(with_base=True)
@@ -5093,6 +5257,8 @@ def fitreso_scan(
     wilson_cap_alpha=None, wilson_cap_snr_min=2.0,
     snr_weighted=False, snr_N=1, snr_pnn_mode='strict',
     delta_snr=False,
+    scale_target='fobs',
+    delfwt_dmin=None, delfwt_taper=0.15,
     verbose=True,
 ):
     """Run the standard fitreso scan and write outputs to scan_dir.
@@ -5246,6 +5412,98 @@ def fitreso_scan(
             if verbose:
                 print(f'  SNR weighting off: {e!r}', flush=True)
             _snr_weight_fn = None
+
+    # ── DELFWT resolution cap.  Auto-default = mov d_min (from raw
+    # input): the diff map is only physically meaningful within the
+    # range where mov has actual Fobs measurements.  Past that, the
+    # diff between two independently-refined models is spike-inducing
+    # phase noise.  Soft cosine taper across `delfwt_dmin ± delfwt_taper/2`.
+    # User can override with an explicit float; None → auto.
+    _delfwt_dmin = delfwt_dmin
+    if _delfwt_dmin is None and _mov_dmin_orig is not None:
+        _delfwt_dmin = float(_mov_dmin_orig)
+    if verbose and _delfwt_dmin is not None:
+        print(f'  DELFWT resolution taper: fade to 0 across '
+              f'd = {_delfwt_dmin:.2f} ± {delfwt_taper/2:.2f} Å '
+              f'(cosine window)', flush=True)
+
+    # ── Build scale_data (Fobs + Fcalc arrays aligned to ref MTZ's HKL
+    # set) so downstream `_fspace_scale_and_diff` can target 'fobs' or
+    # 'fcalc' instead of the default 'fwt'.  Fobs cleanly reflects the
+    # Wilson-B difference between crystals (matches diff.com); Fcalc
+    # reflects the two structures' model B envelopes without ML noise.
+    # Both are per-HKL, sigma-weighted (SIGFP) when possible.
+    def _build_scale_data(mov_mtz_path, ref_mtz_path):
+        if not (mov_mtz_path and ref_mtz_path
+                and mov_mtz_path.lower().endswith('.mtz')
+                and ref_mtz_path.lower().endswith('.mtz')):
+            return None
+        try:
+            mov = gemmi.read_mtz_file(mov_mtz_path)
+            ref = gemmi.read_mtz_file(ref_mtz_path)
+        except Exception:
+            return None
+        mov_labs = {c.label for c in mov.columns}
+        ref_labs = {c.label for c in ref.columns}
+        # Amplitude column selection: prefer FP; try F, FOBS.
+        f_lbl = next((c for c in ('FP', 'F', 'FOBS')
+                      if c in mov_labs and c in ref_labs), None)
+        s_lbl = next((c for c in ('SIGFP', 'SIGF', 'SIGFOBS')
+                      if c in mov_labs and c in ref_labs), None)
+        # Fcalc: unweighted total.  Try FC_ALL_LS (refmac unweighted),
+        # then FC.  FC_ALL is D-weighted (skip: would circularize).
+        fc_lbl = next((c for c in ('FC_ALL_LS', 'FC')
+                       if c in mov_labs and c in ref_labs), None)
+        if f_lbl is None and fc_lbl is None:
+            return None
+        ref_arr = np.array(ref.array)
+        ref_lbls = ref.column_labels()
+        ref_hkls = ref_arr[:, :3].astype(int)
+        mov_arr = np.array(mov.array)
+        mov_lbls = mov.column_labels()
+        mov_idx = {tuple(int(x) for x in h): i
+                   for i, h in enumerate(mov_arr[:, :3].astype(int))}
+        def _lookup(col_ref, col_mov):
+            v_ref = np.full(len(ref_hkls), np.nan)
+            v_mov = np.full(len(ref_hkls), np.nan)
+            if col_ref in ref_lbls:
+                v_ref = ref_arr[:, ref_lbls.index(col_ref)]
+            if col_mov in mov_lbls:
+                mov_col = mov_arr[:, mov_lbls.index(col_mov)]
+                for i, h in enumerate(map(tuple, ref_hkls)):
+                    j = mov_idx.get(h)
+                    if j is not None:
+                        v_mov[i] = mov_col[j]
+            return v_mov, v_ref
+        out = {}
+        if f_lbl:
+            out['fp_mov'], out['fp_ref'] = _lookup(f_lbl, f_lbl)
+        if s_lbl:
+            out['sigfp_mov'], out['sigfp_ref'] = _lookup(s_lbl, s_lbl)
+        if fc_lbl:
+            out['fc_mov'], out['fc_ref'] = _lookup(fc_lbl, fc_lbl)
+        return out
+    _scale_data = None
+    if scale_target in ('fobs', 'fcalc'):
+        try:
+            _scale_data = _build_scale_data(raw_mov_mtz_in, ref_mtz)
+        except Exception as e:
+            if verbose:
+                print(f'  scale_data build failed ({e!r}); falling '
+                      f'back to scale_target=fwt', flush=True)
+            _scale_data = None
+        if _scale_data is None and verbose:
+            print(f'  scale_target={scale_target!r} disabled: no usable '
+                  f'{"FP/SIGFP" if scale_target=="fobs" else "FC_ALL_LS/FC"} '
+                  f'pair; falling back to fwt-target LM', flush=True)
+        elif _scale_data is not None and verbose:
+            _keys = sorted(_scale_data)
+            _n_fp = int(np.isfinite(_scale_data.get(
+                'fp_mov', np.array([]))).sum()) if 'fp_mov' in _scale_data else 0
+            _n_fc = int(np.isfinite(_scale_data.get(
+                'fc_mov', np.array([]))).sum()) if 'fc_mov' in _scale_data else 0
+            print(f'  scale_data built ({_keys}); mov FP finite: {_n_fp}, '
+                  f'mov FC finite: {_n_fc}', flush=True)
 
     # ── _load helper (used by both the ref/pre_mov phase below and the
     # post-altindex mov phase further down) ─────────────────────────────────
@@ -5555,7 +5813,9 @@ def fitreso_scan(
             bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
             bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract,
             d_min_cap=d_cap, snr_weight_fn=_snr_weight_fn,
-            delta_snr=delta_snr)
+            delta_snr=delta_snr,
+            scale_target=scale_target, scale_data=_scale_data,
+            delfwt_dmin=_delfwt_dmin, delfwt_taper=delfwt_taper)
         if diff is None:
             # F-space path failed (too few matched reflections) — fall back to
             # z-scored real-space diff (matches the requested sign convention)
@@ -5670,7 +5930,9 @@ def fitreso_scan(
         pre_bent_map, ref_h, riso_ref_mtz, riso_ref_col, riso_ref_phi,
         pre_bent_mtz_path, n_cycles=riso_n_cycles, subtract=subtract,
         d_min_cap=d_cap, snr_weight_fn=_snr_weight_fn,
-        delta_snr=delta_snr)
+        delta_snr=delta_snr,
+        scale_target=scale_target, scale_data=_scale_data,
+        delfwt_dmin=_delfwt_dmin, delfwt_taper=delfwt_taper)
     if pre_diff is None:
         ref_n  = (ref_d        - ref_d.mean())        / ref_d.std()
         bent_n = (pre_bent_map - pre_bent_map.mean()) / pre_bent_map.std()
