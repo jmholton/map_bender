@@ -1025,8 +1025,8 @@ baseline table above.  Cells show *sigmaa / nan*.
 | raddam 5kxl | 0.112 / 0.112 | 0.114 / 0.114 | 11.9 / 11.9 | 11.2 / 11.2 | 20 / 20 |
 | raddam 5kxm | 0.076 / 0.076 | 0.078 / 0.078 | 10.4 / 10.4 | 9.9 / 9.9 | 17.21 / 17.21 |
 | raddam 5kxn | 0.091 / 0.091 | 0.100 / 0.100 | 18.1 / 18.1 | 17.6 / 17.6 | 20 / 20 |
-| myoglobin | 0.139 / 0.139 | 0.107 / 0.107 | 30.3* / — | 30.2* / — | 10.89* / — |
-| insulin | 0.904* / — | 1.307* / — | 68.3* / — | 65.8* / — | 20 (clamped)* / — |
+| myoglobin | 0.139 / 0.139 | 0.107 / 0.107 | 30.3* / 30.1* | 30.2* / 30.1* | 10.89* / 10.91* |
+| insulin | 0.904* / 0.925* | 1.307* / 1.298* | 68.3* / 62.0* | 65.8* / 60.7* | 20 (clamped)* / 20 (clamped)* |
 | lipox | 0.583 / 0.591 | 0.322 / 0.323 | 54.5 / 54.4 | 52.8 / 52.7 | 16.01 / 16.03 |
 | porin | — | (refmac R=0.466 / 0.46) | — | — | — |
 
@@ -1054,19 +1054,24 @@ synthetic data has no missing rows so the fill path never fires).
   between them shouldn't have a dominant Fe(heme) peak.  Old
   baseline showed −40σ Fe (inflation artifact); post-fix shows Fe
   near −17σ with SO4 as the top peak (real differences in
-  sulfate occupancy/B).  The nan-fill column is dash-marked
-  pending re-run under the fixed pipeline.
+  sulfate occupancy/B).  Nan-fill re-run confirms: best RMSD
+  0.107 Å / Rbent 30.1 % / d_opt 10.91 Å — matches the sigmaA
+  post-fix values (30.2 % / 10.89 Å) to within scan-grid noise.
+  Whichever fill method is used, the post-fix pipeline is where
+  the honest number lives.
 - ***Insulin post-fix** (footnote ⁴): same cross-d_min pipeline
   fix — mov 4fg3 (2.0 Å, human, T6) → ref 4e7u (1.3 Å, bovine,
   T3R3), a 0.7 Å gap band that saw the same cubic-interp / σA
-  extension change as myoglobin.  fr5 RMSD 0.904 Å ≈ pre-fix 0.889 Å
-  (nan) / 0.925 Å (sigmaa) — actual fit is unchanged.  The `best`
-  row moved from 1.014 Å at d_opt = 8.15 Å to 1.307 Å at d_opt = 20 Å
-  (bracket edge).  Cause: post-fix pipeline's SVD saturates at fr10,
-  parabola sees only 3 non-plateau rows monotone-decreasing → no
-  interior minimum → clamps to coarsest.  `best`-row selection
-  artifact, not a fit regression.  fr5 is the honest indicator for
-  this system.
+  extension change as myoglobin.  fr5 RMSD 0.904 Å (sigmaa) /
+  0.925 Å (nan) — actual fit at fine fitreso is unchanged from
+  pre-fix.  The `best` row moved from 1.014 Å at d_opt = 8.15 Å to
+  1.307 Å (sigmaa) / 1.298 Å (nan) at d_opt = 20 Å (bracket edge).
+  Cause: post-fix pipeline's SVD saturates at fr10, parabola sees
+  only 3 non-plateau rows monotone-decreasing → no interior
+  minimum → clamps to coarsest.  `best`-row selection artifact,
+  identical under both fill methods (60.7 % nan vs 65.8 % sigmaa
+  differ only by the usual 1–4 % Rbent uptick sigmaA carries).
+  fr5 is the honest indicator for this system.
 - **Conformational-change cases (dhfr, insulin)**: CA RMSD
   *improves* slightly (dhfr best 0.192→0.186; insulin best
   1.014→0.974, fr5 0.925→0.889) while Rbent climbs 1–4%.
