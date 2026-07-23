@@ -1026,7 +1026,7 @@ baseline table above.  Cells show *sigmaa / nan*.
 | raddam 5kxm | 0.076 / 0.076 | 0.078 / 0.078 | 10.4 / 10.4 | 9.9 / 9.9 | 17.21 / 17.21 |
 | raddam 5kxn | 0.091 / 0.091 | 0.100 / 0.100 | 18.1 / 18.1 | 17.6 / 17.6 | 20 / 20 |
 | myoglobin | 0.139 / 0.139 | 0.107 / 0.107 | 30.3* / — | 30.2* / — | 10.89* / — |
-| insulin | **0.889** / 0.925 | **0.974** / 1.014 | 66.5 / 62.5 | 66.8 / 63.2 | 8.18 / 8.15 |
+| insulin | 0.904* / — | 1.307* / — | 68.3* / — | 65.8* / — | 20 (clamped)* / — |
 | lipox | 0.583 / 0.591 | 0.322 / 0.323 | 54.5 / 54.4 | 52.8 / 52.7 | 16.01 / 16.03 |
 | porin | — | (refmac R=0.466 / 0.46) | — | — | — |
 
@@ -1056,6 +1056,17 @@ synthetic data has no missing rows so the fill path never fires).
   near −17σ with SO4 as the top peak (real differences in
   sulfate occupancy/B).  The nan-fill column is dash-marked
   pending re-run under the fixed pipeline.
+- ***Insulin post-fix** (footnote ⁴): same cross-d_min pipeline
+  fix — mov 4fg3 (2.0 Å, human, T6) → ref 4e7u (1.3 Å, bovine,
+  T3R3), a 0.7 Å gap band that saw the same cubic-interp / σA
+  extension change as myoglobin.  fr5 RMSD 0.904 Å ≈ pre-fix 0.889 Å
+  (nan) / 0.925 Å (sigmaa) — actual fit is unchanged.  The `best`
+  row moved from 1.014 Å at d_opt = 8.15 Å to 1.307 Å at d_opt = 20 Å
+  (bracket edge).  Cause: post-fix pipeline's SVD saturates at fr10,
+  parabola sees only 3 non-plateau rows monotone-decreasing → no
+  interior minimum → clamps to coarsest.  `best`-row selection
+  artifact, not a fit regression.  fr5 is the honest indicator for
+  this system.
 - **Conformational-change cases (dhfr, insulin)**: CA RMSD
   *improves* slightly (dhfr best 0.192→0.186; insulin best
   1.014→0.974, fr5 0.925→0.889) while Rbent climbs 1–4%.
@@ -1263,7 +1274,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxm | P4₃2₁2 | 0.076 Å | 10.4% | 1.36 | 0.078 Å | 9.9%  | 1.20 | +0.099 | 0.167 | 17.21 Å | bent |
 | Raddam 5kxk→5kxn | P4₃2₁2 | 0.091 Å | 18.1% | 1.46 | 0.100 Å | 17.6% | 1.23 | −0.012 | 0.198 | 20 Å (clamped) | bent |
 | Myoglobin 1mbo→1a6m | P2₁ | 0.139 Å | 30.3%³ | 2.66 | 0.107 Å | 30.2%³ | 2.89 | −0.043 | 0.408 | 10.89 Å | ref |
-| Insulin 4fg3→4e7u | H3 | 0.925 Å | 62.5% | 21.58² | 1.014 Å | 63.2% | 19.99² | +0.000 | 1.683 | 8.15 Å | ref (`fill_asu=True`) |
+| Insulin 4fg3→4e7u | H3 | 0.904 Å⁴ | 68.3%⁴ | 21.69² | 1.307 Å⁴ | 65.8%⁴ | 15.14² | +0.000 | 1.495 | 20 Å (clamped)⁴ | ref (`fill_asu=True`) |
 | Porin 3poq→3pou | H 3 2 | (altalign+R32:R; refmac R=0.46) | | | | | | | | | ref |
 | Lipox 9o4s→9o4t | P2₁ | 0.591 Å¹ | 54.4% | 7.80 | 0.323 Å | 52.7% | 6.97 | −0.037 | 0.858 | 16.03 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
 
@@ -1291,6 +1302,23 @@ baseline showed −40σ Fe(heme); new run shows Fe near −17σ with
 SO4 as the top peak, consistent with two independent refinements
 of the same physical species.  The old −40σ Fe was the
 cross-d_min inflation.
+
+⁴ Insulin: same cross-d_min pipeline fix as myoglobin footnote ³
+(mov 4fg3 d_min 2.00 Å → ref 4e7u d_min 1.30 Å, gap 2.0–1.3 Å),
+plus insulin-specific compounding factors (cross-species human vs
+bovine, T6 vs T3R3 conformation, ~3 % cell drift, LEU B6 ~8 Å shift
+exceeds the smooth PSDVF model — footnote ² above).  fr5 RMSD
+0.904 Å is close to the pre-fix baseline of 0.889 Å (nan) / 0.925 Å
+(sigmaa) — actual fit quality at fine fitreso is unchanged.
+The `best`-row RMSD moved from 1.014 Å at d_opt = 8.15 Å to
+1.307 Å at d_opt = 20 Å (parabola bracket edge).  Cause: SVD
+saturates at fr10 (od_margin cap → 427 canonical HKLs) under
+the post-fix pipeline, so fr10–fr5 are plateau-identical rows;
+the parabola-vertex fit sees only 3 non-plateau rows (fr20, fr15,
+fr12), all monotone decreasing → no interior minimum → clamps to
+coarsest bracket.  This is a `best`-row selection artifact, not a
+fit-quality regression.  fr5 is the honest indicator for this
+system.  Pre-fix nan-fill column dash-marked pending re-run.
 
 The `best` row in each `scan_dir/scan_fitreso.log` is the
 parabola-vertex re-fit (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
