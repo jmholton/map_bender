@@ -3672,29 +3672,25 @@ def _relabel_mtz_fp_to_f(in_mtz_path, out_mtz_path):
 
 def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
                         target_col=None, verbose=True):
-    """Recompute Fc with bulk solvent + anisotropic scaling to a target
-    column in ref_mtz.
+    """Recompute Fc with bulk solvent + anisotropic scaling to the deposit's
+    Fobs scale.
 
-    Wraps `gemmi sfcalc --dmin=<d> --scale-to=<mtz>:<col> --to-mtz=<out>`.
+    Wraps `gemmi sfcalc --dmin=<d> --scale-to=<mtz>:<col> --to-mtz=<out>`
+    where <col> is an F/FP/FOBS column with a matching SIG*.
 
-    target_col : which column of `ref_mtz_path` to scale gemmi's Fcalc to.
-        None (default) → auto-detect: prefer `FC` or `FC_ALL_LS` (refmac's
-        UNWEIGHTED total on-Fobs-scale model — scale should come out ≈ 1
-        as a sanity check that gemmi's bulk-solvent fit matches refmac's).
-        Falls back to `F`/`FP`/`FOBS` (Fobs).
+    The *purpose* of `--scale-to` here is to put gemmi's Fcalc (produced
+    on the absolute electron scale by Cromer-Mann atomic form factors)
+    onto the deposit's *arbitrary* Fobs scale.  This is what the σA
+    fill needs — filled `D·|Fc|` rows must match the FP column already
+    in the MTZ, not the absolute Fcalc scale.
 
-        DO NOT use `FC_ALL` — refmac's `FC_ALL` = D · (Fcalc + Fpart) is
-        already σA/ML-weighted (Murshudov 2003).  Using it as the scale
-        target would double-count the D weighting: `sfcalc --scale-to
-        FC_ALL` fits gemmi's Fcalc to a D-weighted target → scale factor
-        ends up ≈ D (< 1), and downstream σA fits done against `FC_ALL`
-        become circular.  Use the unweighted total (`FC` / `FC_ALL_LS`)
-        or Fobs instead.
-
-        Rationale for preferring the unweighted total: reproduces
-        refmac's own k_sol/B_sol/aniso rather than refitting bulk solvent
-        from scratch (small but real difference in the extension band
-        where fits may diverge slightly).
+    target_col : which Fobs column of `ref_mtz_path` to scale to.  Only
+        F/FP/FOBS are valid — Fcalc columns (FC, FC_ALL_LS) are
+        already on the absolute scale so scaling to them is a no-op /
+        nonsense, and gemmi's `--scale-to` needs the target's σ pair
+        (Bayesian fit weighted by observation variance), which never
+        exists for Fcalc columns in a deposit MTZ.  None → auto-detect
+        (F → FP → FOBS, whichever has a matching SIG*).
     """
     import shutil as _sh
     gemmi_exe = (_sh.which('gemmi')
@@ -3704,29 +3700,86 @@ def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
 
     mtz = gemmi.read_mtz_file(ref_mtz_path)
     cols = {c.label for c in mtz.columns}
+    # Which columns can serve as `--scale-to` targets?  gemmi requires a
+    # matching SIG* pair (Bayesian scale-fit weighted by target variance).
+    # For Fobs columns (F/FP/FOBS) the deposit ships the pair.  For Fcalc
+    # columns (FC, FC_ALL_LS) no SIGFC exists in any deposit — but we can
+    # spoof it by copying the observation's SIGFP onto the target's slot:
+    # for envelope-fitting purposes Fc's "uncertainty" comes from the
+    # same model refined against those same Fobs, so SIGFP is a fine
+    # proxy.  (This is a general-purpose hack.  Fobs remains the correct
+    # target for σA-fill's `_recompute_fc_scaled` use — the point there
+    # is to put filled `D·|Fc|` on the deposit's Fobs scale.  Fcalc
+    # targets are for the k+B model-envelope fit, a separate use.)
+    _sig_pairs = {
+        'F':         ('SIGF',),
+        'FP':        ('SIGFP',),
+        'FOBS':      ('SIGFOBS',),
+        'FC':        ('SIGFC',      'SIGFP', 'SIGF', 'SIGFOBS'),
+        'FC_ALL_LS': ('SIGFC_ALL_LS','SIGFP', 'SIGF', 'SIGFOBS'),
+    }
     if target_col is None:
-        # Auto-detect: prefer refmac's UNWEIGHTED total (FC = FC_ALL_LS);
-        # never FC_ALL (D-weighted).  Fall back to Fobs.
-        for cand in ('FC_ALL_LS', 'FC', 'F', 'FP', 'FOBS'):
-            if cand in cols:
+        # Auto-detect preference: Fobs first (correct for σA-fill's use).
+        for cand in ('F', 'FP', 'FOBS'):
+            if cand in cols and any(s in cols for s in _sig_pairs[cand]):
                 target_col = cand
                 break
     if target_col is None or target_col not in cols:
-        raise RuntimeError(f'{ref_mtz_path}: no suitable scale-to column '
-                           f'(looked for FC_ALL_LS/FC_ALL/F/FP/FOBS); have '
-                           f'{sorted(cols)}')
+        raise RuntimeError(f'{ref_mtz_path}: no Fobs column with matching '
+                           f'SIG* (looked for F/FP/FOBS + SIG variant); '
+                           f'have {sorted(cols)}')
+    if target_col not in _sig_pairs or not any(
+            s in cols for s in _sig_pairs[target_col]):
+        raise RuntimeError(f'{ref_mtz_path}: target_col={target_col!r} has '
+                           f'no SIG* pair (native or spoofable via SIGFP/'
+                           f'SIGF).  Available: {sorted(cols)}')
     if d_min is None:
         d_min = float(mtz.resolution_high())
 
     # gemmi sfcalc --scale-to expects the target column to be present in
-    # the MTZ.  If it's FP/FOBS, relabel to F for the default parser;
-    # FC_ALL[_LS] and F pass through directly.
+    # the MTZ.  If it's FP/FOBS, relabel to F for the default parser
+    # (which reads F/SIGF).  If it's an Fcalc column (FC / FC_ALL_LS),
+    # spoof a SIGFC pair by copying SIGFP → SIGFC in a scratch MTZ so
+    # gemmi's Bayesian scale-fit has a variance to weight by.
+    scratch = None
     if target_col in ('FP', 'FOBS'):
         scratch = out_fc_mtz + '.scale_input.mtz'
         _relabel_mtz_fp_to_f(ref_mtz_path, scratch)
         scale_col_expr = f'{scratch}:F'
+    elif target_col in ('FC', 'FC_ALL_LS'):
+        # gemmi's `--scale-to` hardcodes the σ column name as `SIGF`
+        # regardless of the target.  Trick: build a scratch MTZ where
+        # the target's values live in a column NAMED `F`, with `SIGF`
+        # populated from the observation's SIGFP (SIGF or SIGFOBS as
+        # fallback).  Envelope-fitting purposes: Fc's uncertainty
+        # comes from the same model refined against those Fo±σ, so
+        # SIGFP is a fine proxy for σ<target>.
+        _src_sig = next((s for s in ('SIGFP', 'SIGF', 'SIGFOBS')
+                         if s in cols), None)
+        if _src_sig is None:
+            raise RuntimeError(
+                f'{ref_mtz_path}: no observation σ (SIGFP/SIGF/SIGFOBS) '
+                f'to spoof gemmi-expected SIGF for --scale-to={target_col}')
+        scratch = out_fc_mtz + '.sigfc_hack.mtz'
+        _src = gemmi.read_mtz_file(ref_mtz_path)
+        _data = np.array(_src.array, copy=True)
+        _lbls = _src.column_labels()
+        _fc_arr  = _data[:, _lbls.index(target_col)].astype(np.float32)
+        _sig_arr = _data[:, _lbls.index(_src_sig)].astype(np.float32)
+        _out = gemmi.Mtz(with_base=True)
+        _out.cell = _src.cell
+        _out.spacegroup = _src.spacegroup
+        _out.add_dataset('d')
+        _out.add_column('F',    'F')
+        _out.add_column('SIGF', 'Q')
+        _new = np.zeros((len(_data), 5), dtype=np.float32)
+        _new[:, :3] = _data[:, :3]
+        _new[:,  3] = _fc_arr
+        _new[:,  4] = _sig_arr
+        _out.set_data(_new)
+        _out.write_to_file(scratch)
+        scale_col_expr = f'{scratch}:F'
     else:
-        scratch = None
         scale_col_expr = f'{ref_mtz_path}:{target_col}'
 
     cmd = [gemmi_exe, 'sfcalc', f'--dmin={d_min:.4f}',
@@ -4250,10 +4303,13 @@ def _extend_mov_fwt_post_refmac(mov_mtz_path, mov_pdb_path,
         _sh.copyfile(mov_mtz_path, out_mtz_path)
         return out_mtz_path
 
-    # ── 1. Compute gemmi Fcalc scaled to refmac's model column (FC_ALL_LS
-    # or FC_ALL, whichever is present), extended out to fill_dmin.
-    # `_recompute_fc_scaled` auto-detects FC_ALL_LS → FC_ALL → F fallback.
-    # Ideal outcome: scale=1 (gemmi's Fcalc matches refmac's model).
+    # ── 1. Compute gemmi Fcalc scaled to mov's Fobs column, extended
+    # out to fill_dmin.  `_recompute_fc_scaled` auto-detects an F/FP/FOBS
+    # column with a matching SIG*.  We would prefer scale-to FC_ALL_LS
+    # (refmac's unweighted total, gives scale=1 as a "reproduce refmac"
+    # sanity check) but gemmi sfcalc --scale-to requires a matching SIG*
+    # which no deposit MTZ ships for FC columns.  Fo is the practical
+    # choice and gives a Fo-scale Fc — same physics for our purposes.
     fc_mtz_path = out_mtz_path + '.fc_refmac_scaled.mtz'
     _recompute_fc_scaled(mov_pdb_path, mov_mtz_path, fc_mtz_path,
                         d_min=fill_dmin, verbose=verbose)
@@ -5063,6 +5119,30 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
             params = res.x
         except Exception:
             break
+
+    # ── Two-step scale rescue when scale_target='fobs'/'fcalc'.
+    # The Fobs LM fit gives an honest B (Wilson-B difference between the
+    # two crystals — a scale-invariant data property), but its k reflects
+    # the Fobs↔Fobs amplitude ratio, which can differ from the FWT↔FWT
+    # ratio by an arbitrary constant.  Reason: refmac's ML fit scales
+    # Fo→Fcalc during refinement, so FWT lands on the absolute (Fcalc)
+    # scale while raw FP stays on the deposit's arbitrary scale.  For
+    # same-source pairs those scales coincide (k_Fo ≈ k_FWT); for
+    # different-source pairs (e.g. XFEL mov vs synchrotron ref) they
+    # differ, and applying k_Fo to bF (FWT-based) would shift the
+    # entire diff map by that offset.  Fix: keep B from Fobs, refit
+    # only k against FWT.  One closed-form LS: k = Σ w·rF·f·bF /
+    # Σ w·(f·bF)², where f = exp(−B/4·s²) is the B-part of the scale.
+    if _scale_active and not anisotropic:
+        _B_fit = float(params[1])
+        _f = np.exp(-_B_fit / 4.0 * s_sq)
+        _w_k = w_snr if w_snr is not None else np.ones_like(s_sq)
+        _num = float(np.sum(_w_k * rF * (_f * bF)))
+        _den = float(np.sum(_w_k * (_f * bF) ** 2))
+        if _den > 1e-30:
+            _k_FWT = _num / _den
+            if _k_FWT > 0:
+                params[0] = float(np.log(_k_FWT))
 
     scale = _scale_fn(params)
     if not anisotropic:
