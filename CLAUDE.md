@@ -1025,7 +1025,7 @@ baseline table above.  Cells show *sigmaa / nan*.
 | raddam 5kxl | 0.112 / 0.112 | 0.114 / 0.114 | 11.9 / 11.9 | 11.2 / 11.2 | 20 / 20 |
 | raddam 5kxm | 0.076 / 0.076 | 0.078 / 0.078 | 10.4 / 10.4 | 9.9 / 9.9 | 17.21 / 17.21 |
 | raddam 5kxn | 0.091 / 0.091 | 0.100 / 0.100 | 18.1 / 18.1 | 17.6 / 17.6 | 20 / 20 |
-| myoglobin | 0.139 / 0.139 | 0.107 / 0.107 | 56.6 / 52.8 | 56.4 / 52.5 | 9.01 / 9.06 |
+| myoglobin | 0.139 / 0.139 | 0.107 / 0.107 | 30.3* / — | 30.2* / — | 10.89* / — |
 | insulin | **0.889** / 0.925 | **0.974** / 1.014 | 66.5 / 62.5 | 66.8 / 63.2 | 8.18 / 8.15 |
 | lipox | 0.583 / 0.591 | 0.322 / 0.323 | 54.5 / 54.4 | 52.8 / 52.7 | 16.01 / 16.03 |
 | porin | — | (refmac R=0.466 / 0.46) | — | — | — |
@@ -1044,6 +1044,18 @@ synthetic data has no missing rows so the fill path never fires).
 - **Cross-cell (lipox, myoglobin)**: within scan-grid noise of the
   nan baseline.  Stretch + altindex_refine + sigmaA fill compose
   cleanly.
+- ***Myoglobin Rbent post-fix** (July 2026 → July 2026 refit): the
+  56.4/52.5 % baseline was inflated by cross-d_min gap-band
+  pathology (mov 1mbo 1.5 Å → ref 1a6m 1.0 Å, gap 1.5–1.0 Å had
+  cubic-interp leakage into mov FWT before commit `a2187ea` grid
+  unification and the post-refmac σA extension `980a422`).  Post-fix
+  Rbent lands at 30.2 % — matches physical expectations: both 1mbo
+  and 1a6m are OXY-myoglobin (same Fe(II)-O₂ state), so a diff map
+  between them shouldn't have a dominant Fe(heme) peak.  Old
+  baseline showed −40σ Fe (inflation artifact); post-fix shows Fe
+  near −17σ with SO4 as the top peak (real differences in
+  sulfate occupancy/B).  The nan-fill column is dash-marked
+  pending re-run under the fixed pipeline.
 - **Conformational-change cases (dhfr, insulin)**: CA RMSD
   *improves* slightly (dhfr best 0.192→0.186; insulin best
   1.014→0.974, fr5 0.925→0.889) while Rbent climbs 1–4%.
@@ -1250,7 +1262,7 @@ All systems use default parameters (`outlier_sigma=2.5`, `b_sigma=3.0`, `drop_sn
 | Raddam 5kxk→5kxl | P4₃2₁2 | 0.112 Å | 11.9% | 1.51 | 0.114 Å | 11.2% | 1.19 | +0.017 | 0.141 | 20 Å (clamped) | bent |
 | Raddam 5kxk→5kxm | P4₃2₁2 | 0.076 Å | 10.4% | 1.36 | 0.078 Å | 9.9%  | 1.20 | +0.099 | 0.167 | 17.21 Å | bent |
 | Raddam 5kxk→5kxn | P4₃2₁2 | 0.091 Å | 18.1% | 1.46 | 0.100 Å | 17.6% | 1.23 | −0.012 | 0.198 | 20 Å (clamped) | bent |
-| Myoglobin 1mbo→1a6m | P2₁ | 0.139 Å | 52.8% | 2.66 | 0.107 Å | 52.5% | 2.90 | +0.024 | 0.643 | 9.06 Å | ref |
+| Myoglobin 1mbo→1a6m | P2₁ | 0.139 Å | 30.3%³ | 2.66 | 0.107 Å | 30.2%³ | 2.89 | −0.043 | 0.408 | 10.89 Å | ref |
 | Insulin 4fg3→4e7u | H3 | 0.925 Å | 62.5% | 21.58² | 1.014 Å | 63.2% | 19.99² | +0.000 | 1.683 | 8.15 Å | ref (`fill_asu=True`) |
 | Porin 3poq→3pou | H 3 2 | (altalign+R32:R; refmac R=0.46) | | | | | | | | | ref |
 | Lipox 9o4s→9o4t | P2₁ | 0.591 Å¹ | 54.4% | 7.80 | 0.323 Å | 52.7% | 6.97 | −0.037 | 0.858 | 16.03 Å | ref (`fill_asu=True`) — cross-cell pair (~4% expansion); stretch + loose-tol altindex picks 180°-about-z |
@@ -1264,6 +1276,21 @@ bondZ 7.80 (vs 16982 pre-ridge).  See [Field-bounded SVD ridge](#field-bounded-s
 regularization failure — LEU B6 shifts ~8 Å between crystal forms,
 exceeding what a smooth shift field can bend cleanly.  Every other
 system in the gamut lands at bondZ ≤ 3.82 (refined-to-good geometry).
+
+³ Myoglobin Rbent 30.2% (down from July-2026 baseline of 52.5%): the
+old number was inflated by a cross-d_min pathology in the mov-side
+FWT gap band (mov d_min 1.5 Å, ref d_min 1.0 Å, gap 1.5–1.0 Å had
+cubic-interp leakage before the grid-unification fix, commit
+`a2187ea`).  With grid unification + post-refmac σA extension
+(`980a422`) the gap-band bF is now a clean σA·|Fc| fadeout, and
+Rbent reflects the honest map-quality residual.  Independent
+verification: both 1mbo (1981, 1.6 Å) and 1a6m (1998, 1.0 Å) are
+OXY-myoglobin (Fe(II)-O₂, same species, same ligation state) — a
+diff map between them should NOT have a dominant Fe peak.  Old
+baseline showed −40σ Fe(heme); new run shows Fe near −17σ with
+SO4 as the top peak, consistent with two independent refinements
+of the same physical species.  The old −40σ Fe was the
+cross-d_min inflation.
 
 The `best` row in each `scan_dir/scan_fitreso.log` is the
 parabola-vertex re-fit (see [Best d_opt parabola fit](#best-d_opt-parabola-fit)
