@@ -3456,6 +3456,25 @@ def _enumerate_sg_asu_hkls(cell_tuple, sg, d_min):
     return np.array(sorted(canon), dtype=np.int32)
 
 
+#
+# MTZ column-label conventions across refmac / CCP4 / Phenix / XDS.
+# Update in ONE place — every helper picks up new labels automatically.
+# Order = preference: earlier candidates picked first when multiple present.
+#
+_F_LABELS      = ('FP', 'F', 'FOBS',
+                  'F-obs', 'F-obs_filtered')             # Phenix uses hyphens
+_SIGF_LABELS   = ('SIGFP', 'SIGF', 'SIGFOBS',
+                  'SIGF-obs', 'SIGF-obs_filtered')
+_I_LABELS      = ('IMEAN', 'I', 'IOBS',
+                  'I-obs', 'I-obs_filtered')
+_SIGI_LABELS   = ('SIGIMEAN', 'SIGI', 'SIGIOBS',
+                  'SIGI-obs', 'SIGI-obs_filtered')
+_FC_LABELS     = ('FC_ALL_LS', 'FC', 'FMODEL')            # UNWEIGHTED total
+                                                          # (skip FC_ALL — D-weighted)
+_FREE_LABELS   = ('FREE', 'RFREE', 'FreeR_flag',
+                  'R-free-flags', 'FREE_R', 'FREE_flag', 'FreeRflag')
+
+
 def _mtz_completeness(mtz_path):
     """Return (n_obs, n_expected, fraction) for an MTZ.
 
@@ -3473,7 +3492,7 @@ def _mtz_completeness(mtz_path):
     mtz = gemmi.read_mtz_file(mtz_path)
     data = np.array(mtz.array)
     lbls = mtz.column_labels()
-    obs_lbl = next((l for l in ('FP', 'F', 'FOBS', 'IMEAN', 'I', 'IOBS')
+    obs_lbl = next((l for l in (_F_LABELS + _I_LABELS)
                     if l in lbls), None)
     if obs_lbl is None:
         return 0, 0, 1.0
@@ -3509,8 +3528,7 @@ def _pick_free_column(mtz):
     the candidates is sensible — caller can still proceed; refmac will
     warn but not crash.
     """
-    candidates = [c.label for c in mtz.columns
-                  if c.label in ('FREE', 'RFREE', 'FreeR_flag')]
+    candidates = [c.label for c in mtz.columns if c.label in _FREE_LABELS]
     if not candidates:
         return None
     data = mtz.array
@@ -3556,10 +3574,10 @@ def _pad_mtz_to_full_asu(in_mtz_path, out_mtz_path, d_min=None):
     # Identify amplitude / intensity / sigma / free columns.  An MTZ may
     # carry F (post-truncate / refined output) or I (raw deposit straight
     # from cif2mtz) or both — we fill whichever obs column refmac will use.
-    F_lbl    = next((l for l in ('FP', 'F', 'FOBS') if l in lbls), None)
-    SIG_lbl  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in lbls), None)
-    I_lbl    = next((l for l in ('IMEAN', 'I', 'IOBS') if l in lbls), None)
-    SIGI_lbl = next((l for l in ('SIGIMEAN', 'SIGI', 'SIGIOBS') if l in lbls), None)
+    F_lbl    = next((l for l in _F_LABELS    if l in lbls), None)
+    SIG_lbl  = next((l for l in _SIGF_LABELS if l in lbls), None)
+    I_lbl    = next((l for l in _I_LABELS    if l in lbls), None)
+    SIGI_lbl = next((l for l in _SIGI_LABELS if l in lbls), None)
     FREE_lbl = _pick_free_column(mtz)
     if F_lbl is None and I_lbl is None:
         # Nothing to fill — no obs column refmac would consume.
@@ -3700,33 +3718,36 @@ def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
 
     mtz = gemmi.read_mtz_file(ref_mtz_path)
     cols = {c.label for c in mtz.columns}
-    # Which columns can serve as `--scale-to` targets?  gemmi requires a
-    # matching SIG* pair (Bayesian scale-fit weighted by target variance).
-    # For Fobs columns (F/FP/FOBS) the deposit ships the pair.  For Fcalc
-    # columns (FC, FC_ALL_LS) no SIGFC exists in any deposit — but we can
-    # spoof it by copying the observation's SIGFP onto the target's slot:
-    # for envelope-fitting purposes Fc's "uncertainty" comes from the
-    # same model refined against those same Fobs, so SIGFP is a fine
-    # proxy.  (This is a general-purpose hack.  Fobs remains the correct
-    # target for σA-fill's `_recompute_fc_scaled` use — the point there
-    # is to put filled `D·|Fc|` on the deposit's Fobs scale.  Fcalc
-    # targets are for the k+B model-envelope fit, a separate use.)
+    # `--scale-to=FILE:FCOL:SIGFCOL` accepts explicit σ label, so we can
+    # pass any (F, σ) pair — no scratch MTZ relabeling needed.  Fcalc
+    # columns get an observation σ (SIGFP/SIGF/SIGFOBS) as their SIGFCOL
+    # since Fc has no native σ; that's a fine proxy for envelope fitting
+    # (Fc came from a model refined against those very Fo±σ).
+    #
+    # Column families cover refmac + phenix + XDS conventions.  For
+    # Phenix, `F-obs`/`SIGF-obs` and friends use hyphens.
     _sig_pairs = {
-        'F':         ('SIGF',),
-        'FP':        ('SIGFP',),
-        'FOBS':      ('SIGFOBS',),
-        'FC':        ('SIGFC',      'SIGFP', 'SIGF', 'SIGFOBS'),
-        'FC_ALL_LS': ('SIGFC_ALL_LS','SIGFP', 'SIGF', 'SIGFOBS'),
+        # refmac / CCP4
+        'F':                 ('SIGF',),
+        'FP':                ('SIGFP',),
+        'FOBS':              ('SIGFOBS',),
+        # phenix
+        'F-obs':             ('SIGF-obs',),
+        'F-obs_filtered':    ('SIGF-obs_filtered',),
+        # Fcalc (any observation σ works as proxy)
+        'FC':                ('SIGFC', 'SIGFP', 'SIGF', 'SIGFOBS'),
+        'FC_ALL_LS':         ('SIGFC_ALL_LS', 'SIGFP', 'SIGF', 'SIGFOBS'),
+        'FMODEL':            ('SIGFMODEL', 'SIGFP', 'SIGF', 'SIGFOBS'),
     }
     if target_col is None:
         # Auto-detect preference: Fobs first (correct for σA-fill's use).
-        for cand in ('F', 'FP', 'FOBS'):
+        for cand in ('F', 'FP', 'FOBS', 'F-obs', 'F-obs_filtered'):
             if cand in cols and any(s in cols for s in _sig_pairs[cand]):
                 target_col = cand
                 break
     if target_col is None or target_col not in cols:
         raise RuntimeError(f'{ref_mtz_path}: no Fobs column with matching '
-                           f'SIG* (looked for F/FP/FOBS + SIG variant); '
+                           f'SIG* (looked for F/FP/FOBS/F-obs + SIG variant); '
                            f'have {sorted(cols)}')
     if target_col not in _sig_pairs or not any(
             s in cols for s in _sig_pairs[target_col]):
@@ -3737,50 +3758,41 @@ def _recompute_fc_scaled(pdb_path, ref_mtz_path, out_fc_mtz, d_min=None,
         d_min = float(mtz.resolution_high())
 
     # gemmi sfcalc --scale-to expects the target column to be present in
-    # the MTZ.  If it's FP/FOBS, relabel to F for the default parser
-    # (which reads F/SIGF).  If it's an Fcalc column (FC / FC_ALL_LS),
-    # spoof a SIGFC pair by copying SIGFP → SIGFC in a scratch MTZ so
-    # gemmi's Bayesian scale-fit has a variance to weight by.
+    # gemmi's `--scale-to` accepts a `FILE:FCOL:SIGFCOL` form — no need
+    # for scratch MTZ relabeling.  For Fcalc columns (FC, FC_ALL_LS)
+    # we pass an observation σ (SIGFP/SIGF/SIGFOBS) as the SIGFCOL — a
+    # fine proxy for Fc's envelope-fitting uncertainty since Fc came
+    # from a model refined against those very Fobs±σ.  If no σ column
+    # exists at all, we fall back to unit weights via a scratch MTZ
+    # that stamps in σ=max(|F|)/100 (nominal SNR≈100).
     scratch = None
-    if target_col in ('FP', 'FOBS'):
-        scratch = out_fc_mtz + '.scale_input.mtz'
-        _relabel_mtz_fp_to_f(ref_mtz_path, scratch)
-        scale_col_expr = f'{scratch}:F'
-    elif target_col in ('FC', 'FC_ALL_LS'):
-        # gemmi's `--scale-to` hardcodes the σ column name as `SIGF`
-        # regardless of the target.  Trick: build a scratch MTZ where
-        # the target's values live in a column NAMED `F`, with `SIGF`
-        # populated from the observation's SIGFP (SIGF or SIGFOBS as
-        # fallback).  Envelope-fitting purposes: Fc's uncertainty
-        # comes from the same model refined against those Fo±σ, so
-        # SIGFP is a fine proxy for σ<target>.
-        _src_sig = next((s for s in ('SIGFP', 'SIGF', 'SIGFOBS')
-                         if s in cols), None)
-        if _src_sig is None:
-            raise RuntimeError(
-                f'{ref_mtz_path}: no observation σ (SIGFP/SIGF/SIGFOBS) '
-                f'to spoof gemmi-expected SIGF for --scale-to={target_col}')
-        scratch = out_fc_mtz + '.sigfc_hack.mtz'
+    sig_col = next((s for s in _sig_pairs.get(target_col, ()) if s in cols),
+                   None)
+    if sig_col is None:
+        # No σ at all — fabricate a nominal one, write a scratch MTZ.
         _src = gemmi.read_mtz_file(ref_mtz_path)
         _data = np.array(_src.array, copy=True)
         _lbls = _src.column_labels()
-        _fc_arr  = _data[:, _lbls.index(target_col)].astype(np.float32)
-        _sig_arr = _data[:, _lbls.index(_src_sig)].astype(np.float32)
+        _f_arr = _data[:, _lbls.index(target_col)].astype(np.float32)
+        _nominal_sig = float(np.nanmax(np.abs(_f_arr))) / 100.0
         _out = gemmi.Mtz(with_base=True)
-        _out.cell = _src.cell
-        _out.spacegroup = _src.spacegroup
+        _out.cell = _src.cell; _out.spacegroup = _src.spacegroup
         _out.add_dataset('d')
-        _out.add_column('F',    'F')
-        _out.add_column('SIGF', 'Q')
+        _out.add_column(target_col, 'F')
+        _out.add_column('SIGFC_syn', 'Q')
         _new = np.zeros((len(_data), 5), dtype=np.float32)
         _new[:, :3] = _data[:, :3]
-        _new[:,  3] = _fc_arr
-        _new[:,  4] = _sig_arr
+        _new[:,  3] = _f_arr
+        _new[:,  4] = np.full(len(_data), _nominal_sig, dtype=np.float32)
         _out.set_data(_new)
+        scratch = out_fc_mtz + '.nosig_stub.mtz'
         _out.write_to_file(scratch)
-        scale_col_expr = f'{scratch}:F'
+        scale_col_expr = f'{scratch}:{target_col}:SIGFC_syn'
+        if verbose:
+            print(f'  {ref_mtz_path}: no σ column; using nominal σ='
+                  f'{_nominal_sig:.3f} for --scale-to', flush=True)
     else:
-        scale_col_expr = f'{ref_mtz_path}:{target_col}'
+        scale_col_expr = f'{ref_mtz_path}:{target_col}:{sig_col}'
 
     cmd = [gemmi_exe, 'sfcalc', f'--dmin={d_min:.4f}',
            f'--scale-to={scale_col_expr}',
@@ -3985,9 +3997,9 @@ def _sigmaa_fill_mtz(in_mtz_path, pdb_path, out_mtz_path, d_min=None,
     # applies for I-only MTZs.
     mtz_probe = gemmi.read_mtz_file(in_mtz_path)
     probe_cols = {c.label for c in mtz_probe.columns}
-    if not any(l in probe_cols for l in ('FP', 'F', 'FOBS')):
-        i_lbl  = next((l for l in ('IMEAN', 'I', 'IOBS')          if l in probe_cols), None)
-        sigi   = next((l for l in ('SIGIMEAN', 'SIGI', 'SIGIOBS') if l in probe_cols), None)
+    if not any(l in probe_cols for l in _F_LABELS):
+        i_lbl  = next((l for l in _I_LABELS          if l in probe_cols), None)
+        sigi   = next((l for l in _SIGI_LABELS if l in probe_cols), None)
         if not (i_lbl and sigi):
             raise RuntimeError(f'{in_mtz_path}: no F/FP/FOBS or I/IMEAN '
                                f'columns — cannot fill (columns present: '
@@ -4026,8 +4038,8 @@ def _sigmaa_fill_mtz(in_mtz_path, pdb_path, out_mtz_path, d_min=None,
     if d_min is None:
         d_min = float(mtz_in.resolution_high())
 
-    F_lbl    = next((l for l in ('FP', 'F', 'FOBS')          if l in lbls), None)
-    SIG_lbl  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in lbls), None)
+    F_lbl    = next((l for l in _F_LABELS          if l in lbls), None)
+    SIG_lbl  = next((l for l in _SIGF_LABELS if l in lbls), None)
     FREE_lbl = _pick_free_column(mtz_in)
     if F_lbl is None:
         raise RuntimeError(f'{in_mtz_path}: no F/FP/FOBS column — cannot fill '
@@ -4328,7 +4340,7 @@ def _extend_mov_fwt_post_refmac(mov_mtz_path, mov_pdb_path,
     # — refmac-consistent σA, no need to re-run gemmi sfcalc for this
     # purpose.  Falls back to gemmi's Fcalc if neither refmac column
     # is present (non-refmac input).
-    F_lbl_mov = next((l for l in ('FP', 'F', 'FOBS') if l in lbls), None)
+    F_lbl_mov = next((l for l in _F_LABELS if l in lbls), None)
     if F_lbl_mov is None:
         raise RuntimeError(f'{mov_mtz_path}: no F/FP/FOBS column')
     FREE_lbl_mov = _pick_free_column(mtz_mov)
@@ -4343,7 +4355,7 @@ def _extend_mov_fwt_post_refmac(mov_mtz_path, mov_pdb_path,
     # NEVER use FC_ALL — it's already D-weighted (Murshudov 2003), and
     # using it in the amplitude correlation would double-count σA and
     # give a spuriously inflated fit.
-    refmac_fc_col = next((l for l in ('FC_ALL_LS', 'FC') if l in lbls), None)
+    refmac_fc_col = next((l for l in _FC_LABELS if l in lbls), None)
     if refmac_fc_col is not None:
         Fc_at_mov = data[:, lbls.index(refmac_fc_col)]
         if verbose:
@@ -4749,9 +4761,9 @@ def _make_snr_weight_fn(mov_mtz_path, ref_mtz_path,
     mov_labs = {c.label for c in mov.columns}
     ref_labs = {c.label for c in ref.columns}
     if F_col is None:
-        F_col = _pick(mov_labs & ref_labs, ('FP', 'F', 'FOBS'))
+        F_col = _pick(mov_labs & ref_labs, _F_LABELS)
     if S_col is None:
-        S_col = _pick(mov_labs & ref_labs, ('SIGFP', 'SIGF', 'SIGFOBS'))
+        S_col = _pick(mov_labs & ref_labs, _SIGF_LABELS)
     if F_col is None or S_col is None:
         if verbose:
             print('  SNR weighting off: no F/SIGF pair in both MTZs',
@@ -5050,20 +5062,42 @@ def _fspace_scale_and_diff(bent_map, ref_h, ref_mtz_path, ref_f_col, ref_phi_col
             # naïve variance-inverse weighting would heavily
             # over-weight in the outer noisy shell — see CA 8sf1).
             # Verified to match diff.com's k+B on the CA pair.
-            _snr_mov = np.where((_sig_mov > 0) & np.isfinite(_sig_mov),
-                                _A_mov / _sig_mov, 0.0)
-            _snr_ref = np.where((_sig_ref > 0) & np.isfinite(_sig_ref),
-                                _A_ref / _sig_ref, 0.0)
+            # Effective per-side SNR.  If σ column is missing (or all
+            # ≤ 0) we treat that side as "high-SNR everywhere" — SIG-
+            # weighting is only there to down-weight noisy shells, so
+            # a missing σ column means we can't weight but shouldn't
+            # veto rows either.  The SNR-mask then simplifies to the
+            # available-side test only.
+            _mov_has_sig = np.any((_sig_mov > 0) & np.isfinite(_sig_mov))
+            _ref_has_sig = np.any((_sig_ref > 0) & np.isfinite(_sig_ref))
+            _snr_mov = (np.where((_sig_mov > 0) & np.isfinite(_sig_mov),
+                                 _A_mov / _sig_mov, np.inf)
+                        if _mov_has_sig else np.full_like(_A_mov, np.inf))
+            _snr_ref = (np.where((_sig_ref > 0) & np.isfinite(_sig_ref),
+                                 _A_ref / _sig_ref, np.inf)
+                        if _ref_has_sig else np.full_like(_A_ref, np.inf))
+            # SNR mask: SNR > 2 on whichever side has σ.  When both σ
+            # are missing (e.g. Fcalc-target with no observation σ on
+            # either), keep every finite positive row.
             _scale_mask = (np.isfinite(_A_mov) & np.isfinite(_A_ref)
-                           & (_A_mov > 0) & (_A_ref > 0)
-                           & (_snr_mov > 2.0) & (_snr_ref > 2.0))
+                           & (_A_mov > 0) & (_A_ref > 0))
+            if _mov_has_sig:
+                _scale_mask &= (_snr_mov > 2.0)
+            if _ref_has_sig:
+                _scale_mask &= (_snr_ref > 2.0)
             if _scale_mask.sum() < 10:
                 _scale_active = False
             else:
-                _inv_var_ln = np.where(
-                    (_snr_mov > 0) & (_snr_ref > 0),
-                    1.0 / np.sqrt(1.0 / _snr_ref**2 + 1.0 / _snr_mov**2),
-                    0.0)
+                # LM weight: inverse-variance of the log residual.  If
+                # either σ is missing (inf SNR on that side), the
+                # inv-var reduces to whichever side is finite, or
+                # falls back to unit weight when both are missing.
+                if _mov_has_sig or _ref_has_sig:
+                    _inv_var_ln = 1.0 / np.sqrt(
+                        1.0 / np.maximum(_snr_mov**2, 1e-30)
+                        + 1.0 / np.maximum(_snr_ref**2, 1e-30))
+                else:
+                    _inv_var_ln = np.ones_like(_A_mov)
                 _scale_w = _inv_var_ln
                 _scale_A_mov, _scale_A_ref = _A_mov, _A_ref
         else:
@@ -5526,13 +5560,13 @@ def fitreso_scan(
         mov_labs = {c.label for c in mov.columns}
         ref_labs = {c.label for c in ref.columns}
         # Amplitude column selection: prefer FP; try F, FOBS.
-        f_lbl = next((c for c in ('FP', 'F', 'FOBS')
+        f_lbl = next((c for c in _F_LABELS
                       if c in mov_labs and c in ref_labs), None)
-        s_lbl = next((c for c in ('SIGFP', 'SIGF', 'SIGFOBS')
+        s_lbl = next((c for c in _SIGF_LABELS
                       if c in mov_labs and c in ref_labs), None)
         # Fcalc: unweighted total.  Try FC_ALL_LS (refmac unweighted),
         # then FC.  FC_ALL is D-weighted (skip: would circularize).
-        fc_lbl = next((c for c in ('FC_ALL_LS', 'FC')
+        fc_lbl = next((c for c in _FC_LABELS
                        if c in mov_labs and c in ref_labs), None)
         if f_lbl is None and fc_lbl is None:
             return None
@@ -6112,6 +6146,63 @@ def fitreso_scan(
             if verbose:
                 print(f'  post-refmac σA extension failed ({e!r}); '
                       f'continuing with un-extended mov MTZ', flush=True)
+
+    # ── Augment scale_data with fresh Fc arrays for scale_target='fcalc'.
+    # Both mov and ref PDBs are now aligned to ref's cell/SG (via
+    # resolve_altindex).  `gemmi sfcalc` on each produces absolute-scale
+    # Fc on ref's HKL set, cleanly indexed.  Fitting log-space k+B on
+    # ln(|Fc_ref|/|Fc_mov|) then gives the relative model-envelope B —
+    # the "how sharp is mov's model vs ref's model" property that's
+    # what we actually want to apply for map matching (both Fc's and
+    # both FWT's are on absolute scale, so k lands ~1 naturally).
+    if _scale_data is not None and scale_target == 'fcalc':
+        try:
+            _sfcalc_common_kwargs = dict(d_min=None, verbose=False)
+            _mov_fc_mtz = os.path.join(scan_dir, '_fc_mov.mtz')
+            _ref_fc_mtz = os.path.join(scan_dir, '_fc_ref.mtz')
+            import shutil as _sh
+            _gemmi_exe = (_sh.which('gemmi')
+                          or os.path.join(os.environ.get('CCP4', ''),
+                                          'bin', 'gemmi'))
+            if not (_gemmi_exe and os.path.exists(_gemmi_exe)):
+                raise RuntimeError('gemmi executable not found on PATH')
+            _ref_dmin = float(gemmi.read_mtz_file(ref_mtz).resolution_high())
+            for _pdb, _out in [(mov_pdb, _mov_fc_mtz),
+                               (ref_pdb, _ref_fc_mtz)]:
+                _cmd = [_gemmi_exe, 'sfcalc',
+                        f'--dmin={_ref_dmin:.4f}',
+                        f'--to-mtz={_out}', _pdb]
+                _r = subprocess.run(_cmd, capture_output=True, text=True)
+                if _r.returncode != 0 or not os.path.exists(_out):
+                    raise RuntimeError(
+                        f'gemmi sfcalc failed for {_pdb}: {_r.stderr!r}')
+            # Look up per-HKL Fc for both sides, aligned to ref MTZ's set.
+            _ref_orig = gemmi.read_mtz_file(ref_mtz)
+            _ref_hkls = np.array(_ref_orig.array)[:, :3].astype(int)
+            def _fc_lookup(fc_mtz_path):
+                _m = gemmi.read_mtz_file(fc_mtz_path)
+                _d = np.array(_m.array)
+                _fc = _d[:, _m.column_labels().index('FC')]
+                _idx = {tuple(int(x) for x in h): i
+                        for i, h in enumerate(_d[:, :3].astype(int))}
+                _v = np.full(len(_ref_hkls), np.nan)
+                for i, h in enumerate(map(tuple, _ref_hkls)):
+                    j = _idx.get(h)
+                    if j is not None: _v[i] = _fc[j]
+                return _v
+            _scale_data['fc_mov'] = _fc_lookup(_mov_fc_mtz)
+            _scale_data['fc_ref'] = _fc_lookup(_ref_fc_mtz)
+            if verbose:
+                _n_fc = int(np.isfinite(_scale_data['fc_mov']).sum())
+                print(f'  scale_target=fcalc: computed Fc for both PDBs via '
+                      f'gemmi sfcalc; mov Fc finite: {_n_fc}/'
+                      f'{len(_scale_data["fc_mov"])}', flush=True)
+        except Exception as e:
+            if verbose:
+                print(f'  scale_target=fcalc Fc computation failed ({e!r}); '
+                      f'falling back to fwt-target LM', flush=True)
+            _scale_data.pop('fc_mov', None)
+            _scale_data.pop('fc_ref', None)
 
     # Load post-altindex mov density.  Default mov_fullcell to True for
     # CCP4 input (avoids ASU-boundary noise in diff_norm); MTZ input
@@ -7051,10 +7142,10 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
     if refmac and os.path.exists(refmac):
         mtz_in = gemmi.read_mtz_file(mtz_path_for_refmac)
         cols   = {c.label for c in mtz_in.columns}
-        fp     = next((l for l in ('FP', 'F', 'FOBS')              if l in cols), None)
-        sigfp  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS')     if l in cols), None)
-        i_lbl  = next((l for l in ('IMEAN', 'I', 'IOBS')           if l in cols), None)
-        sigi   = next((l for l in ('SIGIMEAN', 'SIGI', 'SIGIOBS')  if l in cols), None)
+        fp     = next((l for l in _F_LABELS              if l in cols), None)
+        sigfp  = next((l for l in _SIGF_LABELS     if l in cols), None)
+        i_lbl  = next((l for l in _I_LABELS           if l in cols), None)
+        sigi   = next((l for l in _SIGI_LABELS  if l in cols), None)
         # I-only MTZs (e.g. RCSB raw deposits straight from cif2mtz) need
         # an F column for REFI TYPE RIGID — refmac's intensity input path
         # doesn't run French-Wilson in rigid mode (reports "All observed
@@ -7087,8 +7178,8 @@ def run_refinement(pdb_path, mtz_path, outdir='.', n_cycles=5,
             # Re-detect F columns from the truncated MTZ.
             mtz_in = gemmi.read_mtz_file(mtz_path_for_refmac)
             cols   = {c.label for c in mtz_in.columns}
-            fp     = next((l for l in ('FP', 'F', 'FOBS')          if l in cols), None)
-            sigfp  = next((l for l in ('SIGFP', 'SIGF', 'SIGFOBS') if l in cols), None)
+            fp     = next((l for l in _F_LABELS          if l in cols), None)
+            sigfp  = next((l for l in _SIGF_LABELS if l in cols), None)
         if fp and sigfp:
             # No FREE= in LABIN — refmac does not require a free set for
             # rigid-body refinement, and propagating the deposit's free
