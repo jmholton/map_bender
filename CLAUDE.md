@@ -1473,24 +1473,38 @@ bend fit but not for standalone Coot diff-map display.
 the stretched mov inside `resolve_altindex`, which trips the gate.
 Pass `fill_asu=True`.
 
-**Full-fitreso results (July 2026, `scan_all_fr=True`, MTZ inputs):**
+**Full-fitreso results (post cross-d_min fix — July 2026 refit,
+`scan_all_fr=True`, MTZ inputs, `fill_asu=True`):**
 
-| ref         | best RMSD | best Rbent | bondZ | dipole | score | d_opt          | early-stop |
-|-------------|-----------|------------|-------|--------|-------|----------------|------------|
-| 1-6-100kGy  | 0.092 Å   | 30.1%      | 1.62  | +0.005 | 0.344 | 20 Å (clamped) | fr12       |
-| 1-9-100kGy  | 0.107 Å   | 35.3%      | 1.67  | +0.015 | 0.404 | 20 Å (clamped) | fr12       |
-| 160kGy      | 0.115 Å   | 35.2%      | 1.55  | +0.000 | 0.391 | 20 Å (clamped) | fr12       |
-| 260kGy      | 0.151 Å   | 38.6%      | 2.04  | +0.000 | 0.453 | 6.78 Å         | fr12       |
-| 440kGy      | 0.098 Å   | 35.3%      | 1.62  | +0.000 | 0.393 | 6.00 Å (clamped) | fr12     |
+| ref         | best RMSD | best Rbent | bondZ | dipole | score | d_opt (parabola)          |
+|-------------|-----------|------------|-------|--------|-------|---------------------------|
+| 1-6-100kGy  | 0.092 Å   | 27.2%      | 1.62  | +0.012 | 0.318 | fr20 (concave-down argmin) |
+| 1-9-100kGy  | 0.107 Å   | 28.6%      | 1.67  | +0.020 | 0.340 | fr20 (concave-down argmin) |
+| 160kGy      | 0.115 Å   | 27.5%      | 1.55  | +0.063 | 0.346 | fr20 (concave-down argmin) |
+| 260kGy      | 0.127 Å   | 27.8%      | 1.56  | −0.052 | 0.318 | fr20 (concave-down argmin) |
+| 440kGy      | 0.080 Å   | 22.8%      | 1.56  | +0.047 | 0.287 | fr20 (concave-down argmin) |
 
-Every full-scan `argmin(score)` also lands at fr12 — the early-stop
-rule (`scan_all_fr=False`, default) picks the same row without
-running fr10/fr8/fr7/fr6.  260kGy and 440kGy do produce a real
-concave-up parabola vertex in the fine-fitreso band, so full-fitreso
-data pushes d_opt to 6-7 Å for those two; the argmin score still
-prefers fr20 for all 5, showing that beyond fr12 the field is
-mostly adding fine-scale detail that helps Rbent slightly but not
-enough to overcome bondZ + dipole penalties.
+Combined-score `d_opt` picks fr20 for all five doses (best-row row of
+the log; combined-score-column d_opt agrees on fr20 for 4 of 5, with
+440kGy picking fr8 on the combined score at score=0.282 vs its fr20
+score 0.287 — near-tie).  Rbent dropped ~3–13 % across the series
+compared to the pre-fix July-2026 baseline (30.1 / 35.3 / 35.2 / 38.6
+/ 35.3 % → 27.2 / 28.6 / 27.5 / 27.8 / 22.8 %); RMSDs are essentially
+identical (or slightly better for 260kGy 0.151→0.127 and 440kGy
+0.098→0.080).  The Rbent drop tracks the same cross-d_min pipeline
+fixes that landed for myoglobin and insulin — even though these
+scalit-refined pairs are ostensibly same-d_min, the σA fill /
+extension paths are still exercised for the MTZs that come out
+below the 99 % SG-ASU completeness gate, and the fixed pipeline
+produces cleaner amplitudes in the outer shells.
+
+k lands near unity (0.94–0.99) across the series with small B
+(−0.65 to −1.71 Å²), consistent with same-crystal same-refinement
+pairs — radiation damage doesn't shift the overall Wilson envelope
+much, only specific residues.
+
+Baseline preserved at `fitreso_scans_fullfr.baseline_20260709/` on
+disk for map-level diff checks.
 
 Persistent A/5MET/SD(r) peak (+10 to +12σ) at every dose point is
 a sulfur that displaces between crystal forms rather than a
